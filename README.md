@@ -161,9 +161,13 @@ python extract_network.py --polygon round.geojson --out data
 # service to 0. Snaps to the intersection if you click near one.
 python split_edge.py --data data --at=-37.8450,144.9505
 
-# Network type (default `walk`, closest to a delivery vehicle on
-# footpaths; includes paths and laneways that make good shortcuts):
-python extract_network.py --place ... --network-type bike --out data
+# Network type (default `all`: footpaths AND carriageways). `walk`
+# looks right for a footpath vehicle, but osmnx drops the roadway
+# pieces inside big junctions, so "straight through the intersection"
+# stops existing and routes detour over pedestrian crossings -- on a
+# real round that cost 1.25 km. With `all`, set ways you cannot ride
+# (motorway, steps, corridor) to x.
+python extract_network.py --place ... --network-type walk --out data
 ```
 
 ## Re-extracting without losing your annotation
@@ -186,8 +190,15 @@ python prepare_round.py --data data --round round.local
 ```
 
 Edges that are new to the enlarged area keep the extraction default
-and are reported — review them in the editor. Stale overrides (ids
-that no longer exist) are warned about, never silently dropped.
+and are reported — review them in the editor.
+
+`edge_id`s come from OSM and are stable while the map is, but changing
+`--network-type` changes which junctions exist, so osmnx splits ways
+differently and some ids disappear (one old edge often becomes two or
+three new ones). Overrides that match no id are therefore retried **by
+geometry**: a new edge lying along the old one, with the same name and
+road type, inherits its value. Anything that still cannot be placed is
+listed for you to re-mark — never silently dropped.
 
 ## Version history — did that edit actually help?
 

@@ -88,6 +88,32 @@ def main():
     run(d1, sol)
     check_walk(read_route(sol), edges_by_id, spec, closed=True)
 
+    print("== an edge whose id changed is re-found by geometry ==")
+    # a different --network-type splits ways at different junctions, so
+    # ids vanish; here split_edge stands in for that re-splitting
+    d2 = TMP / "regeom"
+    rdir2 = TMP / "round2"
+    write_case(d2)
+    set_service(d2, "n00-n01-0", 1)          # annotate, then snapshot
+    set_service(d2, "n10-n11-0", "x")
+    run_prepare(d2, rdir2, "--export")
+    shutil.rmtree(d2)
+    write_case(d2)                            # "re-extraction": defaults
+    for parent in ("n00-n01-0", "n10-n11-0"):
+        res = run_split(d2, "-37.84498,144.9505" if parent.startswith("n00")
+                        else "-37.84598,144.9505", "--edge", parent)
+        assert res.returncode == 0, res.stderr
+    out = run_prepare(d2, rdir2)
+    assert "re-found by geometry" in out, out
+    svc = services(d2)
+    assert "n00-n01-0" not in svc, "parent should have been split away"
+    assert svc["n00-n01-0#a"] == "1" and svc["n00-n01-0#b"] == "1", \
+        f"both halves should inherit the annotation: {svc['n00-n01-0#a']}, " \
+        f"{svc['n00-n01-0#b']}"
+    assert svc["n10-n11-0#a"] == "x" and svc["n10-n11-0#b"] == "x"
+    # an untouched neighbour must not be dragged in
+    assert svc["n01-n02-0"] == "2", "geometry match leaked onto a neighbour"
+
     print("== new edges keep default; stale overrides warn ==")
     with open(d1 / "edges.csv", newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
@@ -104,7 +130,7 @@ def main():
         csv.writer(f).writerow(["ghost-99", "2", "Ghost Street"])
     out = run_prepare(d1, rdir)
     assert "1 edges had no override" in out, out
-    assert "stale override" in out and "ghost-99" in out, out
+    assert "could not be placed" in out and "Ghost Street" in out, out
     assert services(d1)["corridor-0"] == "0", \
         "new edge must keep its extraction default"
 

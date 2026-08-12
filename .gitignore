@@ -1,8 +1,10 @@
 # ---- private round data: NEVER commit ----------------------------
 # Your edited edges.csv IS your round definition. Everything the
 # pipeline reads or writes about a real round stays local.
-data/
-result/
+# any data*/ or result*/ variant: side-by-side extractions and backups
+# (data_all/, data.bak/, result_test/ ...) are round data just the same
+data*/
+result*/
 round.local/
 # osmnx Overpass cache -- raw OSM data of the round
 cache/

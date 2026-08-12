@@ -186,10 +186,15 @@ def main():
     ap.add_argument("--polygon",
                     help="GeoJSON file with your round boundary "
                          "(draw at geojson.io)")
-    ap.add_argument("--network-type", default="walk",
-                    choices=["walk", "bike", "drive", "all"],
-                    help="which OSM ways to include (default: walk -- "
-                         "closest to an EDV on footpaths)")
+    ap.add_argument("--network-type", default="all",
+                    choices=["all", "walk", "bike", "drive"],
+                    help="which OSM ways to include (default: all -- "
+                         "footpaths AND carriageways. `walk` looks "
+                         "right for an EDV but drops the roadway "
+                         "pieces inside big junctions, so 'straight "
+                         "through the intersection' stops existing and "
+                         "routes detour over pedestrian crossings; it "
+                         "also reports every way as two-way)")
     ap.add_argument("--buffer", type=float, default=0.0006,
                     help="boundary buffer in degrees (~60 m) so that "
                          "roads on the area boundary are kept")
@@ -238,7 +243,10 @@ Editing tips:
     a single carriageway) -> 1
   * footway / path segments are orange on the preview: keep the ones you
     actually ride, zero the rest; ALWAYS set 'steps' to x (excluded --
-    never routed through, not even as a shortcut)""")
+    never routed through, not even as a shortcut)
+  * with --network-type all, check for ways you cannot ride at all
+    (motorway, steps, corridor) and set them to x -- unlike `walk`,
+    this network does not filter them out for you""")
 
 
 if __name__ == "__main__":

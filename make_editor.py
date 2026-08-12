@@ -74,7 +74,9 @@ def parse_wkt_linestring(wkt):
             x, y = float(xy[0]), float(xy[1])
         except ValueError:
             return None
-        pts.append([y, x])  # WKT is lon lat; leaflet wants lat lon
+        # 6 decimals is ~0.1 m: far below any editing decision, and it
+        # keeps the embedded payload roughly a third smaller
+        pts.append([round(y, 6), round(x, 6)])   # WKT is lon lat
     return pts if len(pts) >= 2 else None
 
 

@@ -180,6 +180,19 @@ Migration notes:
   small. Fail with that exact advice; never guess.
 - **E12 OSM attribute quirks.** `name`/`highway` may be strings, lists
   or missing — normalise on extraction (`norm()`), never downstream.
+- **E15 `walk` networks are not road networks.** osmnx's walk filter
+  keeps ways where walking is allowed, which silently drops the
+  carriageway pieces *inside* large junctions. Measured on the
+  maintainer's area: the road-only subgraph of a `walk` extraction fell
+  into **34 components**; at one arterial crossroads the two roads
+  shared **no node**, so "straight through the intersection" did not
+  exist as an edge and every route crossed on the pedestrian
+  crossings. The same
+  polygon with `--network-type all` gives 5 road components, 4 shared
+  nodes at that junction, and a 1.25 km shorter route on an identical
+  annotation. `all` is therefore the default. Its cost: ways you cannot
+  ride (motorway, steps, corridor) are no longer filtered out for you —
+  set them to `x`.
 - **E13 One-way streets ("can I ride against traffic?").** The model
   is deliberately **undirected**: the vehicle works from the footpath,
   and footpaths have no direction — "riding against" a one-way only
@@ -192,7 +205,11 @@ Migration notes:
   polynomial (matching) and fully directed CPP is polynomial
   (min-cost flow), but the realistic *mixed* case is NP-hard — the
   upgrade is a different solver (ILP formulation), not a tweak.
-  Revisit only with a concrete street in hand.
+  Revisit only with a concrete street in hand. *Note (2026-08): with
+  `network_type=walk` osmnx marks **every** edge `oneway=False`, so the
+  column carried no information at all; under the new `all` default it
+  is real data (2 497 of 12 912 edges one-way on the maintainer's
+  area), which is what a future wrong-way **flag** would need.*
 - **E14 Separate footpath lines vs the road.** Big roads are often
   mapped with their footpaths as separate parallel `footway` lines.
   Marking the line you physically ride (usually that footway, as
@@ -408,5 +425,8 @@ is the only networked step — keep it thin, and keep everything after
 | 2026-08 | Point picking on the maps: editor right-click copies `lat,lon` / `--start=` / `--end=`; the extraction preview gets folium's LatLngPopup | Coordinates are the CLI primitive (reproducible, scriptable), but hunting them in an external map was needless friction |
 | 2026-08 | Endpoints became data, not just arguments: right-click sets START/END into `data/endpoints.json`, the editor draws them, `solve_route.py` loads the file when `--start`/`--end` are absent, `prepare_round.py` carries it across re-extractions; a Solve button runs the solver server-side and serves the route map | Copy-pasting coordinates into a terminal was still the last manual step. Storing the pins makes the browser flow complete (edit → Save → Solve → view) while the CLI stays authoritative and scriptable |
 | 2026-08 | Editor: Leaflet `boxZoom` disabled; contextmenu `preventDefault`; added a "click sets" mode selector | Two real bugs found in use: shift+click (the x gesture) was eaten by box-zoom, since a 1 px wobble zooms to a box, and the right-click popup was hidden behind the browser's native menu. The mode selector removes the reliance on modifier keys altogether |
+| 2026-08 | Default extraction switched from `walk` to `all` | `walk` drops junction carriageways, shattering the road network into 34 components and forcing routes onto pedestrian crossings; `all` keeps both layers, restores "go straight", yields real `oneway` data and a 1.25 km shorter route on the same annotation (E15) |
+| 2026-08 | `prepare_round` gained a geometry fallback: overrides whose `edge_id` vanished are re-found by position (same name/type, all sample points within 6 m, length-bounded), accepting any component of an osmnx-merged `"A; B"` name | Changing the network type changes which junctions exist, so osmnx splits ways differently and 618 of 10 850 ids disappeared. Id-only replay silently lost 7 annotated edges (659 m); with geometry it recovered all of them as 18 new pieces, and mandatory distance came out identical to the metre. B1's promise ("fully reproducible after re-extraction") only holds with this |
+| 2026-08 | `.gitignore`: `data/` → `data*/`, `result/` → `result*/` | A side-by-side `data_all/` extraction of the real round showed up as untracked — the ignore patterns only covered the exact directory names |
 | 2026-08 | Version history stores the *annotation* (edges with service 1/2/x, ~200 rows) rather than a copy of `edges.csv` (10 850 rows), keyed by a hash of it; unchanged re-solves are not filed | The annotation is the round definition and is two orders of magnitude smaller; hashing it makes "did anything actually change?" exact, so pressing Solve repeatedly cannot bury the real changes |
 | 2026-08 | Island warning rewritten: names service islands vs pinned endpoints separately, reports the bridging kilometres, points at the editor's island view | The old message called the endpoint pair a "service island" (wrong) and gave no sense of scale, so "near-optimal" read as "unquantified doubt" instead of "these 1.1 km are heuristic" |
