@@ -19,7 +19,8 @@ project evolves — especially the decision log.
 | B1: reproducible rounds (`prepare_round.py` export/apply) | **done, tested** (`test_prepare.py`) — **V2 complete** |
 | V2.2 graphical endpoints + in-browser solving | **done, tested** |
 | B9: solved-version history (`round_history.py`) | **done, tested** (`test_history.py`) |
-| V3+: time-based costs, pass pairing, GPX compare, editor UI | backlog |
+| V3 next up: B2 cost profile (prefer roads to footways) + B10.1 wrong-way flag | **specified, not started** |
+| V3+: pass pairing, GPX compare, per-letterbox sequencing, exact ILP | backlog |
 
 ---
 
@@ -353,7 +354,41 @@ stands, honestly). Option B was not needed.
 - **B2 Time-based costs (V3).** Replace distance with estimated time:
   per-highway-type speeds, fixed penalties for crossing signalised
   intersections / arterials. Structure is ready (NF3); true turn-aware
-  costs need a line-graph formulation — research task.
+  costs need a line-graph formulation — research task. The first cut
+  that the round actually needs is narrower: **prefer carriageways to
+  footways for deadhead**. Measured 2026-08 on the real round: of
+  12.03 km deadhead, 3.88 km (32%) was footway, and the 4.79 km ride
+  home from the handover office was 26% footway — the solver treats a
+  metre of footpath and a metre of road as equal, so it threads
+  shortcuts through pedestrian paths where an EDV would rather use the
+  road. Weight per-metre cost by highway type, keep reporting
+  distances in metres.
+- **B10 One-way awareness (three tiers).** Since the `all` default
+  (E15) `oneway` is real data — 2 497 of 12 912 edges on the real
+  round. The solver is still undirected (E13) and ignores it.
+  Measured on the current route: 8.59 km of 29.37 km runs on one-way
+  edges, and **4.01 km of that is against the arrow** (47% of the
+  one-way mileage; 1.76 km service + 2.25 km deadhead), concentrated
+  on divided arterials mapped as two one-way chains. Legal on the
+  footpath, wrong on the carriageway. Three separable tiers, cheapest
+  first:
+  1. **Flag it (informational, ~15 lines, no algorithm change).** Add
+     an `against_oneway` column to `route.csv` and a distinct style in
+     the route viewer, so the rider knows which stretches must be
+     ridden on the footpath. Needs the traversal direction, which the
+     emitter has but currently discards — `route.csv` records only a
+     compass bearing.
+  2. **Penalise it (heuristic, part of B2).** Add a cost multiplier
+     for traversing a one-way edge against its direction, applied to
+     the deadhead/connector shortest paths. Would target the 2.25 km
+     of wrong-way deadhead; service passes stay mandatory either way.
+     Note this makes pair distances asymmetric while the matching
+     assumes symmetry — apply it to path *selection* only, or accept
+     the approximation and say so (NF2).
+  3. **Forbid it (exact, different solver class).** A true directional
+     constraint is the Mixed CPP: NP-hard (E13), needs the ILP /
+     branch-and-cut backend of B8. Only worth it with a concrete
+     street that must be ridden on the carriageway.
 - **B3 Prefer paired passes.** Soft constraint nudging 1/2 and 2/2 of
   the same street to be adjacent when nearly free (E5).
 - **B4 GPX comparison.** Import a ride trace of the current route
