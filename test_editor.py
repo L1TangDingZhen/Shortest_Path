@@ -243,26 +243,32 @@ def test_serve():
             assert e.code == 404, e.code
 
         eps = {"start": [-37.845, 144.950], "end": [-37.8471, 144.9529],
-               "return_to_start": True}
+               "return_to_start": True, "profile": "edv",
+               "wrong_way_penalty": 2}
         req = urllib.request.Request(
             f"{base}/endpoints", data=json.dumps(eps).encode("utf-8"),
             method="POST", headers={"Content-Type": "application/json"})
         saved = json.loads(urllib.request.urlopen(req, timeout=10).read())
         assert saved["start"] == eps["start"] and saved["end"] == eps["end"]
         assert saved["return_to_start"] is True
+        assert saved["profile"] == "edv"
+        assert saved["wrong_way_penalty"] == 2
         assert json.loads((data / "endpoints.json").read_text(
             encoding="utf-8"))["start"] == eps["start"]
 
-        # nonsense coordinates are rejected
-        req = urllib.request.Request(
-            f"{base}/endpoints",
-            data=json.dumps({"start": ["north", 3]}).encode("utf-8"),
-            method="POST", headers={"Content-Type": "application/json"})
-        try:
-            urllib.request.urlopen(req, timeout=10)
-            raise AssertionError("bad endpoint must be rejected")
-        except urllib.error.HTTPError as e:
-            assert e.code == 400, e.code
+        # nonsense values are rejected
+        for bad in ({"start": ["north", 3]},
+                    {"wrong_way_penalty": 0.5},
+                    {"profile": "; rm -rf /"}):
+            req = urllib.request.Request(
+                f"{base}/endpoints", data=json.dumps(bad).encode("utf-8"),
+                method="POST",
+                headers={"Content-Type": "application/json"})
+            try:
+                urllib.request.urlopen(req, timeout=10)
+                raise AssertionError(f"{bad} must be rejected")
+            except urllib.error.HTTPError as e:
+                assert e.code == 400, e.code
 
         # the served page carries the stored endpoints back
         html3 = urllib.request.urlopen(f"{base}/", timeout=10).read()
@@ -276,6 +282,8 @@ def test_serve():
                                      method="POST")
         out = urllib.request.urlopen(req, timeout=120).read().decode()
         assert "RESULT" in out and "return to start" in out, out
+        assert "cost profile: edv" in out, \
+            "the solver must pick up the profile stored by the editor"
         assert (TMP / "serve_out" / "route.csv").exists()
         page = urllib.request.urlopen(f"{base}/route_map.html",
                                       timeout=10).read()

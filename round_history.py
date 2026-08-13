@@ -43,7 +43,7 @@ DEFAULT_HISTORY = "round.local/history"
 INDEX = "index.csv"
 FIELDS = ["id", "timestamp", "note", "mode", "service_edges",
           "mandatory_km", "total_km", "deadhead_km", "islands",
-          "bridge_km", "annotation"]
+          "bridge_km", "profile", "wrong_way_km", "annotation"]
 
 
 # ----------------------------------------------------------------------
@@ -174,7 +174,7 @@ def cmd_list(history_dir: Path, _args):
     if not index:
         sys.exit("no versions recorded yet -- solve with --history first")
     print(f"{'id':<16}{'streets':>8}{'service':>9}{'total':>9}"
-          f"{'dead':>8}{'isl':>5}  mode / note")
+          f"{'dead':>8}{'isl':>5}  {'profile':<9}  mode / note")
     prev = None
     for r in index:
         total = float(r["total_km"])
@@ -184,7 +184,7 @@ def cmd_list(history_dir: Path, _args):
         print(f"{r['id']:<16}{r['service_edges']:>8}"
               f"{float(r['mandatory_km']):>8.2f}k{total:>8.2f}k"
               f"{float(r['deadhead_km']):>7.2f}k{r['islands']:>5}"
-              f"  {label}{delta}")
+              f"  {(r.get('profile') or '?'):<9}  {label}{delta}")
     print(f"\n{len(index)} version(s) in {history_dir}")
 
 

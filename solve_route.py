@@ -114,6 +114,9 @@ def load_data(data_dir: Path):
                 "u": row["u"],
                 "v": row["v"],
                 "name": row.get("name") or "(unnamed)",
+                "highway": (row.get("highway") or "").split(";")[0].strip(),
+                "oneway": (row.get("oneway") or "").strip().lower()
+                in ("true", "yes", "1"),
                 "length": float(row["length_m"]),
                 "service": service,
                 "wkt": row.get("geometry_wkt") or "",
@@ -128,23 +131,118 @@ def load_data(data_dir: Path):
 
 
 # ----------------------------------------------------------------------
+# Cost profiles -- what "shortest" means
+# ----------------------------------------------------------------------
+#
+# `length` is always real metres: it is what the mandatory distance,
+# route.csv and every printed kilometre are made of.  `cost` is what
+# the optimiser minimises.  With the default profile the two are the
+# same and the route is the shortest one.  With a speed profile a
+# metre of footpath costs more than a metre of road, so the optimiser
+# prefers roads for deadhead -- the result is then the cheapest route
+# under that profile, which may be slightly longer in metres.
+
+PROFILES = {
+    # speeds in km/h; only their ratios matter
+    "distance": None,                    # every metre equal
+    "edv": {                             # electric delivery vehicle
+        "steps": 2, "corridor": 6, "path": 9, "track": 9,
+        "footway": 10, "pedestrian": 10,
+        "cycleway": 15, "service": 15, "living_street": 15,
+        "residential": 18, "unclassified": 18,
+        "tertiary": 20, "tertiary_link": 20,
+        "secondary": 20, "secondary_link": 20,
+        "primary": 20, "primary_link": 20,
+        "trunk": 20, "trunk_link": 20,
+    },
+}
+DEFAULT_SPEED = 15.0
+
+
+def load_profile(name):
+    """Preset name or path to a JSON file {"speeds": {...},
+    "default": 15}. Returns (label, speeds or None)."""
+    if name in PROFILES:
+        return name, PROFILES[name]
+    path = Path(name)
+    if not path.exists():
+        sys.exit(f"--profile: unknown preset and no such file: {name!r} "
+                 f"(presets: {', '.join(PROFILES)})")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        sys.exit(f"--profile {name}: not valid JSON ({exc})")
+    speeds = data.get("speeds", data)
+    if not isinstance(speeds, dict) or not speeds:
+        sys.exit(f"--profile {name}: expected a non-empty object of "
+                 f"highway -> km/h")
+    try:
+        speeds = {k: float(v) for k, v in speeds.items()}
+    except (TypeError, ValueError):
+        sys.exit(f"--profile {name}: speeds must be numbers")
+    if any(v <= 0 for v in speeds.values()):
+        sys.exit(f"--profile {name}: speeds must be positive")
+    return path.stem, speeds
+
+
+def edge_cost(length, highway, speeds):
+    if speeds is None:
+        return length
+    return length / speeds.get(highway, DEFAULT_SPEED)
+
+
+# ----------------------------------------------------------------------
 # Phase 1 -- graphs
 # ----------------------------------------------------------------------
 
-def build_graphs(edges):
-    F = nx.MultiGraph()   # full rideable network
-    R = nx.MultiGraph()   # required work (with multiplicities)
+def build_graphs(edges, speeds=None, wrong_way=1.0):
+    """F: undirected view used for lookups and cross streets.
+    R: the required work.  D: directed cost graph -- every edge becomes
+    two arcs so that riding a one-way street the wrong way can be made
+    more expensive than riding it the right way.  All path finding runs
+    on D; nothing else knows about direction."""
+    F = nx.MultiGraph()    # full rideable network
+    R = nx.MultiGraph()    # required work (with multiplicities)
+    D = nx.MultiDiGraph()  # same network, directed, carrying `cost`
     for e in edges:
+        cost = edge_cost(e["length"], e["highway"], speeds)
         F.add_edge(e["u"], e["v"], key=e["edge_id"],
                    length=e["length"], name=e["name"],
-                   service=e["service"], wkt=e["wkt"])
+                   service=e["service"], wkt=e["wkt"],
+                   highway=e["highway"], oneway=e["oneway"],
+                   cu=e["u"], cv=e["v"])
+        common = dict(length=e["length"], name=e["name"], wkt=e["wkt"],
+                      highway=e["highway"], oneway=e["oneway"])
+        D.add_edge(e["u"], e["v"], key=e["edge_id"], cost=cost,
+                   against=False, **common)
+        D.add_edge(e["v"], e["u"], key=e["edge_id"],
+                   cost=cost * wrong_way if e["oneway"] else cost,
+                   against=e["oneway"], **common)
         for p in range(1, e["service"] + 1):
             R.add_edge(e["u"], e["v"], key=f'{e["edge_id"]}|p{p}',
                        base=e["edge_id"], length=e["length"])
-    return F, R
+    return F, R, D
 
 
-def ensure_required_connected(F, R, pinned_endpoints=False):
+def cheapest_arc(D, x, y):
+    """(key, data) of the arc actually taken between adjacent nodes."""
+    return min(D[x][y].items(), key=lambda kv: kv[1]["cost"])
+
+
+def path_length_m(D, path):
+    """Real metres along a node path (whose cost may be weighted)."""
+    return sum(cheapest_arc(D, x, y)[1]["length"]
+               for x, y in zip(path, path[1:]))
+
+
+def both_ways(D, a, b):
+    """Cheapest node path a->b and b->a. Connectivity is symmetric --
+    every edge contributes both arcs -- so both always exist."""
+    return {a: nx.shortest_path(D, a, b, weight="cost"),
+            b: nx.shortest_path(D, b, a, weight="cost")}
+
+
+def ensure_required_connected(R, D, pinned_endpoints=False):
     """If the required work falls into several islands, bridge them with
     the cheapest paths through the full network. Prints a warning, since
     the result is then near-optimal rather than provably optimal.
@@ -158,23 +256,27 @@ def ensure_required_connected(F, R, pinned_endpoints=False):
     comps = list(nx.connected_components(R))
     bridges = 0
     bridge_len = 0.0
-    n_components = len(comps)
     while len(comps) > 1:
-        base = comps[0]
+        base = set(comps[0])
         others = set().union(*comps[1:])
-        dist, paths = nx.multi_source_dijkstra(F, sources=set(base),
-                                               weight="length")
-        reachable = [(d, n) for n, d in dist.items() if n in others]
-        if not reachable:
+        best = None
+        # cheapest link either way out of the growing component
+        for graph, reverse in ((D, False), (D.reverse(copy=False), True)):
+            dist, paths = nx.multi_source_dijkstra(graph, sources=base,
+                                                   weight="cost")
+            for n, c in dist.items():
+                if n in others and (best is None or c < best[0]):
+                    path = paths[n]
+                    best = (c, list(reversed(path)) if reverse else path)
+        if best is None:
             sys.exit("Service streets are disconnected and no rideable "
                      "edges link them. Extract a larger area, or check "
                      "that a linking street was not excluded (service=x).")
-        d, target = min(reachable)
-        path = paths[target]
-        R.add_edge(path[0], path[-1], key=f"bridge|{bridges}",
-                   nodepath=path, length=d)
+        _, path = best
+        a, b = path[0], path[-1]
+        R.add_edge(a, b, key=f"bridge|{bridges}", paths=both_ways(D, a, b))
         bridges += 1
-        bridge_len += d
+        bridge_len += path_length_m(D, path)
         comps = list(nx.connected_components(R))
     if bridges:
         islands = bridges + 1 - (1 if pinned_endpoints else 0)
@@ -201,13 +303,15 @@ def odd_nodes(R):
     return sorted(n for n in R.nodes if R.degree(n) % 2 == 1)
 
 
-def pairwise_shortest(F, targets):
-    """Shortest path lengths and node paths between all pairs of targets,
-    measured over the FULL network (service-0 edges are fair game)."""
+def pairwise_shortest(D, targets):
+    """Cheapest cost and node path for every ORDERED pair of targets,
+    over the full network (service-0 edges are fair game). Costs are
+    asymmetric once a wrong-way penalty is in play, so both directions
+    are kept."""
     dist, path = {}, {}
     tset = set(targets)
     for s in targets:
-        d, p = nx.single_source_dijkstra(F, s, weight="length")
+        d, p = nx.single_source_dijkstra(D, s, weight="cost")
         for t in tset:
             if t != s:
                 if t not in d:
@@ -218,6 +322,17 @@ def pairwise_shortest(F, targets):
                 dist[(s, t)] = d[t]
                 path[(s, t)] = p[t]
     return dist, path
+
+
+def symmetrise(dist):
+    """Matching needs one number per unordered pair, but the traversal
+    direction is only decided later by the Euler tour. Take the cheaper
+    direction -- exact without a wrong-way penalty, a lower bound with
+    one (see NF2 / B10 in docs/DEVELOPMENT.md)."""
+    out = {}
+    for (a, b), cost in dist.items():
+        out[(a, b)] = out[(b, a)] = min(cost, dist[(b, a)])
+    return out
 
 
 def min_matching(nodes_subset, dist):
@@ -233,22 +348,23 @@ def min_matching(nodes_subset, dist):
     return list(M), cost
 
 
-def parity_repair(F, R, open_route, start_node):
-    """Add matching connectors to R. Returns (endpoints, extra_length).
+def parity_repair(R, D, open_route, start_node):
+    """Add matching connectors to R. Returns (endpoints, extra_cost).
     endpoints is (s, t) for an open route, else None."""
     odd = odd_nodes(R)
     if not odd:
         return None, 0.0
 
-    dist, path = pairwise_shortest(F, odd)
+    dist, path = pairwise_shortest(D, odd)
+    sdist = symmetrise(dist)
 
     def add_connectors(pairs):
         for i, (a, b) in enumerate(pairs):
             R.add_edge(a, b, key=f"match|{i}",
-                       nodepath=path[(a, b)], length=dist[(a, b)])
+                       paths={a: path[(a, b)], b: path[(b, a)]})
 
     if not open_route:
-        pairs, cost = min_matching(odd, dist)
+        pairs, cost = min_matching(odd, sdist)
         add_connectors(pairs)
         return None, cost
 
@@ -262,8 +378,7 @@ def parity_repair(F, R, open_route, start_node):
         if start_node in odd:
             s_fixed = start_node
         else:
-            d, _ = nx.single_source_dijkstra(F, start_node,
-                                             weight="length")
+            d, _ = nx.single_source_dijkstra(D, start_node, weight="cost")
             s_fixed = min((n for n in odd if n in d),
                           key=lambda n: d[n], default=odd[0])
         pairs_to_try = [(s_fixed, t) for t in odd if t != s_fixed]
@@ -271,7 +386,7 @@ def parity_repair(F, R, open_route, start_node):
         pairs_to_try = list(itertools.combinations(odd, 2))
     for s, t in pairs_to_try:
         rest = [n for n in odd if n not in (s, t)]
-        pairs, cost = min_matching(rest, dist)
+        pairs, cost = min_matching(rest, sdist)
         candidates.append((cost, (s, t), pairs))
     cost, endpoints, pairs = min(candidates, key=lambda c: c[0])
     add_connectors(pairs)
@@ -285,19 +400,20 @@ def parity_repair(F, R, open_route, start_node):
 VIRTUAL_KEY = "virtual|endpin"
 
 
-def deadhead_segments(F, node_path):
+def deadhead_segments(D, node_path):
     """Expand a node path into deadhead segments, taking the cheapest
-    real edge between each pair of adjacent nodes."""
+    arc between each pair of adjacent nodes."""
     segs = []
     for x, y in zip(node_path, node_path[1:]):
-        key, data = min(F[x][y].items(), key=lambda kv: kv[1]["length"])
+        key, data = cheapest_arc(D, x, y)
         segs.append(dict(kind="deadhead", edge_id=key, u=x, v=y,
                          name=data["name"], length=data["length"],
-                         wkt=data["wkt"], pass_label="-"))
+                         wkt=data["wkt"], pass_label="-",
+                         against=data["against"]))
     return segs
 
 
-def traverse(F, R, nodes, endpoints, start_node, pin_start=None):
+def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None):
     """Walk the Euler circuit/path and expand connectors into real
     street segments. Returns a list of segment dicts.
 
@@ -327,11 +443,10 @@ def traverse(F, R, nodes, endpoints, start_node, pin_start=None):
 
     for u, v, key in euler:
         data = R[u][v][key]
-        if "nodepath" in data:                       # connector -> expand
-            np_ = data["nodepath"]
-            if np_[0] != u:
-                np_ = list(reversed(np_))
-            segments.extend(deadhead_segments(F, np_))
+        if "paths" in data:                          # connector -> expand
+            # each connector carries a path for either direction of
+            # travel; they differ once wrong-way costs are in play
+            segments.extend(deadhead_segments(D, data["paths"][u]))
         else:                                        # service pass
             base = data["base"]
             edata = F[u][v][base]
@@ -340,7 +455,9 @@ def traverse(F, R, nodes, endpoints, start_node, pin_start=None):
             segments.append(dict(kind="service", edge_id=base,
                                  u=u, v=v, name=edata["name"],
                                  length=edata["length"], wkt=edata["wkt"],
-                                 pass_label=f"{passes_seen[base]}/{total}"))
+                                 pass_label=f"{passes_seen[base]}/{total}",
+                                 against=bool(edata["oneway"])
+                                 and u != edata["cu"]))
     return segments
 
 
@@ -395,7 +512,7 @@ def write_route_csv(segments, F, nodes, out_dir: Path):
         w = csv.writer(f)
         w.writerow(["seq", "type", "street", "pass", "direction",
                     "from_cross", "to_cross", "length_m", "cum_km",
-                    "edge_id"])
+                    "against_oneway", "edge_id"])
         for i, s in enumerate(segments, 1):
             cum += s["length"]
             w.writerow([
@@ -403,7 +520,8 @@ def write_route_csv(segments, F, nodes, out_dir: Path):
                 bearing_label(nodes[s["u"]], nodes[s["v"]]),
                 cross_streets(F, s["u"], s["name"]),
                 cross_streets(F, s["v"], s["name"]),
-                round(s["length"], 1), round(cum / 1000, 3), s["edge_id"],
+                round(s["length"], 1), round(cum / 1000, 3),
+                "yes" if s.get("against") else "", s["edge_id"],
             ])
     return path
 
@@ -452,6 +570,7 @@ ROUTE_TEMPLATE = r"""<!DOCTYPE html>
   <div class="row">
     <span class="sw" style="background:#2b6cb0"></span>service
     <span class="sw" style="background:#dd6b20;margin-left:8px"></span>deadhead
+    <span class="sw" style="background:#7b341e;margin-left:8px"></span>against one-way
     <span class="sw" style="background:#e53e3e;margin-left:8px"></span>current
     <span class="sw" style="background:#b8c2cc;margin-left:8px"></span>not yet
   </div>
@@ -478,6 +597,10 @@ function esc(s) {
 
 const UNVISITED = {color: "#b8c2cc", weight: 2, opacity: 0.55};
 function visitedStyle(s) {
+  if (s.w) {  // travelled against a one-way: ride the footpath here
+    return {color: "#7b341e", weight: s.k === "s" ? 5 : 4, opacity: 1,
+            dashArray: "2 4"};
+  }
   return s.k === "s"
     ? {color: "#2b6cb0", weight: 4, opacity: 0.9, dashArray: null}
     : {color: "#dd6b20", weight: 3, opacity: 0.9, dashArray: "5 7"};
@@ -487,7 +610,8 @@ const lines = S.map(function (s, i) {
   const pl = L.polyline(s.c, UNVISITED).addTo(map);
   pl.bindTooltip("#" + (i + 1) + " " + esc(s.n) + " &middot; " +
     (s.k === "s" ? "pass " + esc(s.p) : "deadhead") +
-    " &middot; " + s.l + " m", {sticky: true});
+    " &middot; " + s.l + " m" +
+    (s.w ? " &middot; <b>against the one-way</b>" : ""), {sticky: true});
   return pl;
 });
 map.fitBounds(L.featureGroup(lines).getBounds());
@@ -512,10 +636,13 @@ if (closed) {
     fillOpacity: 1}).addTo(map).bindTooltip("END");
 }
 
+const wrongKm = S.reduce((a, s) => a + (s.w ? s.l : 0), 0) / 1000;
 document.getElementById("totals").innerHTML =
   "service <b>" + P.service_km.toFixed(2) + " km</b> &middot; total <b>" +
   P.total_km.toFixed(2) + " km</b> &middot; deadhead <b>" +
-  (P.total_km - P.service_km).toFixed(2) + " km</b>";
+  (P.total_km - P.service_km).toFixed(2) + " km</b>" +
+  (wrongKm > 0 ? '<br><span style="color:#7b341e">' + wrongKm.toFixed(2) +
+   " km against a one-way (use the footpath)</span>" : "");
 
 function arrowAngle(c) {
   const a = c[c.length - 2], b = c[c.length - 1];
@@ -547,7 +674,9 @@ function setStep(k) {
     "<b>#" + cur + "/" + N + "</b> &middot; " + esc(s.n) + "<br>" +
     (s.k === "s" ? "service pass " + esc(s.p) : "deadhead (connector)") +
     " &middot; " + s.l + " m &middot; heading " + s.dir +
-    " &middot; cum " + s.cum.toFixed(3) + " km";
+    " &middot; cum " + s.cum.toFixed(3) + " km" +
+    (s.w ? '<br><span style="color:#7b341e"><b>against the one-way</b>'
+         + " &mdash; ride the footpath here</span>" : "");
   slider.value = cur;
   if (document.getElementById("follow").checked) map.panTo(end);
 }
@@ -603,6 +732,7 @@ def write_map(segments, nodes, out_dir: Path):
             "l": round(s["length"], 1),
             "cum": round(cum / 1000, 3),
             "dir": bearing_label(nodes[s["u"]], nodes[s["v"]]),
+            "w": 1 if s.get("against") else 0,
             "c": [[round(lat, 6), round(lon, 6)] for lat, lon in coords],
         })
     service = sum(s["length"] for s in segments if s["kind"] == "service")
@@ -651,6 +781,24 @@ def main():
                          "end is pinned, start chosen optimally. "
                          "Mutually exclusive with --open. Equals form "
                          "for southern latitudes: --end=-37.84,144.95")
+    ap.add_argument("--profile", default=None, metavar="NAME|FILE",
+                    help="what 'shortest' means. 'distance' (default) "
+                         "weighs every metre equally. 'edv' weighs by "
+                         "how fast a delivery vehicle covers each road "
+                         "type, so deadhead prefers carriageways to "
+                         "footpaths. Or give a JSON file of "
+                         "{highway: km/h}. Reported kilometres are "
+                         "always real metres either way.")
+    ap.add_argument("--wrong-way-penalty", type=float, default=None,
+                    metavar="FACTOR",
+                    help="multiply the cost of riding a one-way street "
+                         "against its direction (1.0 = off, the "
+                         "default; try 3). Only steers deadhead: "
+                         "service passes are mandatory whichever way "
+                         "they are ridden. Needs real oneway data, so "
+                         "extract with --network-type all. Riding the "
+                         "footpath is direction-free, so leave this off "
+                         "unless you ride on the carriageway.")
     ap.add_argument("--history", nargs="?", const=DEFAULT_HISTORY,
                     metavar="DIR",
                     help="file this solve away as a version (annotation "
@@ -677,28 +825,45 @@ def main():
     data_dir, out_dir = Path(args.data), Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Endpoints picked in the editor (data/endpoints.json) are used when
-    # no --start/--end was given, so the browser flow needs no flags.
+    # Settings picked in the editor (data/endpoints.json) fill in for
+    # any flag that was not given, so the browser flow needs no flags.
+    ep_file = data_dir / "endpoints.json"
+    ep = {}
+    if ep_file.exists():
+        try:
+            ep = json.loads(ep_file.read_text(encoding="utf-8"))
+        except ValueError:
+            ep = {}
     if not args.start and not args.end:
-        ep_file = data_dir / "endpoints.json"
-        if ep_file.exists():
-            try:
-                ep = json.loads(ep_file.read_text(encoding="utf-8"))
-            except ValueError:
-                ep = {}
-            if ep.get("start"):
-                args.start = "{},{}".format(*ep["start"])
-            if ep.get("end"):
-                args.end = "{},{}".format(*ep["end"])
-                args.return_to_start = (args.return_to_start or
-                                        bool(ep.get("return_to_start")))
-            if args.start or args.end:
-                print(f"  using endpoints from {ep_file} "
-                      f"(set in the editor)")
+        if ep.get("start"):
+            args.start = "{},{}".format(*ep["start"])
+        if ep.get("end"):
+            args.end = "{},{}".format(*ep["end"])
+            args.return_to_start = (args.return_to_start or
+                                    bool(ep.get("return_to_start")))
+        if args.start or args.end:
+            print(f"  using endpoints from {ep_file} "
+                  f"(set in the editor)")
+    if args.profile is None:
+        args.profile = ep.get("profile") or "distance"
+    if args.wrong_way_penalty is None:
+        try:
+            args.wrong_way_penalty = float(ep.get("wrong_way_penalty") or 1)
+        except (TypeError, ValueError):
+            args.wrong_way_penalty = 1.0
+
+    if args.wrong_way_penalty < 1.0:
+        ap.error("--wrong-way-penalty must be >= 1.0")
 
     print("Loading network ...")
     nodes, edges = load_data(data_dir)
-    F, R = build_graphs(edges)
+    profile_name, speeds = load_profile(args.profile)
+    F, R, D = build_graphs(edges, speeds, args.wrong_way_penalty)
+    if speeds is not None or args.wrong_way_penalty > 1.0:
+        print(f"  cost profile: {profile_name}"
+              + (f", wrong-way penalty x{args.wrong_way_penalty:g}"
+                 if args.wrong_way_penalty > 1.0 else "")
+              + " -- optimising weighted cost, reporting real metres")
     n_service_edges = sum(1 for e in edges if e["service"] > 0)
     if n_service_edges == 0:
         sys.exit("No edges have service 1 or 2 -- nothing to route. "
@@ -718,7 +883,7 @@ def main():
         R.add_edge(pin_end, pin_start, key=VIRTUAL_KEY, length=0.0)
 
     bridges, bridge_len = ensure_required_connected(
-        F, R, pinned_endpoints=pin_start is not None)
+        R, D, pinned_endpoints=pin_start is not None)
 
     start_node = None
     if args.start and pin_start is None:
@@ -733,36 +898,37 @@ def main():
     print(f"Parity repair: {n_odd} odd-degree nodes to match ...")
     print("Extracting Euler traversal ...")
     if pin_start is not None:                        # --start + --end
-        endpoints, extra = parity_repair(F, R, False, None)
-        segments = traverse(F, R, nodes, None, None, pin_start=pin_start)
+        endpoints, extra = parity_repair(R, D, False, None)
+        segments = traverse(F, R, D, nodes, None, None,
+                            pin_start=pin_start)
         kind = "open path, start & end pinned"
     elif pin_end is not None:                        # --end only
-        endpoints, extra = parity_repair(F, R, True, pin_end)
+        endpoints, extra = parity_repair(R, D, True, pin_end)
         if endpoints:
             # orient the walk so it ENDS at the pin (or, if parity
             # forces both endpoints, at the forced endpoint nearest it)
             e_pin = snap_to_node(args.end, list(endpoints), nodes)
             endpoints = tuple(n for n in endpoints if n != e_pin) \
                 + (e_pin,)
-            segments = traverse(F, R, nodes, endpoints, None)
+            segments = traverse(F, R, D, nodes, endpoints, None)
             kind = "open path, end pinned"
         else:  # no odd nodes: the route is a circuit; close it there
-            segments = traverse(F, R, nodes, None, pin_end)
+            segments = traverse(F, R, D, nodes, None, pin_end)
             kind = "closed circuit (starts and ends at --end)"
     else:
-        endpoints, extra = parity_repair(F, R, args.open, start_node)
-        segments = traverse(F, R, nodes, endpoints, start_node)
+        endpoints, extra = parity_repair(R, D, args.open, start_node)
+        segments = traverse(F, R, D, nodes, endpoints, start_node)
         kind = "open path" if endpoints else "closed circuit"
 
     if args.return_to_start:
         last, first = segments[-1]["v"], segments[0]["u"]
         if last != first:
             try:
-                path = nx.shortest_path(F, last, first, weight="length")
+                path = nx.shortest_path(D, last, first, weight="cost")
             except nx.NetworkXNoPath:
                 sys.exit("--return-to-start: no path from the end back "
                          "to the start exists in the network.")
-            tail = deadhead_segments(F, path)
+            tail = deadhead_segments(D, path)
             segments.extend(tail)
             print(f"  return leg after the end: "
                   f"{sum(s['length'] for s in tail) / 1000:.2f} km "
@@ -797,6 +963,11 @@ def main():
                 "end": args.end or "",
                 "return_to_start": bool(args.return_to_start),
                 "edges_total": len(edges),
+                "profile": profile_name,
+                "wrong_way_penalty": args.wrong_way_penalty,
+                "wrong_way_km": round(sum(
+                    s["length"] for s in segments
+                    if s.get("against")) / 1000, 3),
             })
         print("  history: " + (f"recorded version {version}" if is_new
                                else f"unchanged since version {version}")

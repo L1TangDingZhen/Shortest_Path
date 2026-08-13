@@ -151,6 +151,17 @@ def save_endpoints(data_dir: Path, data):
             raise ValueError(f"{key}: {lat},{lon} is not a coordinate")
         out[key] = [lat, lon]
     out["return_to_start"] = bool(data.get("return_to_start"))
+    profile = str(data.get("profile") or "distance")
+    if not re.fullmatch(r"[\w.\-/]+", profile):
+        raise ValueError(f"profile: {profile!r} is not a name or path")
+    out["profile"] = profile
+    try:
+        penalty = float(data.get("wrong_way_penalty") or 1)
+    except (TypeError, ValueError):
+        raise ValueError("wrong_way_penalty: expected a number")
+    if penalty < 1:
+        raise ValueError("wrong_way_penalty: must be >= 1")
+    out["wrong_way_penalty"] = penalty
     (data_dir / ENDPOINTS).write_text(
         json.dumps(out, indent=1), encoding="utf-8")
     return out
@@ -232,6 +243,13 @@ TEMPLATE = r"""<!DOCTYPE html>
     <button data-clear="end">clear</button><br>
     <label><input type="checkbox" id="eprts"> return to start after
       the end</label><br>
+    cost <select id="epprofile">
+      <option value="distance">distance (every metre equal)</option>
+      <option value="edv">edv (prefer roads to footpaths)</option>
+    </select>
+    <label title="only useful if you ride on the carriageway">
+      wrong-way &times;<input id="epww" type="number" min="1" step="0.5"
+        style="width:48px"></label><br>
     <input id="note" placeholder="label this version (optional)"
            style="width:150px">
     <button id="solve">Solve route</button>
@@ -501,6 +519,10 @@ function drawEndpoints() {
     }).addTo(map).bindTooltip(k.toUpperCase() + " of the round");
   });
   document.getElementById("eprts").checked = !!endpoints.return_to_start;
+  document.getElementById("epprofile").value =
+    endpoints.profile || "distance";
+  document.getElementById("epww").value =
+    endpoints.wrong_way_penalty || 1;
 }
 
 async function saveEndpoints() {
@@ -539,6 +561,14 @@ document.addEventListener("click", function (ev) {
 });
 document.getElementById("eprts").addEventListener("change", function () {
   endpoints.return_to_start = this.checked;
+  saveEndpoints();
+});
+document.getElementById("epprofile").addEventListener("change", function () {
+  endpoints.profile = this.value;
+  saveEndpoints();
+});
+document.getElementById("epww").addEventListener("change", function () {
+  endpoints.wrong_way_penalty = parseFloat(this.value) || 1;
   saveEndpoints();
 });
 
@@ -808,6 +838,7 @@ def run_solver(data_dir: Path, out_dir: Path, history_dir: Path,
         cmd.append("--end={},{}".format(*ep["end"]))
         if ep.get("return_to_start"):
             cmd.append("--return-to-start")
+    # profile / penalty are read from endpoints.json by the solver
     res = subprocess.run(cmd, capture_output=True, text=True)
     return res.returncode == 0, (res.stdout + res.stderr).strip()
 

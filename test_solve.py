@@ -80,6 +80,38 @@ def write_case(data_dir: Path, disconnect=False):
     return {eid: s for eid, _, _, _, s in edges}
 
 
+def write_cost_case(data_dir: Path):
+    """One long service street plus two ways back: a short footway and
+    a slightly longer road that is one-way against the direction of
+    travel. Which one the deadhead takes reveals the cost profile."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    nodes = {"A": (-37.8450, 144.9500), "B": (-37.8450, 144.9530)}
+    with open(data_dir / "nodes.csv", "w", newline="",
+              encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["node_id", "lat", "lon"])
+        for n, (la, lo) in nodes.items():
+            w.writerow([n, la, lo])
+    rows = [
+        # edge_id,   name,        highway,       oneway, len, service, u, v
+        ("svc", "Long Street", "residential", "False", 300, 1, "A", "B"),
+        ("foot", "The Path", "footway", "False", 100, 0, "A", "B"),
+        ("road", "Back Road", "residential", "True", 130, 0, "B", "A"),
+    ]
+    with open(data_dir / "edges.csv", "w", newline="",
+              encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["edge_id", "name", "highway", "oneway", "length_m",
+                    "service", "note", "u", "v", "geometry_wkt"])
+        for eid, nm, hw, ow, ln, sv, u, v in rows:
+            w.writerow([eid, nm, hw, ow, ln, sv, "", u, v, ""])
+    return {eid: sv for eid, _, _, _, _, sv, _, _ in rows}
+
+
+def deadhead_ids(rows):
+    return [r["edge_id"] for r in rows if r["type"] == "deadhead"]
+
+
 def read_route(out_dir: Path):
     with open(out_dir / "route.csv", newline="",
               encoding="utf-8-sig") as f:
@@ -241,6 +273,50 @@ def main():
     rows9 = read_route(out9)
     end9, first9 = check_walk(rows9, edges_by_id, spec, closed=True)
     assert first9 == "n00", f"auto start should be n00, got {first9}"
+
+    print("== cost profile steers deadhead off the footpath ==")
+    dc = TMP / "cost"
+    cspec = write_cost_case(dc)
+    cby = {"svc": ("A", "B"), "foot": ("A", "B"), "road": ("B", "A")}
+
+    out_d = TMP / "cost_distance"
+    run(dc, out_d)                       # default: every metre equal
+    rows_d = read_route(out_d)
+    check_walk(rows_d, cby, cspec, closed=True)
+    assert deadhead_ids(rows_d) == ["foot"], deadhead_ids(rows_d)
+    assert abs(total_km(rows_d) - 0.400) < 1e-6, total_km(rows_d)
+
+    out_e = TMP / "cost_edv"
+    run(dc, out_e, "--profile", "edv")   # a metre of footpath costs more
+    rows_e = read_route(out_e)
+    check_walk(rows_e, cby, cspec, closed=True)
+    assert deadhead_ids(rows_e) == ["road"], deadhead_ids(rows_e)
+    assert total_km(rows_e) > total_km(rows_d), \
+        "the cheaper route may be longer in metres -- that is the point"
+
+    print("== against_oneway is reported ==")
+    assert "against_oneway" in rows_e[0], list(rows_e[0])
+    flags = {r["edge_id"]: r["against_oneway"] for r in rows_e}
+    assert flags["road"] == "yes", flags   # ridden B->A backwards
+    assert flags["svc"] == "", flags       # two-way street
+    assert all(r["against_oneway"] == "" for r in rows_d), \
+        "the footway route has nothing to flag"
+
+    print("== wrong-way penalty avoids the one-way ==")
+    out_w = TMP / "cost_wrong"
+    run(dc, out_w, "--profile", "edv", "--wrong-way-penalty", "3")
+    rows_w = read_route(out_w)
+    check_walk(rows_w, cby, cspec, closed=True)
+    assert deadhead_ids(rows_w) == ["foot"], deadhead_ids(rows_w)
+    assert all(r["against_oneway"] == "" for r in rows_w)
+
+    print("== bad profile / penalty are rejected ==")
+    for bad in (["--profile", "nonsense"], ["--wrong-way-penalty", "0.5"]):
+        res = subprocess.run(
+            [sys.executable, str(BASE / "solve_route.py"), "--data",
+             str(dc), "--out", str(TMP / "reject2"), *bad],
+            capture_output=True, text=True)
+        assert res.returncode != 0, f"{bad} should have been rejected"
 
     print("== --end with --open rejected ==")
     res = subprocess.run(

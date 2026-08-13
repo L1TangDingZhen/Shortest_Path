@@ -91,6 +91,11 @@ reload; tick *return to start* for a closed tour. Then press
 a new tab. The whole loop stays in the browser; `solve_route.py` picks
 the same endpoints up automatically when run without `--start`/`--end`.
 
+The **cost** dropdown and **wrong-way** factor next to the endpoints
+set the same preferences as `--profile` / `--wrong-way-penalty`; they
+are stored with the endpoints, so the Solve button and a bare
+`solve_route.py` both use them.
+
 **show islands** colours each connected component of your service
 streets separately (with per-island zoom buttons) — one island means
 the solver's optimum is exact; stray extra islands are usually
@@ -199,6 +204,34 @@ three new ones). Overrides that match no id are therefore retried **by
 geometry**: a new edge lying along the old one, with the same name and
 road type, inherits its value. Anything that still cannot be placed is
 listed for you to re-mark — never silently dropped.
+
+## What "shortest" means — cost profiles
+
+By default every metre counts the same, so the route is the shortest
+one. A delivery vehicle would rather deadhead along a road than thread
+a footpath, and `--profile` says so:
+
+```bash
+# weigh metres by how fast each road type is ridden
+python solve_route.py --data data --out result --profile edv
+
+# or your own weights: {"footway": 8, "residential": 18, ...} in km/h
+python solve_route.py --data data --out result --profile my_speeds.json
+```
+
+Reported kilometres are always **real metres**, whatever the profile —
+only the choice of route changes, and the cheaper route may be
+slightly longer.
+
+One-way streets are reported but never enforced: the model is
+undirected because a vehicle working from the footpath has no
+direction. `route.csv` marks each traversal that runs against a
+one-way in the `against_oneway` column, and the route viewer draws
+those stretches dark red with a total ("N km against a one-way — use
+the footpath"), so you know where not to ride on the carriageway. If
+you do ride on the carriageway, `--wrong-way-penalty 3` makes the
+optimiser avoid them where it can — it only steers deadhead, since
+service passes are mandatory whichever way you ride them.
 
 ## Version history — did that edit actually help?
 

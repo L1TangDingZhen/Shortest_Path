@@ -19,8 +19,9 @@ project evolves — especially the decision log.
 | B1: reproducible rounds (`prepare_round.py` export/apply) | **done, tested** (`test_prepare.py`) — **V2 complete** |
 | V2.2 graphical endpoints + in-browser solving | **done, tested** |
 | B9: solved-version history (`round_history.py`) | **done, tested** (`test_history.py`) |
-| V3 next up: B2 cost profile (prefer roads to footways) + B10.1 wrong-way flag | **specified, not started** |
-| V3+: pass pairing, GPX compare, per-letterbox sequencing, exact ILP | backlog |
+| E15: extraction switched to `--network-type all` (roads actually connected) | **done** |
+| B2 cost profiles (`--profile edv`) + B10.1/B10.2 wrong-way flag and penalty | **done, tested** (in `test_solve.py`) |
+| V3+: real time costs, pass pairing, GPX compare, per-letterbox sequencing, exact ILP | backlog |
 
 ---
 
@@ -83,9 +84,11 @@ Non-functional:
   lives exclusively in gitignored local files. See CLAUDE.md.
 - **NF2 Honest optimality claims.** Exactness is stated only under its
   true conditions; degraded modes must warn.
-- **NF3 Cost abstraction.** All algorithms read edge cost via `length`
-  only, so V3 can substitute time-based weights without touching the
-  solver's structure.
+- **NF3 Cost abstraction.** *Realised 2026-08.* Optimisation reads
+  `cost` (on the directed graph `D`), reporting reads `length` (real
+  metres). `--profile distance` makes them equal, so the historic
+  behaviour is the default and every printed kilometre stays a real
+  kilometre whatever the profile.
 - **NF4** String node ids; utf-8-sig CSVs; no meaning parsed from
   `edge_id`.
 
@@ -96,11 +99,12 @@ everywhere**):
 
 - `edges.csv`:
   `edge_id,name,highway,oneway,length_m,service,note,u,v,geometry_wkt`
-  (`service` ∈ {0,1,2,x}; `oneway` is informational only — the solver
-  ignores it, see E13)
+  (`service` ∈ {0,1,2,x}; `oneway` steers nothing by default — the
+  model is undirected — but feeds the `against_oneway` flag and the
+  optional `--wrong-way-penalty`, see E13 / B10)
 - `nodes.csv`: `node_id,lat,lon`
 - `route.csv`:
-  `seq,type,street,pass,direction,from_cross,to_cross,length_m,cum_km,edge_id`
+  `seq,type,street,pass,direction,from_cross,to_cross,length_m,cum_km,against_oneway,edge_id`
 
 `edge_id` is opaque to the solver — never parse meaning out of it.
 Contract changes require: updating this section, a migration note
@@ -112,6 +116,11 @@ Migration notes:
 - 2026-08: `service` gained the value `x` (excluded — the edge is
   dropped from the graph at load). Files without any `x` behave
   exactly as before; no migration needed.
+- 2026-08: `route.csv` gained `against_oneway` (second-to-last column,
+  before `edge_id`): `yes` when that traversal runs against a one-way,
+  else empty. Purely informational — the model stays undirected.
+  Anything reading `route.csv` by column *index* past `cum_km` must be
+  updated; reading by header name is unaffected.
 
 ## 4. Edge-case catalogue
 
@@ -351,18 +360,17 @@ stands, honestly). Option B was not needed.
   default mode replays splits (via `split_edge.py`) then overrides
   onto a fresh extraction, with backups and stale/new-edge reporting.
   Fixes E8; workflow: `extract --default-service 0 → prepare → solve`.
-- **B2 Time-based costs (V3).** Replace distance with estimated time:
-  per-highway-type speeds, fixed penalties for crossing signalised
-  intersections / arterials. Structure is ready (NF3); true turn-aware
-  costs need a line-graph formulation — research task. The first cut
-  that the round actually needs is narrower: **prefer carriageways to
-  footways for deadhead**. Measured 2026-08 on the real round: of
-  12.03 km deadhead, 3.88 km (32%) was footway, and the 4.79 km ride
-  home from the handover office was 26% footway — the solver treats a
-  metre of footpath and a metre of road as equal, so it threads
-  shortcuts through pedestrian paths where an EDV would rather use the
-  road. Weight per-metre cost by highway type, keep reporting
-  distances in metres.
+- **B2 Cost profiles.** *First cut shipped 2026-08* as `--profile`
+  (preset `distance` / `edv`, or a JSON file of `{highway: km/h}`):
+  cost = metres ÷ speed, so a metre of footpath costs more than a
+  metre of road and deadhead prefers carriageways. Reporting stays in
+  real metres (NF3). Measured effect on the real round: footway
+  deadhead 0.49 km → 0.03 km for +0.05 km total. Note the *large* win
+  (32% → 5% footway deadhead) came earlier and for free from
+  `--network-type all` (E15): with the roads missing, the solver had
+  no choice. **Still open:** real time estimates (fixed penalties for
+  signalised crossings and arterials; turn-aware costs need a
+  line-graph formulation — research task).
 - **B10 One-way awareness (three tiers).** Since the `all` default
   (E15) `oneway` is real data — 2 497 of 12 912 edges on the real
   round. The solver is still undirected (E13) and ignores it.
@@ -372,19 +380,24 @@ stands, honestly). Option B was not needed.
   on divided arterials mapped as two one-way chains. Legal on the
   footpath, wrong on the carriageway. Three separable tiers, cheapest
   first:
-  1. **Flag it (informational, ~15 lines, no algorithm change).** Add
-     an `against_oneway` column to `route.csv` and a distinct style in
-     the route viewer, so the rider knows which stretches must be
-     ridden on the footpath. Needs the traversal direction, which the
-     emitter has but currently discards — `route.csv` records only a
-     compass bearing.
-  2. **Penalise it (heuristic, part of B2).** Add a cost multiplier
-     for traversing a one-way edge against its direction, applied to
-     the deadhead/connector shortest paths. Would target the 2.25 km
-     of wrong-way deadhead; service passes stay mandatory either way.
-     Note this makes pair distances asymmetric while the matching
-     assumes symmetry — apply it to path *selection* only, or accept
-     the approximation and say so (NF2).
+  1. **Flag it.** *Shipped 2026-08.* `route.csv` gained
+     `against_oneway`; the viewer draws those stretches dark red and
+     dashed, names them in the tooltip and the step panel, and totals
+     them ("N km against a one-way -- use the footpath"). Purely
+     informational; the model stays undirected.
+  2. **Penalise it.** *Shipped 2026-08* as `--wrong-way-penalty`
+     (default 1.0 = off). Every edge becomes two arcs in a directed
+     cost graph `D`; the backward arc of a one-way costs x FACTOR.
+     Only steers deadhead -- service passes are mandatory whichever
+     way they are ridden. Measured at x3 on the real round: wrong-way
+     4.18 -> 2.29 km (its deadhead part ~2.4 -> 0.48 km) for +0.27 km
+     total. Documented approximation: costs become asymmetric while
+     the matching needs one number per pair, so `symmetrise()` takes
+     the cheaper direction -- a lower bound, since the Euler tour only
+     picks the direction later. Each connector therefore stores a path
+     for *both* directions and the traversal uses the matching one.
+     Off by default: riding the footpath is direction-free, and on a
+     divided arterial the "correct" chain is across the median.
   3. **Forbid it (exact, different solver class).** A true directional
      constraint is the Mixed CPP: NP-hard (E13), needs the ILP /
      branch-and-cut backend of B8. Only worth it with a concrete
@@ -460,6 +473,8 @@ is the only networked step — keep it thin, and keep everything after
 | 2026-08 | Point picking on the maps: editor right-click copies `lat,lon` / `--start=` / `--end=`; the extraction preview gets folium's LatLngPopup | Coordinates are the CLI primitive (reproducible, scriptable), but hunting them in an external map was needless friction |
 | 2026-08 | Endpoints became data, not just arguments: right-click sets START/END into `data/endpoints.json`, the editor draws them, `solve_route.py` loads the file when `--start`/`--end` are absent, `prepare_round.py` carries it across re-extractions; a Solve button runs the solver server-side and serves the route map | Copy-pasting coordinates into a terminal was still the last manual step. Storing the pins makes the browser flow complete (edit → Save → Solve → view) while the CLI stays authoritative and scriptable |
 | 2026-08 | Editor: Leaflet `boxZoom` disabled; contextmenu `preventDefault`; added a "click sets" mode selector | Two real bugs found in use: shift+click (the x gesture) was eaten by box-zoom, since a 1 px wobble zooms to a box, and the right-click popup was hidden behind the browser's native menu. The mode selector removes the reliance on modifier keys altogether |
+| 2026-08 | Optimisation weight (`cost`) split from reported distance (`length`), on a directed graph `D` where every edge becomes two arcs | A cost profile and a wrong-way penalty both need a weight that is not metres, and one of them is direction-dependent. Keeping `length` untouched means every printed kilometre stays a real kilometre, and `--profile distance` reproduces the old routes exactly (verified: synthetic totals unchanged to the metre) |
+| 2026-08 | Wrong-way penalty ships off by default | On a footpath, direction does not exist; on a divided arterial the "correct" chain is on the far side of the median, so forcing it could send the rider across the road. A real option for carriageway riding, not a default (B10) |
 | 2026-08 | Default extraction switched from `walk` to `all` | `walk` drops junction carriageways, shattering the road network into 34 components and forcing routes onto pedestrian crossings; `all` keeps both layers, restores "go straight", yields real `oneway` data and a 1.25 km shorter route on the same annotation (E15) |
 | 2026-08 | `prepare_round` gained a geometry fallback: overrides whose `edge_id` vanished are re-found by position (same name/type, all sample points within 6 m, length-bounded), accepting any component of an osmnx-merged `"A; B"` name | Changing the network type changes which junctions exist, so osmnx splits ways differently and 618 of 10 850 ids disappeared. Id-only replay silently lost 7 annotated edges (659 m); with geometry it recovered all of them as 18 new pieces, and mandatory distance came out identical to the metre. B1's promise ("fully reproducible after re-extraction") only holds with this |
 | 2026-08 | `.gitignore`: `data/` → `data*/`, `result/` → `result*/` | A side-by-side `data_all/` extraction of the real round showed up as untracked — the ignore patterns only covered the exact directory names |
