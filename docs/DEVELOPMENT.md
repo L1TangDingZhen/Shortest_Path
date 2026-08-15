@@ -22,6 +22,7 @@ project evolves — especially the decision log.
 | E15: extraction switched to `--network-type all` (roads actually connected) | **done** |
 | B2 cost profiles (`--profile edv`) + B10.1/B10.2 wrong-way flag and penalty | **done, tested** (in `test_solve.py`) |
 | E16: one-way direction preserved through extraction | **done, tested** (`test_extract.py`) |
+| B11: turn-aware Euler tour + rough riding time / turn counts | **done, tested** (in `test_solve.py`) |
 | V3+: real time costs, pass pairing, GPX compare, per-letterbox sequencing, exact ILP | backlog |
 
 ---
@@ -418,7 +419,29 @@ stands, honestly). Option B was not needed.
      branch-and-cut backend of B8. Only worth it with a concrete
      street that must be ridden on the carriageway.
 - **B3 Prefer paired passes.** Soft constraint nudging 1/2 and 2/2 of
-  the same street to be adjacent when nearly free (E5).
+  the same street to be adjacent when nearly free (E5). *Now cheap to
+  build:* it is the same lever as B11 — a preference inside the tour
+  chooser, costing no distance.
+- **B11 Choosing WHICH Euler tour (turn comfort, wrong-way).**
+  *Shipped 2026-08.* Every Euler tour over the same augmented graph
+  covers the same edges, so they all have the same length: the choice
+  is free, and Hierholzer stays correct whichever unused edge comes
+  next (unlike Fleury). `euler_tour()` therefore replaces networkx's
+  arbitrary tour with a greedy one scoring turn comfort (straight /
+  easy / crossing / U-turn, in seconds, sided by `--traffic-side`)
+  plus wrong-way metres. Two things learned the hard way:
+  - The greedy is myopic. Judging only the first edge made it *slide
+    into* long backwards runs on a divided arterial, because "carry
+    straight on" is the cheap choice; it now looks ahead along the
+    forced continuation (55% of nodes have degree 2 and offer no
+    choice at all, so entering a chain commits to all of it).
+  - The wrong-way weight is tied to `--wrong-way-penalty`, not a
+    constant: with the penalty off, trading turns for wrong-way is not
+    what the rider asked for.
+  Caveat on "free": a connector's two directions are separately
+  computed shortest paths, so a wrong-way penalty can make them differ
+  by a few metres. Without a penalty the length is identical to the
+  metre (asserted in `test_solve.py`).
 - **B4 GPX comparison.** Import a ride trace of the current route
   (private data — never committed) and report current vs optimised km.
 - **B5 Interactive service editor.** Browser UI: click an edge to
@@ -488,6 +511,8 @@ is the only networked step — keep it thin, and keep everything after
 | 2026-08 | Point picking on the maps: editor right-click copies `lat,lon` / `--start=` / `--end=`; the extraction preview gets folium's LatLngPopup | Coordinates are the CLI primitive (reproducible, scriptable), but hunting them in an external map was needless friction |
 | 2026-08 | Endpoints became data, not just arguments: right-click sets START/END into `data/endpoints.json`, the editor draws them, `solve_route.py` loads the file when `--start`/`--end` are absent, `prepare_round.py` carries it across re-extractions; a Solve button runs the solver server-side and serves the route map | Copy-pasting coordinates into a terminal was still the last manual step. Storing the pins makes the browser flow complete (edit → Save → Solve → view) while the CLI stays authoritative and scriptable |
 | 2026-08 | Editor: Leaflet `boxZoom` disabled; contextmenu `preventDefault`; added a "click sets" mode selector | Two real bugs found in use: shift+click (the x gesture) was eaten by box-zoom, since a 1 px wobble zooms to a box, and the right-click popup was hidden behind the browser's native menu. The mode selector removes the reliance on modifier keys altogether |
+| 2026-08 | SPEC-2's pinned mode now starts the circuit at the pinned **end** and crosses the virtual edge first, instead of rotating afterwards and reversing when the circuit happened to cross it the other way | The reversal mirrored **every** traversal in the route, so a coin flip decided whether the tour's carefully chosen directions survived: measured 2.47 km ridden against one-ways where the tour had produced 0.03 km. Reversing a walk is not direction-neutral once anything cares about direction |
+| 2026-08 | Riding time and turn counts are reported (rough: profile speeds + a fixed cost per turn), and stored per version | The user asked to compare routes by time. Reported as "excludes every stop" because stop time at letterboxes dominates a real round and would make an absolute estimate fiction; as a *relative* measure between versions it is sound |
 | 2026-08 | One-way direction is captured from the directed graph before `to_undirected()` and written into the u/v columns; `edge_id` stays keyed on iteration order | The undirected view keeps no direction, so 49% of one-way edges had been exported backwards (E16). Everything built on B10 — the `against_oneway` flag and the wrong-way penalty — was reasoning about a coin flip. Keeping `edge_id` stable meant the fix cost one re-extraction and zero annotation |
 | 2026-08 | Optimisation weight (`cost`) split from reported distance (`length`), on a directed graph `D` where every edge becomes two arcs | A cost profile and a wrong-way penalty both need a weight that is not metres, and one of them is direction-dependent. Keeping `length` untouched means every printed kilometre stays a real kilometre, and `--profile distance` reproduces the old routes exactly (verified: synthetic totals unchanged to the metre) |
 | 2026-08 | Wrong-way penalty ships off by default | On a footpath, direction does not exist; on a divided arterial the "correct" chain is on the far side of the median, so forcing it could send the rider across the road. A real option for carriageway riding, not a default (B10) |

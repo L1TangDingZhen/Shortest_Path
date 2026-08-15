@@ -409,11 +409,180 @@ def deadhead_segments(D, node_path):
         segs.append(dict(kind="deadhead", edge_id=key, u=x, v=y,
                          name=data["name"], length=data["length"],
                          wkt=data["wkt"], pass_label="-",
-                         against=data["against"]))
+                         highway=data["highway"], against=data["against"]))
     return segs
 
 
-def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None):
+# ----------------------------------------------------------------------
+# Phase 3 -- choosing WHICH Euler tour
+# ----------------------------------------------------------------------
+#
+# Every Euler tour over the same augmented graph covers exactly the
+# same edges, so they all have exactly the same length.  Which one we
+# take is therefore free: we can spend it on the things distance does
+# not capture -- awkward turns and riding one-way streets backwards.
+# Hierholzer's algorithm stays correct whichever unused edge is picked
+# next (unlike Fleury, which needs bridge avoidance), so a greedy
+# preference costs nothing and risks nothing.
+#
+# One caveat on "same length": a connector's two directions are two
+# separately computed shortest paths, and a wrong-way penalty can make
+# them differ in metres. Without a penalty they are the same path
+# reversed and the tour choice is exactly free; with one, the total can
+# shift by a few metres.
+#
+# The wrong-way weight is tied to --wrong-way-penalty rather than being
+# a constant: preferring straight continuations pulls the tour INTO the
+# long one-way chains of a divided arterial, so unless the rider has
+# actually asked to avoid wrong-way riding, the tour should not trade
+# turns for it (measured: a weak weight made wrong-way worse, not
+# better).
+
+TURN_SECONDS = {"straight": 0.0, "easy": 4.0, "cross": 12.0, "u": 25.0}
+STRAIGHT_DEG = 30      # within this, it is not a turn
+U_TURN_DEG = 150       # beyond this, it is a U-turn
+WRONG_WAY_TOUR_WEIGHT = 0.5   # seconds per metre, per unit of penalty
+
+
+def turn_kind(bearing_in, bearing_out, traffic_side="left"):
+    """straight / easy / cross / u. The `cross` turn is the one that
+    cuts the oncoming stream: right where traffic keeps left."""
+    if bearing_in is None or bearing_out is None:
+        return "straight"
+    delta = (bearing_out - bearing_in + 180) % 360 - 180
+    if abs(delta) <= STRAIGHT_DEG:
+        return "straight"
+    if abs(delta) >= U_TURN_DEG:
+        return "u"
+    turning_right = delta > 0
+    crosses = turning_right if traffic_side == "left" else not turning_right
+    return "cross" if crosses else "easy"
+
+
+def bearing_of(a, b):
+    return None if a == b else (
+        math.degrees(math.atan2(
+            (b[1] - a[1]) * math.cos(math.radians((a[0] + b[0]) / 2)),
+            b[0] - a[0])) % 360)
+
+
+def tour_meta(R, F, D, nodes):
+    """Per required-edge geometry facts the tour chooser needs: the
+    bearing leaving u, the bearing arriving at v, and how many metres
+    of that direction run against a one-way."""
+    meta = {}
+    blank = {"out": None, "in": None, "against_m": 0.0}
+    for u, v, key, data in R.edges(keys=True, data=True):
+        if "base" not in data and "paths" not in data:
+            meta[key] = {u: blank, v: blank}   # the virtual end->start
+            continue
+        if "paths" in data:
+            chains = {d: [nodes[n] for n in p]
+                      for d, p in data["paths"].items()}
+            against = {}
+            for d, path in data["paths"].items():
+                against[d] = sum(
+                    a[1]["length"] for a in
+                    (cheapest_arc(D, x, y) for x, y in zip(path, path[1:]))
+                    if a[1]["against"])
+        else:
+            edata = F[u][v][data["base"]]
+            chain = segment_coords({"wkt": edata["wkt"], "u": u, "v": v},
+                                   nodes)
+            chains = {u: chain, v: list(reversed(chain))}
+            wrong = edata["length"] if edata["oneway"] else 0.0
+            against = {u: 0.0 if not edata["oneway"] or u == edata["cu"]
+                       else wrong,
+                       v: 0.0 if not edata["oneway"] or v == edata["cu"]
+                       else wrong}
+        info = {}
+        for start, chain in chains.items():
+            info[start] = {
+                "out": bearing_of(chain[0], chain[1]) if len(chain) > 1
+                else None,
+                "in": bearing_of(chain[-2], chain[-1]) if len(chain) > 1
+                else None,
+                "against_m": against.get(start, 0.0),
+            }
+        meta[key] = info
+    return meta
+
+
+def euler_tour(R, source, meta, traffic_side="left", optimise=True,
+               wrong_way_penalty=1.0, first_key=None):
+    """Hierholzer, picking the next edge by turn comfort and by not
+    riding one-way streets backwards. Returns [(u, v, key), ...].
+
+    The choice never changes the tour's length -- see the note above --
+    so this is pure gain; with optimise=False the first available edge
+    is taken, which is what an unguided Euler tour does."""
+    adj = defaultdict(list)
+    for u, v, key in R.edges(keys=True):
+        adj[u].append((v, key))
+        if u != v:
+            adj[v].append((u, key))
+    used = set()
+    wrong_weight = max(0.0, wrong_way_penalty - 1.0) * WRONG_WAY_TOUR_WEIGHT
+
+    def run_against(node, key):
+        """Metres against a one-way committed to by taking `key` from
+        `node`: most nodes have degree 2 and offer no further choice,
+        so entering a chain the wrong way commits to all of it. Judging
+        only the first edge is what made the tour prefer to slide into
+        long backwards runs on a divided arterial."""
+        total, seen = 0.0, set()
+        while key is not None and key not in seen:
+            seen.add(key)
+            total += meta.get(key, {}).get(node, {}).get("against_m", 0.0)
+            nxt = next((n for n, k in adj[node] if k == key), None)
+            if nxt is None or len(adj[nxt]) != 2:
+                break
+            node, key = nxt, next((k for _, k in adj[nxt] if k != key),
+                                  None)
+        return total
+
+    def choose(node, bearing_in):
+        if first_key is not None and not used:
+            forced = next(((i, n, k) for i, (n, k) in enumerate(adj[node])
+                           if k == first_key), None)
+            if forced:
+                return forced
+        best = None
+        for i, (nbr, key) in enumerate(adj[node]):
+            if key in used:
+                continue
+            if not optimise:
+                return i, nbr, key
+            info = meta.get(key, {}).get(node, {})
+            score = (TURN_SECONDS[turn_kind(bearing_in, info.get("out"),
+                                            traffic_side)]
+                     + wrong_weight * (run_against(node, key)
+                                       if wrong_weight else 0.0))
+            if best is None or score < best[0]:
+                best = (score, i, nbr, key)
+        return None if best is None else best[1:]
+
+    stack = [(source, None, None)]        # node, key used to get here
+    out = []
+    while stack:
+        node, in_key, bearing_in = stack[-1]
+        picked = choose(node, bearing_in)
+        if picked is None:
+            stack.pop()
+            if stack and in_key is not None:
+                out.append((stack[-1][0], node, in_key))
+        else:
+            _, nbr, key = picked
+            used.add(key)
+            stack.append((nbr, key,
+                          meta.get(key, {}).get(node, {}).get("in")))
+    out.reverse()
+    return out
+
+
+def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None,
+             traffic_side="left", optimise_tour=True,
+             wrong_way_penalty=1.0):
     """Walk the Euler circuit/path and expand connectors into real
     street segments. Returns a list of segment dicts.
 
@@ -421,22 +590,33 @@ def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None):
     The circuit is rotated so the virtual edge would be last, the edge
     is dropped, and the walk is oriented to begin at pin_start -- what
     remains is the open route start -> ... -> end."""
+    meta = tour_meta(R, F, D, nodes)
     if endpoints:
         source = endpoints[0]
         assert nx.has_eulerian_path(R, source=source)
-        euler = list(nx.eulerian_path(R, source=source, keys=True))
-    else:
-        source = start_node if (start_node in R) else None
+        first = None
+    elif pin_start is not None:
+        # SPEC-2: start the circuit at the pinned END and cross the
+        # virtual end->start edge immediately, so dropping that first
+        # step leaves a walk that already runs start -> ... -> end.
+        # (Rotating afterwards and reversing when the circuit happened
+        # to cross the virtual edge the other way used to mirror every
+        # traversal, throwing away the tour's chosen directions.)
+        source = next(n for n in R.neighbors(pin_start)
+                      if VIRTUAL_KEY in R[pin_start][n])
+        first = VIRTUAL_KEY
         assert nx.is_eulerian(R)
-        euler = list(nx.eulerian_circuit(R, source=source, keys=True))
+    else:
+        assert nx.is_eulerian(R)
+        source = start_node if (start_node in R) else next(iter(R.nodes))
+        first = None
+    euler = euler_tour(R, source, meta, traffic_side, optimise_tour,
+                       wrong_way_penalty, first)
 
     if pin_start is not None:
-        i = next(idx for idx, (u, v, k) in enumerate(euler)
-                 if k == VIRTUAL_KEY)
-        walk = euler[i + 1:] + euler[:i]
-        if walk and walk[0][0] != pin_start:   # circuit hit the virtual
-            walk = [(v, u, k) for u, v, k in reversed(walk)]  # edge the
-        euler = walk                           # other way round: flip
+        assert euler[0][2] == VIRTUAL_KEY, "virtual edge must be first"
+        euler = euler[1:]
+        assert not euler or euler[0][0] == pin_start
 
     segments = []
     passes_seen = defaultdict(int)
@@ -456,9 +636,46 @@ def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None):
                                  u=u, v=v, name=edata["name"],
                                  length=edata["length"], wkt=edata["wkt"],
                                  pass_label=f"{passes_seen[base]}/{total}",
+                                 highway=edata["highway"],
                                  against=bool(edata["oneway"])
                                  and u != edata["cu"]))
     return segments
+
+
+def annotate_turns(segments, nodes, traffic_side="left"):
+    """Record the turn made when entering each segment, and count them.
+    Done on the expanded route, so turns inside connectors count too."""
+    counts = defaultdict(int)
+    previous = None
+    for i, s in enumerate(segments):
+        chain = segment_coords(s, nodes)
+        out = bearing_of(chain[0], chain[1]) if len(chain) > 1 else None
+        into = bearing_of(chain[-2], chain[-1]) if len(chain) > 1 else None
+        s["turn"] = ("start" if i == 0 else
+                     turn_kind(previous, out, traffic_side))
+        if i:
+            counts[s["turn"]] += 1
+        previous = into if into is not None else previous
+    return counts
+
+
+def estimate_seconds(segments, speeds):
+    """Rough riding time: metres at the profile's speeds, plus a fixed
+    cost per turn. Excludes every stop at a letterbox, which on a real
+    round dominates -- useful for comparing routes, not for planning a
+    day."""
+    table = speeds or PROFILES["edv"]
+    riding = sum(s["length"] /
+                 (table.get(s.get("highway", ""), DEFAULT_SPEED) / 3.6)
+                 for s in segments)
+    turning = sum(TURN_SECONDS.get(s.get("turn", "straight"), 0.0)
+                  for s in segments)
+    return riding, turning
+
+
+def hhmm(seconds):
+    m = int(round(seconds / 60))
+    return f"{m // 60}h {m % 60:02d}m" if m >= 60 else f"{m}m"
 
 
 # ----------------------------------------------------------------------
@@ -637,10 +854,16 @@ if (closed) {
 }
 
 const wrongKm = S.reduce((a, s) => a + (s.w ? s.l : 0), 0) / 1000;
+const nCross = S.filter(s => s.t === "cross").length;
+const nU = S.filter(s => s.t === "u").length;
 document.getElementById("totals").innerHTML =
   "service <b>" + P.service_km.toFixed(2) + " km</b> &middot; total <b>" +
   P.total_km.toFixed(2) + " km</b> &middot; deadhead <b>" +
   (P.total_km - P.service_km).toFixed(2) + " km</b>" +
+  (P.time_min ? "<br>riding <b>" + Math.floor(P.time_min / 60) + "h " +
+   String(Math.round(P.time_min % 60)).padStart(2, "0") +
+   "m</b> (excludes stops) &middot; " + nCross + " crossing turns, " +
+   nU + " U-turns" : "") +
   (wrongKm > 0 ? '<br><span style="color:#7b341e">' + wrongKm.toFixed(2) +
    " km against a one-way (use the footpath)</span>" : "");
 
@@ -675,6 +898,8 @@ function setStep(k) {
     (s.k === "s" ? "service pass " + esc(s.p) : "deadhead (connector)") +
     " &middot; " + s.l + " m &middot; heading " + s.dir +
     " &middot; cum " + s.cum.toFixed(3) + " km" +
+    (s.t === "cross" ? " &middot; <b>turn across traffic</b>"
+     : s.t === "u" ? " &middot; <b>U-turn</b>" : "") +
     (s.w ? '<br><span style="color:#7b341e"><b>against the one-way</b>'
          + " &mdash; ride the footpath here</span>" : "");
   slider.value = cur;
@@ -718,7 +943,7 @@ setStep(1);
 """
 
 
-def write_map(segments, nodes, out_dir: Path):
+def write_map(segments, nodes, out_dir: Path, time_min=0.0):
     """Self-contained interactive viewer: slider/play steps through the
     walk, the current segment is highlighted with a direction arrow."""
     segs, cum = [], 0.0
@@ -733,13 +958,15 @@ def write_map(segments, nodes, out_dir: Path):
             "cum": round(cum / 1000, 3),
             "dir": bearing_label(nodes[s["u"]], nodes[s["v"]]),
             "w": 1 if s.get("against") else 0,
+            "t": s.get("turn", "straight"),
             "c": [[round(lat, 6), round(lon, 6)] for lat, lon in coords],
         })
     service = sum(s["length"] for s in segments if s["kind"] == "service")
     payload = json.dumps(
         {"segs": segs,
          "service_km": round(service / 1000, 2),
-         "total_km": round(cum / 1000, 2)},
+         "total_km": round(cum / 1000, 2),
+         "time_min": round(time_min, 1)},
         ensure_ascii=False).replace("</", "<\\/")
     path = out_dir / "route_map.html"
     path.write_text(ROUTE_TEMPLATE.replace("__PAYLOAD__", payload),
@@ -799,6 +1026,16 @@ def main():
                          "extract with --network-type all. Riding the "
                          "footpath is direction-free, so leave this off "
                          "unless you ride on the carriageway.")
+    ap.add_argument("--traffic-side", choices=["left", "right"],
+                    default="left",
+                    help="which side traffic drives on, so the solver "
+                         "knows which turn crosses the oncoming stream "
+                         "(default left: AU/UK/JP/NZ)")
+    ap.add_argument("--no-turn-optimisation", action="store_true",
+                    help="take any Euler tour instead of preferring one "
+                         "with fewer awkward turns and less wrong-way "
+                         "riding. All Euler tours are the same length, "
+                         "so this only makes the route less pleasant")
     ap.add_argument("--history", nargs="?", const=DEFAULT_HISTORY,
                     metavar="DIR",
                     help="file this solve away as a version (annotation "
@@ -897,10 +1134,13 @@ def main():
     n_odd = len(odd_nodes(R))
     print(f"Parity repair: {n_odd} odd-degree nodes to match ...")
     print("Extracting Euler traversal ...")
+    tour_opts = {"traffic_side": args.traffic_side,
+                 "optimise_tour": not args.no_turn_optimisation,
+                 "wrong_way_penalty": args.wrong_way_penalty}
     if pin_start is not None:                        # --start + --end
         endpoints, extra = parity_repair(R, D, False, None)
         segments = traverse(F, R, D, nodes, None, None,
-                            pin_start=pin_start)
+                            pin_start=pin_start, **tour_opts)
         kind = "open path, start & end pinned"
     elif pin_end is not None:                        # --end only
         endpoints, extra = parity_repair(R, D, True, pin_end)
@@ -910,14 +1150,17 @@ def main():
             e_pin = snap_to_node(args.end, list(endpoints), nodes)
             endpoints = tuple(n for n in endpoints if n != e_pin) \
                 + (e_pin,)
-            segments = traverse(F, R, D, nodes, endpoints, None)
+            segments = traverse(F, R, D, nodes, endpoints, None,
+                                **tour_opts)
             kind = "open path, end pinned"
         else:  # no odd nodes: the route is a circuit; close it there
-            segments = traverse(F, R, D, nodes, None, pin_end)
+            segments = traverse(F, R, D, nodes, None, pin_end,
+                                **tour_opts)
             kind = "closed circuit (starts and ends at --end)"
     else:
         endpoints, extra = parity_repair(R, D, args.open, start_node)
-        segments = traverse(F, R, D, nodes, endpoints, start_node)
+        segments = traverse(F, R, D, nodes, endpoints, start_node,
+                            **tour_opts)
         kind = "open path" if endpoints else "closed circuit"
 
     if args.return_to_start:
@@ -935,10 +1178,15 @@ def main():
                   f"back to the start")
             kind += " + return to start"
 
+    turns = annotate_turns(segments, nodes, args.traffic_side)
+    riding_s, turning_s = estimate_seconds(segments, speeds)
+    wrong_km = sum(s["length"] for s in segments if s.get("against")) / 1000
+
     total = sum(s["length"] for s in segments)
     deadhead = total - service_len
     route_csv = write_route_csv(segments, F, nodes, out_dir)
-    route_map = write_map(segments, nodes, out_dir)
+    route_map = write_map(segments, nodes, out_dir,
+                          (riding_s + turning_s) / 60)
 
     if args.history:
         import round_history
@@ -965,9 +1213,11 @@ def main():
                 "edges_total": len(edges),
                 "profile": profile_name,
                 "wrong_way_penalty": args.wrong_way_penalty,
-                "wrong_way_km": round(sum(
-                    s["length"] for s in segments
-                    if s.get("against")) / 1000, 3),
+                "wrong_way_km": round(wrong_km, 3),
+                "time_min": round((riding_s + turning_s) / 60, 1),
+                "turns_cross": turns["cross"],
+                "turns_u": turns["u"],
+                "turn_optimised": not args.no_turn_optimisation,
             })
         print("  history: " + (f"recorded version {version}" if is_new
                                else f"unchanged since version {version}")
@@ -980,6 +1230,11 @@ Route total              : {total / 1000:7.2f} km
 Extra / deadhead         : {deadhead / 1000:7.2f} km   ({100 * deadhead / max(total, 1):.1f}% of route)
 Segments                 : {sum(1 for s in segments if s['kind'] == 'service')} service + \
 {sum(1 for s in segments if s['kind'] == 'deadhead')} deadhead
+Riding time (rough)      : {hhmm(riding_s + turning_s):>9}   \
+({hhmm(riding_s)} moving + {hhmm(turning_s)} turning; excludes every stop)
+Turns                    : {turns['cross']} crossing + {turns['u']} U-turn + \
+{turns['easy']} easy + {turns['straight']} straight
+Against a one-way        : {wrong_km:7.2f} km   (ride the footpath there)
 Outputs                  : {route_csv}
                            {route_map}
 =================================================

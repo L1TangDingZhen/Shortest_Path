@@ -271,6 +271,18 @@ Route total              :   19.87 km
 Extra / deadhead         :    1.45 km   (7.3% of route)
 ```
 
+Alongside it the solver reports a rough **riding time** (profile speeds
+plus a fixed cost per turn) and how many turns cross the oncoming
+traffic or double back. The time deliberately excludes every stop at a
+letterbox — those dominate a real round, so treat it as a way to
+compare two routes, not as a plan for the day.
+
+Among all the routes that cover the same streets the total distance is
+identical, so the solver spends that freedom on comfort: it prefers
+tours with fewer awkward turns and less riding against one-ways
+(`--no-turn-optimisation` turns this off, `--traffic-side` says which
+turn crosses traffic).
+
 The mandatory part is the job itself — every service street times its
 multiplicity. The **extra** is the only optimisable quantity, and the
 algorithm guarantees it is minimal **when the service streets form one

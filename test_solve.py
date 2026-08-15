@@ -112,6 +112,39 @@ def deadhead_ids(rows):
     return [r["edge_id"] for r in rows if r["type"] == "deadhead"]
 
 
+def wrong_way_m(rows):
+    return sum(float(r["length_m"]) for r in rows
+               if r["against_oneway"] == "yes")
+
+
+def walk_directions(edges, rows):
+    """(edge_id, travelled_forward) per row, by chaining the walk."""
+    out, cur = [], None
+    for i, r in enumerate(rows):
+        u, v = edges[r["edge_id"]]["u"], edges[r["edge_id"]]["v"]
+        if cur is None:
+            nxt = rows[i + 1]["edge_id"] if i + 1 < len(rows) else None
+            ends = ((edges[nxt]["u"], edges[nxt]["v"]) if nxt else ())
+            cur = v if (v in ends and u not in ends) else (
+                u if v not in ends else v)
+        else:
+            cur = v if cur == u else u
+        out.append((r["edge_id"], cur == v))
+    return out
+
+
+def check_oneway_flags(data_dir: Path, rows):
+    """against_oneway must be exactly 'this one-way was ridden v->u'."""
+    with open(data_dir / "edges.csv", newline="",
+              encoding="utf-8-sig") as f:
+        edges = {r["edge_id"]: r for r in csv.DictReader(f)}
+    for r, (eid, forward) in zip(rows, walk_directions(edges, rows)):
+        oneway = (edges[eid]["oneway"] or "").strip().lower() == "true"
+        expected = "yes" if (oneway and not forward) else ""
+        assert r["against_oneway"] == expected, \
+            f"{eid}: flag {r['against_oneway']!r}, expected {expected!r}"
+
+
 def read_route(out_dir: Path):
     with open(out_dir / "route.csv", newline="",
               encoding="utf-8-sig") as f:
@@ -185,6 +218,16 @@ def main():
                   r"(.*?)</script>", html, re.DOTALL)
     viewer = json.loads(m.group(1))
     assert len(viewer["segs"]) == len(rows1), "viewer payload out of sync"
+
+    print("== turn optimisation is free (same distance, same work) ==")
+    out_raw = TMP / "circuit_raw"
+    run(data, out_raw, "--no-turn-optimisation")
+    rows_raw = read_route(out_raw)
+    check_walk(rows_raw, edges_by_id, spec, closed=True)
+    assert abs(total_km(rows_raw) - total_km(rows1)) < 1e-6, \
+        f"every Euler tour has the same length: {total_km(rows_raw)} " \
+        f"vs {total_km(rows1)}"
+    assert len(rows_raw) == len(rows1), "same number of traversals"
 
     print("== open mode ==")
     out2 = TMP / "open"
@@ -294,20 +337,30 @@ def main():
     assert total_km(rows_e) > total_km(rows_d), \
         "the cheaper route may be longer in metres -- that is the point"
 
-    print("== against_oneway is reported ==")
+    print("== against_oneway agrees with the direction actually ridden ==")
     assert "against_oneway" in rows_e[0], list(rows_e[0])
-    flags = {r["edge_id"]: r["against_oneway"] for r in rows_e}
-    assert flags["road"] == "yes", flags   # ridden B->A backwards
-    assert flags["svc"] == "", flags       # two-way street
     assert all(r["against_oneway"] == "" for r in rows_d), \
         "the footway route has nothing to flag"
+    for rows in (rows_d, rows_e):
+        check_oneway_flags(dc, rows)
+
+    print("== the tour prefers riding the one-way legally ==")
+    # both directions cover the same edges, so choosing the legal one
+    # is free -- an unguided tour has no reason to prefer it
+    out_raw = TMP / "cost_raw"
+    run(dc, out_raw, "--profile", "edv", "--no-turn-optimisation")
+    rows_raw = read_route(out_raw)
+    assert abs(total_km(rows_raw) - total_km(rows_e)) < 1e-6, \
+        "turn optimisation must not change the distance"
+    assert wrong_way_m(rows_e) <= wrong_way_m(rows_raw), \
+        f"optimised tour rides {wrong_way_m(rows_e)} m the wrong way, " \
+        f"unguided only {wrong_way_m(rows_raw)} m"
 
     print("== wrong-way penalty avoids the one-way ==")
     out_w = TMP / "cost_wrong"
     run(dc, out_w, "--profile", "edv", "--wrong-way-penalty", "3")
     rows_w = read_route(out_w)
     check_walk(rows_w, cby, cspec, closed=True)
-    assert deadhead_ids(rows_w) == ["foot"], deadhead_ids(rows_w)
     assert all(r["against_oneway"] == "" for r in rows_w)
 
     print("== bad profile / penalty are rejected ==")

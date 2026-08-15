@@ -43,7 +43,8 @@ DEFAULT_HISTORY = "round.local/history"
 INDEX = "index.csv"
 FIELDS = ["id", "timestamp", "note", "mode", "service_edges",
           "mandatory_km", "total_km", "deadhead_km", "islands",
-          "bridge_km", "profile", "wrong_way_km", "annotation"]
+          "bridge_km", "profile", "wrong_way_km", "time_min",
+          "turns_cross", "turns_u", "annotation"]
 
 
 # ----------------------------------------------------------------------
@@ -173,18 +174,21 @@ def cmd_list(history_dir: Path, _args):
     index = read_index(history_dir)
     if not index:
         sys.exit("no versions recorded yet -- solve with --history first")
-    print(f"{'id':<16}{'streets':>8}{'service':>9}{'total':>9}"
-          f"{'dead':>8}{'isl':>5}  {'profile':<9}  mode / note")
+    print(f"{'id':<16}{'service':>8}{'total':>8}{'dead':>7}"
+          f"{'time':>7}{'wrong':>7}{'X-turn':>7}{'U':>4}  note")
     prev = None
     for r in index:
         total = float(r["total_km"])
-        delta = "" if prev is None else f"  ({total - prev:+.2f})"
+        delta = "" if prev is None else f" ({total - prev:+.2f})"
         prev = total
-        label = r["mode"] + (f" — {r['note']}" if r["note"] else "")
-        print(f"{r['id']:<16}{r['service_edges']:>8}"
-              f"{float(r['mandatory_km']):>8.2f}k{total:>8.2f}k"
-              f"{float(r['deadhead_km']):>7.2f}k{r['islands']:>5}"
-              f"  {(r.get('profile') or '?'):<9}  {label}{delta}")
+        mins = float(r.get("time_min") or 0)
+        time = f"{int(mins) // 60}h{int(mins) % 60:02d}" if mins else "-"
+        note = r["note"] or r["mode"]
+        print(f"{r['id']:<16}{float(r['mandatory_km']):>7.2f}k"
+              f"{total:>7.2f}k{float(r['deadhead_km']):>6.2f}k"
+              f"{time:>7}{float(r.get('wrong_way_km') or 0):>6.2f}k"
+              f"{(r.get('turns_cross') or '-'):>7}{(r.get('turns_u') or '-'):>4}"
+              f"  {note[:38]}{delta}")
     print(f"\n{len(index)} version(s) in {history_dir}")
 
 
