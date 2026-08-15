@@ -69,12 +69,26 @@ def norm(val, fallback=""):
     return str(val)
 
 
+def oneway_arcs(G):
+    """{(u, v)} of the LEGAL direction of every one-way edge, taken
+    from the directed graph before it is collapsed.
+
+    Needed because `to_undirected()` keeps no direction, and iterating
+    an undirected MultiGraph yields (u, v) in node-insertion order --
+    so roughly half of the one-way edges would be exported pointing
+    the wrong way, which silently corrupts anything that reasons about
+    direction (the `against_oneway` flag, `--wrong-way-penalty`)."""
+    return {(u, v) for u, v, d in G.edges(data=True) if d.get("oneway")}
+
+
 def download_graph(poly, network_type):
     import osmnx as ox
     print("Downloading network from OpenStreetMap ...")
     G = ox.graph_from_polygon(poly, network_type=network_type,
                               simplify=True, truncate_by_edge=True)
+    arcs = oneway_arcs(G)
     G = ox.convert.to_undirected(G)
+    G.graph["oneway_arcs"] = arcs
     # keep the largest connected component only
     if not nx.is_connected(G):
         biggest = max(nx.connected_components(G), key=len)
@@ -97,9 +111,19 @@ def export(G, out_dir: Path, default_service=2):
             w.writerow([n, d["y"], d["x"]])
 
     edges_path = out_dir / "edges.csv"
+    arcs = G.graph.get("oneway_arcs") or set()
     rows = []
+    reoriented = 0
     for u, v, k, d in G.edges(keys=True, data=True):
         name = norm(d.get("name")) or f"(unnamed {norm(d.get('highway'), 'way')})"
+        # edge_id stays keyed on the iteration order (it is opaque, and
+        # keeping it stable keeps existing annotations valid), but the
+        # u/v columns are flipped to the legal direction when the
+        # undirected view happened to store a one-way backwards.
+        edge_id = f"{u}-{v}-{k}"
+        if (v, u) in arcs and (u, v) not in arcs:
+            u, v = v, u
+            reoriented += 1
         geom = d.get("geometry")
         if geom is not None:
             wkt = geom.wkt
@@ -107,7 +131,7 @@ def export(G, out_dir: Path, default_service=2):
             wkt = (f"LINESTRING ({G.nodes[u]['x']} {G.nodes[u]['y']}, "
                    f"{G.nodes[v]['x']} {G.nodes[v]['y']})")
         rows.append({
-            "edge_id": f"{u}-{v}-{k}",
+            "edge_id": edge_id,
             "name": name,
             "highway": norm(d.get("highway")),
             "oneway": norm(d.get("oneway")),
@@ -118,6 +142,9 @@ def export(G, out_dir: Path, default_service=2):
             "v": v,
             "geometry_wkt": wkt,
         })
+    if reoriented:
+        print(f"  {reoriented} one-way edges written in their legal "
+              f"direction (the undirected view had them backwards)")
     rows.sort(key=lambda r: (r["name"], r["edge_id"]))
     with open(edges_path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))

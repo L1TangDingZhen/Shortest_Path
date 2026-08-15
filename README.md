@@ -293,6 +293,7 @@ python test_editor.py
 python test_split.py
 python test_prepare.py
 python test_history.py
+python test_extract.py
 ```
 
 Runs the solver on a synthetic street grid (no internet needed) and
