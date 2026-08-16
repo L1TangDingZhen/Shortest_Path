@@ -151,7 +151,7 @@ def save_endpoints(data_dir: Path, data):
             raise ValueError(f"{key}: {lat},{lon} is not a coordinate")
         out[key] = [lat, lon]
     out["return_to_start"] = bool(data.get("return_to_start"))
-    profile = str(data.get("profile") or "distance")
+    profile = str(data.get("profile") or "edv")
     if not re.fullmatch(r"[\w.\-/]+", profile):
         raise ValueError(f"profile: {profile!r} is not a name or path")
     out["profile"] = profile
@@ -243,9 +243,9 @@ TEMPLATE = r"""<!DOCTYPE html>
     <button data-clear="end">clear</button><br>
     <label><input type="checkbox" id="eprts"> return to start after
       the end</label><br>
-    cost <select id="epprofile">
-      <option value="distance">distance (every metre equal)</option>
-      <option value="edv">edv (prefer roads to footpaths)</option>
+    speed <select id="epprofile">
+      <option value="edv">edv (limit, capped at the vehicle)</option>
+      <option value="limits">limits (posted limit as it stands)</option>
     </select>
     <label title="only useful if you ride on the carriageway">
       wrong-way &times;<input id="epww" type="number" min="1" step="0.5"
@@ -520,7 +520,7 @@ function drawEndpoints() {
   });
   document.getElementById("eprts").checked = !!endpoints.return_to_start;
   document.getElementById("epprofile").value =
-    endpoints.profile || "distance";
+    endpoints.profile || "edv";
   document.getElementById("epww").value =
     endpoints.wrong_way_penalty || 1;
 }

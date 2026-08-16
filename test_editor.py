@@ -282,7 +282,7 @@ def test_serve():
                                      method="POST")
         out = urllib.request.urlopen(req, timeout=120).read().decode()
         assert "RESULT" in out and "return to start" in out, out
-        assert "cost profile: edv" in out, \
+        assert "speed profile: edv" in out, \
             "the solver must pick up the profile stored by the editor"
         assert (TMP / "serve_out" / "route.csv").exists()
         page = urllib.request.urlopen(f"{base}/route_map.html",

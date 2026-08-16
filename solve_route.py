@@ -138,11 +138,15 @@ def load_data(data_dir: Path):
 #
 # `length` is always real metres: it is what the mandatory distance,
 # route.csv and every printed kilometre are made of.  `cost` is what
-# the optimiser minimises.  With the default profile the two are the
-# same and the route is the shortest one.  With a speed profile a
-# metre of footpath costs more than a metre of road, so the optimiser
-# prefers roads for deadhead -- the result is then the cheapest route
-# under that profile, which may be slightly longer in metres.
+# the optimiser minimises, and it is seconds -- so the route is the
+# quickest one, and the time it reports is the quantity it minimised.
+# A metre of footpath costs more than a metre of road, so the cheapest
+# route can be slightly longer in metres. That is the point.
+#
+# Stops at letterboxes are excluded on purpose: the same letterboxes
+# are served whichever way the route runs, so stop time is a constant
+# that cancels out when comparing routes -- and it varies by the day's
+# mail, which would make it noise rather than signal.
 
 # Surfaces you ride *on* rather than drive along: a footway has no
 # posted limit (0% of them carry one in OSM), and what you do there is
@@ -154,30 +158,27 @@ FOOT_SURFACES = {"footway", "path", "pedestrian", "steps", "corridor",
 EDV_SURFACE = {"footway": 10, "path": 10, "pedestrian": 10,
                "cycleway": 15, "track": 10, "corridor": 6, "steps": 2}
 
+# Fallback speeds, used only where OSM has no posted limit.
+ROAD_FALLBACK = {"service": 25, "living_street": 20,
+                 "residential": 50, "unclassified": 50,
+                 "tertiary": 50, "tertiary_link": 50,
+                 "secondary": 60, "secondary_link": 60,
+                 "primary": 60, "primary_link": 60,
+                 "trunk": 60, "trunk_link": 60}
+
+EDV_TOP_SPEED = 50.0        # what the vehicle can actually do
+
 PROFILES = {
-    "distance": None,                    # every metre equal
-    "edv": {                             # one speed per road type
-        "speeds": {**EDV_SURFACE,
-                   "service": 15, "living_street": 15,
-                   "residential": 18, "unclassified": 18,
-                   "tertiary": 20, "tertiary_link": 20,
-                   "secondary": 20, "secondary_link": 20,
-                   "primary": 20, "primary_link": 20,
-                   "trunk": 20, "trunk_link": 20},
-        "use_maxspeed": False},
-    "limits": {                          # footpath fixed, road = posted
-        "speeds": {**EDV_SURFACE,
-                   # only used where OSM has no maxspeed
-                   "service": 25, "living_street": 20,
-                   "residential": 50, "unclassified": 50,
-                   "tertiary": 50, "tertiary_link": 50,
-                   "secondary": 60, "secondary_link": 60,
-                   "primary": 60, "primary_link": 60,
-                   "trunk": 60, "trunk_link": 60},
-        "use_maxspeed": True},
+    # What the vehicle does: the posted limit where it is slower than
+    # the vehicle, the vehicle's own top speed where it is not.
+    "edv": {"speeds": {**EDV_SURFACE, **ROAD_FALLBACK},
+            "use_maxspeed": True, "cap_kmh": EDV_TOP_SPEED},
+    # What the road allows: the posted limit, whatever it says.
+    "limits": {"speeds": {**EDV_SURFACE, **ROAD_FALLBACK},
+               "use_maxspeed": True, "cap_kmh": None},
 }
+DEFAULT_PROFILE = "edv"
 DEFAULT_SPEED = 15.0
-REPORT_PROFILE = "limits"    # what the printed time is measured with
 
 
 def load_profile(name):
@@ -223,10 +224,8 @@ def speed_kmh(highway, maxspeed, profile):
 
 
 def edge_cost(length, highway, maxspeed, profile):
-    """What the optimiser minimises: metres under `distance`, seconds
-    under any speed profile."""
-    if profile is None:
-        return length
+    """What the optimiser minimises: seconds. Distances are reported
+    from `length` regardless, so a kilometre is always a kilometre."""
     return length / (speed_kmh(highway, maxspeed, profile) / 3.6)
 
 
@@ -707,7 +706,7 @@ def estimate_seconds(segments, profile):
     cost per turn. Excludes every stop at a letterbox, which on a real
     round dominates -- useful for comparing routes, not for planning a
     day."""
-    table = profile or PROFILES[REPORT_PROFILE]
+    table = profile
     riding = sum(s["length"] /
                  (speed_kmh(s.get("highway", ""), s.get("maxspeed"),
                             table) / 3.6)
@@ -1053,13 +1052,16 @@ def main():
                          "Mutually exclusive with --open. Equals form "
                          "for southern latitudes: --end=-37.84,144.95")
     ap.add_argument("--profile", default=None, metavar="NAME|FILE",
-                    help="what 'shortest' means. 'distance' (default) "
-                         "weighs every metre equally. 'edv' weighs by "
-                         "how fast a delivery vehicle covers each road "
-                         "type, so deadhead prefers carriageways to "
-                         "footpaths. Or give a JSON file of "
-                         "{highway: km/h}. Reported kilometres are "
-                         "always real metres either way.")
+                    help="how fast each edge is ridden, which is what "
+                         "'shortest' means. 'edv' (default) takes the "
+                         f"posted limit capped at {EDV_TOP_SPEED:g} km/h "
+                         "-- what the vehicle can actually do; 'limits' "
+                         "takes the posted limit as it stands. A "
+                         "footpath has no posted limit, so both use the "
+                         "surface speed there. Or give a JSON file: "
+                         '{"speeds": {highway: km/h}, "use_maxspeed": '
+                         'true, "cap_kmh": 50}. Reported kilometres are '
+                         "always real metres.")
     ap.add_argument("--wrong-way-penalty", type=float, default=None,
                     metavar="FACTOR",
                     help="multiply the cost of riding a one-way street "
@@ -1129,7 +1131,7 @@ def main():
             print(f"  using endpoints from {ep_file} "
                   f"(set in the editor)")
     if args.profile is None:
-        args.profile = ep.get("profile") or "distance"
+        args.profile = ep.get("profile") or DEFAULT_PROFILE
     if args.wrong_way_penalty is None:
         try:
             args.wrong_way_penalty = float(ep.get("wrong_way_penalty") or 1)
@@ -1143,11 +1145,10 @@ def main():
     nodes, edges = load_data(data_dir)
     profile_name, profile = load_profile(args.profile)
     F, R, D = build_graphs(edges, profile, args.wrong_way_penalty)
-    if profile is not None or args.wrong_way_penalty > 1.0:
-        print(f"  cost profile: {profile_name}"
-              + (f", wrong-way penalty x{args.wrong_way_penalty:g}"
-                 if args.wrong_way_penalty > 1.0 else "")
-              + " -- optimising weighted cost, reporting real metres")
+    print(f"  speed profile: {profile_name}"
+          + (f", wrong-way penalty x{args.wrong_way_penalty:g}"
+             if args.wrong_way_penalty > 1.0 else "")
+          + " -- minimising riding time, reporting real metres")
     n_service_edges = sum(1 for e in edges if e["service"] > 0)
     if n_service_edges == 0:
         sys.exit("No edges have service 1 or 2 -- nothing to route. "

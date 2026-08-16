@@ -205,23 +205,34 @@ geometry**: a new edge lying along the old one, with the same name and
 road type, inherits its value. Anything that still cannot be placed is
 listed for you to re-mark — never silently dropped.
 
-## What "shortest" means — cost profiles
+## What "shortest" means — speed profiles
 
-By default every metre counts the same, so the route is the shortest
-one. A delivery vehicle would rather deadhead along a road than thread
-a footpath, and `--profile` says so:
+The solver minimises **riding time**, so it needs to know how fast each
+edge is ridden. On a footpath that is a property of the surface and the
+vehicle — no footway anywhere carries a posted limit. On a road it is
+the posted limit, which the extraction stores in `maxspeed_kmh`.
 
 ```bash
-# weigh metres by how fast each road type is ridden
-python solve_route.py --data data --out result --profile edv
+# the vehicle: posted limit, capped at what it can actually do (50 km/h)
+python solve_route.py --data data --out result --profile edv     # default
 
-# or your own weights: {"footway": 8, "residential": 18, ...} in km/h
+# the road: the posted limit as it stands
+python solve_route.py --data data --out result --profile limits
+
+# or your own: {"speeds": {"footway": 8, ...}, "use_maxspeed": true,
+#               "cap_kmh": 45}
 python solve_route.py --data data --out result --profile my_speeds.json
 ```
 
 Reported kilometres are always **real metres**, whatever the profile —
-only the choice of route changes, and the cheaper route may be
+only the choice of route changes, and the quicker route may be
 slightly longer.
+
+The reported time excludes every stop at a letterbox. That is
+deliberate rather than a shortcut: the same letterboxes are served
+whichever way the route runs, so stop time is a constant that cancels
+out when two routes are compared — and it changes with the day's mail,
+which would turn the comparison into noise.
 
 One-way streets are reported but never enforced: the model is
 undirected because a vehicle working from the footpath has no

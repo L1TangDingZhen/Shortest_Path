@@ -93,19 +93,21 @@ def write_cost_case(data_dir: Path):
         for n, (la, lo) in nodes.items():
             w.writerow([n, la, lo])
     rows = [
-        # edge_id,   name,        highway,       oneway, len, service, u, v
-        ("svc", "Long Street", "residential", "False", 300, 1, "A", "B"),
-        ("foot", "The Path", "footway", "False", 100, 0, "A", "B"),
-        ("road", "Back Road", "residential", "True", 130, 0, "B", "A"),
+        # id,   name,   highway, oneway, maxspeed, len, service, u, v
+        ("svc", "Long Street", "residential", "False", "", 300, 1, "A", "B"),
+        ("foot", "The Path", "footway", "False", "", 100, 0, "A", "B"),
+        ("road", "Back Road", "residential", "True", "50", 130, 0, "B", "A"),
+        ("fast", "Quick Road", "secondary", "False", "80", 200, 0, "A", "B"),
     ]
     with open(data_dir / "edges.csv", "w", newline="",
               encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["edge_id", "name", "highway", "oneway", "length_m",
-                    "service", "note", "u", "v", "geometry_wkt"])
-        for eid, nm, hw, ow, ln, sv, u, v in rows:
-            w.writerow([eid, nm, hw, ow, ln, sv, "", u, v, ""])
-    return {eid: sv for eid, _, _, _, _, sv, _, _ in rows}
+        w.writerow(["edge_id", "name", "highway", "oneway", "maxspeed_kmh",
+                    "length_m", "service", "note", "u", "v",
+                    "geometry_wkt"])
+        for eid, nm, hw, ow, ms, ln, sv, u, v in rows:
+            w.writerow([eid, nm, hw, ow, ms, ln, sv, "", u, v, ""])
+    return {eid: sv for eid, _, _, _, _, _, sv, _, _ in rows}
 
 
 def deadhead_ids(rows):
@@ -317,25 +319,32 @@ def main():
     end9, first9 = check_walk(rows9, edges_by_id, spec, closed=True)
     assert first9 == "n00", f"auto start should be n00, got {first9}"
 
-    print("== cost profile steers deadhead off the footpath ==")
+    print("== speed profile steers deadhead off the footpath ==")
     dc = TMP / "cost"
     cspec = write_cost_case(dc)
-    cby = {"svc": ("A", "B"), "foot": ("A", "B"), "road": ("B", "A")}
-
-    out_d = TMP / "cost_distance"
-    run(dc, out_d)                       # default: every metre equal
-    rows_d = read_route(out_d)
-    check_walk(rows_d, cby, cspec, closed=True)
-    assert deadhead_ids(rows_d) == ["foot"], deadhead_ids(rows_d)
-    assert abs(total_km(rows_d) - 0.400) < 1e-6, total_km(rows_d)
+    cby = {"svc": ("A", "B"), "foot": ("A", "B"), "road": ("B", "A"),
+           "fast": ("A", "B")}
 
     out_e = TMP / "cost_edv"
-    run(dc, out_e, "--profile", "edv")   # a metre of footpath costs more
+    run(dc, out_e, "--profile", "edv")
     rows_e = read_route(out_e)
     check_walk(rows_e, cby, cspec, closed=True)
+    # 130 m at 50 km/h beats 100 m of footpath at 10, and beats the
+    # 200 m road the vehicle cannot use at its full 80
     assert deadhead_ids(rows_e) == ["road"], deadhead_ids(rows_e)
-    assert total_km(rows_e) > total_km(rows_d), \
-        "the cheaper route may be longer in metres -- that is the point"
+    assert total_km(rows_e) > 0.400, \
+        "the quicker route is longer than the shortest -- that is the point"
+
+    print("== 'limits' uses the posted limit, 'edv' caps at the vehicle ==")
+    out_l = TMP / "cost_limits"
+    run(dc, out_l, "--profile", "limits")
+    rows_l = read_route(out_l)
+    check_walk(rows_l, cby, cspec, closed=True)
+    # 200 m at 80 km/h is quicker than 130 m at 50 -- but only for a
+    # vehicle that can do 80, which is exactly what the two differ on
+    assert deadhead_ids(rows_l) == ["fast"], deadhead_ids(rows_l)
+    assert total_km(rows_l) > total_km(rows_e)
+    rows_d = rows_e
 
     print("== against_oneway agrees with the direction actually ridden ==")
     assert "against_oneway" in rows_e[0], list(rows_e[0])
