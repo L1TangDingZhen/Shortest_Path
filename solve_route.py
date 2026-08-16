@@ -117,6 +117,8 @@ def load_data(data_dir: Path):
                 "highway": (row.get("highway") or "").split(";")[0].strip(),
                 "oneway": (row.get("oneway") or "").strip().lower()
                 in ("true", "yes", "1"),
+                "maxspeed": float(row["maxspeed_kmh"])
+                if (row.get("maxspeed_kmh") or "").strip() else None,
                 "length": float(row["length_m"]),
                 "service": service,
                 "wkt": row.get("geometry_wkt") or "",
@@ -142,26 +144,46 @@ def load_data(data_dir: Path):
 # prefers roads for deadhead -- the result is then the cheapest route
 # under that profile, which may be slightly longer in metres.
 
+# Surfaces you ride *on* rather than drive along: a footway has no
+# posted limit (0% of them carry one in OSM), and what you do there is
+# set by the vehicle and the pedestrians, not by the law. Everywhere
+# else the posted limit is the honest number.
+FOOT_SURFACES = {"footway", "path", "pedestrian", "steps", "corridor",
+                 "track", "cycleway"}
+
+EDV_SURFACE = {"footway": 10, "path": 10, "pedestrian": 10,
+               "cycleway": 15, "track": 10, "corridor": 6, "steps": 2}
+
 PROFILES = {
-    # speeds in km/h; only their ratios matter
     "distance": None,                    # every metre equal
-    "edv": {                             # electric delivery vehicle
-        "steps": 2, "corridor": 6, "path": 9, "track": 9,
-        "footway": 10, "pedestrian": 10,
-        "cycleway": 15, "service": 15, "living_street": 15,
-        "residential": 18, "unclassified": 18,
-        "tertiary": 20, "tertiary_link": 20,
-        "secondary": 20, "secondary_link": 20,
-        "primary": 20, "primary_link": 20,
-        "trunk": 20, "trunk_link": 20,
-    },
+    "edv": {                             # one speed per road type
+        "speeds": {**EDV_SURFACE,
+                   "service": 15, "living_street": 15,
+                   "residential": 18, "unclassified": 18,
+                   "tertiary": 20, "tertiary_link": 20,
+                   "secondary": 20, "secondary_link": 20,
+                   "primary": 20, "primary_link": 20,
+                   "trunk": 20, "trunk_link": 20},
+        "use_maxspeed": False},
+    "limits": {                          # footpath fixed, road = posted
+        "speeds": {**EDV_SURFACE,
+                   # only used where OSM has no maxspeed
+                   "service": 25, "living_street": 20,
+                   "residential": 50, "unclassified": 50,
+                   "tertiary": 50, "tertiary_link": 50,
+                   "secondary": 60, "secondary_link": 60,
+                   "primary": 60, "primary_link": 60,
+                   "trunk": 60, "trunk_link": 60},
+        "use_maxspeed": True},
 }
 DEFAULT_SPEED = 15.0
+REPORT_PROFILE = "limits"    # what the printed time is measured with
 
 
 def load_profile(name):
-    """Preset name or path to a JSON file {"speeds": {...},
-    "default": 15}. Returns (label, speeds or None)."""
+    """Preset name, or a JSON file {"speeds": {highway: km/h},
+    "use_maxspeed": bool, "cap_kmh": number}. Returns (label,
+    profile or None)."""
     if name in PROFILES:
         return name, PROFILES[name]
     path = Path(name)
@@ -172,30 +194,47 @@ def load_profile(name):
         data = json.loads(path.read_text(encoding="utf-8"))
     except ValueError as exc:
         sys.exit(f"--profile {name}: not valid JSON ({exc})")
-    speeds = data.get("speeds", data)
+    speeds = data.get("speeds", data if "use_maxspeed" not in data else {})
     if not isinstance(speeds, dict) or not speeds:
         sys.exit(f"--profile {name}: expected a non-empty object of "
                  f"highway -> km/h")
     try:
         speeds = {k: float(v) for k, v in speeds.items()}
+        cap = data.get("cap_kmh")
+        cap = float(cap) if cap else None
     except (TypeError, ValueError):
         sys.exit(f"--profile {name}: speeds must be numbers")
-    if any(v <= 0 for v in speeds.values()):
+    if any(v <= 0 for v in speeds.values()) or (cap is not None and cap <= 0):
         sys.exit(f"--profile {name}: speeds must be positive")
-    return path.stem, speeds
+    return path.stem, {"speeds": speeds,
+                       "use_maxspeed": bool(data.get("use_maxspeed")),
+                       "cap_kmh": cap}
 
 
-def edge_cost(length, highway, speeds):
-    if speeds is None:
+def speed_kmh(highway, maxspeed, profile):
+    """How fast this edge is ridden. Posted limits only apply where you
+    ride on the carriageway; on a footway the surface decides."""
+    kmh = profile["speeds"].get(highway, DEFAULT_SPEED)
+    if profile.get("use_maxspeed") and maxspeed \
+            and highway not in FOOT_SURFACES:
+        kmh = maxspeed
+    cap = profile.get("cap_kmh")
+    return min(kmh, cap) if cap else kmh
+
+
+def edge_cost(length, highway, maxspeed, profile):
+    """What the optimiser minimises: metres under `distance`, seconds
+    under any speed profile."""
+    if profile is None:
         return length
-    return length / speeds.get(highway, DEFAULT_SPEED)
+    return length / (speed_kmh(highway, maxspeed, profile) / 3.6)
 
 
 # ----------------------------------------------------------------------
 # Phase 1 -- graphs
 # ----------------------------------------------------------------------
 
-def build_graphs(edges, speeds=None, wrong_way=1.0):
+def build_graphs(edges, profile=None, wrong_way=1.0):
     """F: undirected view used for lookups and cross streets.
     R: the required work.  D: directed cost graph -- every edge becomes
     two arcs so that riding a one-way street the wrong way can be made
@@ -205,14 +244,16 @@ def build_graphs(edges, speeds=None, wrong_way=1.0):
     R = nx.MultiGraph()    # required work (with multiplicities)
     D = nx.MultiDiGraph()  # same network, directed, carrying `cost`
     for e in edges:
-        cost = edge_cost(e["length"], e["highway"], speeds)
+        cost = edge_cost(e["length"], e["highway"], e["maxspeed"],
+                         profile)
         F.add_edge(e["u"], e["v"], key=e["edge_id"],
                    length=e["length"], name=e["name"],
                    service=e["service"], wkt=e["wkt"],
                    highway=e["highway"], oneway=e["oneway"],
-                   cu=e["u"], cv=e["v"])
+                   maxspeed=e["maxspeed"], cu=e["u"], cv=e["v"])
         common = dict(length=e["length"], name=e["name"], wkt=e["wkt"],
-                      highway=e["highway"], oneway=e["oneway"])
+                      highway=e["highway"], oneway=e["oneway"],
+                      maxspeed=e["maxspeed"])
         D.add_edge(e["u"], e["v"], key=e["edge_id"], cost=cost,
                    against=False, **common)
         D.add_edge(e["v"], e["u"], key=e["edge_id"],
@@ -409,7 +450,8 @@ def deadhead_segments(D, node_path):
         segs.append(dict(kind="deadhead", edge_id=key, u=x, v=y,
                          name=data["name"], length=data["length"],
                          wkt=data["wkt"], pass_label="-",
-                         highway=data["highway"], against=data["against"]))
+                         highway=data["highway"], against=data["against"],
+                         maxspeed=data["maxspeed"]))
     return segs
 
 
@@ -637,6 +679,7 @@ def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None,
                                  length=edata["length"], wkt=edata["wkt"],
                                  pass_label=f"{passes_seen[base]}/{total}",
                                  highway=edata["highway"],
+                                 maxspeed=edata["maxspeed"],
                                  against=bool(edata["oneway"])
                                  and u != edata["cu"]))
     return segments
@@ -659,14 +702,15 @@ def annotate_turns(segments, nodes, traffic_side="left"):
     return counts
 
 
-def estimate_seconds(segments, speeds):
+def estimate_seconds(segments, profile):
     """Rough riding time: metres at the profile's speeds, plus a fixed
     cost per turn. Excludes every stop at a letterbox, which on a real
     round dominates -- useful for comparing routes, not for planning a
     day."""
-    table = speeds or PROFILES["edv"]
+    table = profile or PROFILES[REPORT_PROFILE]
     riding = sum(s["length"] /
-                 (table.get(s.get("highway", ""), DEFAULT_SPEED) / 3.6)
+                 (speed_kmh(s.get("highway", ""), s.get("maxspeed"),
+                            table) / 3.6)
                  for s in segments)
     turning = sum(TURN_SECONDS.get(s.get("turn", "straight"), 0.0)
                   for s in segments)
@@ -1043,6 +1087,9 @@ def main():
                          "compared; bare --history uses "
                          f"{DEFAULT_HISTORY}. Inspect with "
                          "round_history.py list / diff")
+    ap.add_argument("--bump", choices=["major", "minor", "patch"],
+                    help="force the history version bump instead of "
+                         "deriving it from what changed")
     ap.add_argument("--note", default="",
                     help="label for the recorded version, e.g. "
                          '--note "after fixing the sliver gaps"')
@@ -1094,9 +1141,9 @@ def main():
 
     print("Loading network ...")
     nodes, edges = load_data(data_dir)
-    profile_name, speeds = load_profile(args.profile)
-    F, R, D = build_graphs(edges, speeds, args.wrong_way_penalty)
-    if speeds is not None or args.wrong_way_penalty > 1.0:
+    profile_name, profile = load_profile(args.profile)
+    F, R, D = build_graphs(edges, profile, args.wrong_way_penalty)
+    if profile is not None or args.wrong_way_penalty > 1.0:
         print(f"  cost profile: {profile_name}"
               + (f", wrong-way penalty x{args.wrong_way_penalty:g}"
                  if args.wrong_way_penalty > 1.0 else "")
@@ -1179,7 +1226,7 @@ def main():
             kind += " + return to start"
 
     turns = annotate_turns(segments, nodes, args.traffic_side)
-    riding_s, turning_s = estimate_seconds(segments, speeds)
+    riding_s, turning_s = estimate_seconds(segments, profile)
     wrong_km = sum(s["length"] for s in segments if s.get("against")) / 1000
 
     total = sum(s["length"] for s in segments)
@@ -1192,7 +1239,7 @@ def main():
         import round_history
         version, is_new = round_history.record(
             Path(args.history), data_dir, out_dir=out_dir,
-            note=args.note,
+            note=args.note, bump=args.bump,
             summary={
                 "mode": kind,
                 "service_edges": sum(1 for e in edges if e["service"] > 0),

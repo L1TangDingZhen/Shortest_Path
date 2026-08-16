@@ -60,6 +60,33 @@ def places_polygon(places, buffer_deg):
     return merged.buffer(buffer_deg)
 
 
+def parse_maxspeed(val):
+    """OSM `maxspeed` -> km/h, or "" when it says nothing usable.
+
+    Values seen in the wild: "60", "40 mph", "walk", "AU:urban",
+    "signals", and lists when osmnx merged several ways. A footway has
+    no maxspeed at all, which is why the solver keeps its own speed for
+    surfaces you ride rather than drive."""
+    if val is None:
+        return ""
+    if isinstance(val, (list, tuple)):
+        speeds = [parse_maxspeed(v) for v in val]
+        speeds = [s for s in speeds if s != ""]
+        return min(speeds) if speeds else ""
+    text = str(val).strip().lower()
+    if text in ("walk", "walking"):
+        return 5.0
+    mph = text.endswith("mph")
+    number = text[:-3].strip() if mph else text
+    try:
+        kmh = float(number)
+    except ValueError:
+        return ""            # "AU:urban", "signals", "none", ...
+    if kmh <= 0:
+        return ""
+    return round(kmh * 1.609344, 1) if mph else kmh
+
+
 def norm(val, fallback=""):
     """OSM attributes may be str, list or missing."""
     if val is None:
@@ -135,6 +162,7 @@ def export(G, out_dir: Path, default_service=2):
             "name": name,
             "highway": norm(d.get("highway")),
             "oneway": norm(d.get("oneway")),
+            "maxspeed_kmh": parse_maxspeed(d.get("maxspeed")),
             "length_m": round(float(d["length"]), 1),
             "service": default_service,
             "note": "",

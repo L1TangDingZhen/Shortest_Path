@@ -94,11 +94,20 @@ def main():
     assert float(rows[1]["mandatory_km"]) < float(rows[0]["mandatory_km"])
     assert int(rows[1]["service_edges"]) == int(rows[0]["service_edges"]) - 1
 
+    print("== versions are numbered like a release ==")
+    assert rows[0]["version"] == "1.0.0", rows[0]["version"]
+    # a single street dropped is a small edit, whatever the percentage
+    assert rows[1]["version"] == "1.1.0", rows[1]["version"]
+
     print("== list ==")
     res = history(hist, "list")
     assert res.returncode == 0, res.stderr
-    assert v1 in res.stdout and v2 in res.stdout
+    assert "1.0.0" in res.stdout and "1.1.0" in res.stdout
     assert "court dropped" in res.stdout
+
+    print("== a version number resolves like an id ==")
+    res = history(hist, "show", "1.1.0")
+    assert res.returncode == 0 and v2 in res.stdout, res.stdout
 
     print("== diff (defaults to the last two) ==")
     res = history(hist, "diff")
@@ -118,6 +127,20 @@ def main():
     solve(data, out, hist, "--note", "court one side")
     res = history(hist, "diff", "-2", "-1")
     assert "added to the round" in res.stdout, res.stdout
+
+    print("== a bulk edit bumps the major number ==")
+    for eid in ("n00-n10-0", "n10-n20-0", "n03-n13-0", "n13-n23-0"):
+        set_service(data, eid, 0)
+    solve(data, out, hist, "--note", "avenues dropped")
+    rows = index_rows(hist)
+    assert rows[-1]["version"].startswith("2."), \
+        f"a four-street change should be major: {rows[-1]['version']}"
+
+    print("== --bump forces the number ==")
+    set_service(data, "n00-n10-0", 1)
+    solve(data, out, hist, "--bump", "patch", "--note", "forced patch")
+    rows = index_rows(hist)
+    assert rows[-1]["version"] == "2.0.1", rows[-1]["version"]
 
     print("== unknown version reference fails ==")
     res = history(hist, "show", "nope")

@@ -23,6 +23,7 @@ project evolves — especially the decision log.
 | B2 cost profiles (`--profile edv`) + B10.1/B10.2 wrong-way flag and penalty | **done, tested** (in `test_solve.py`) |
 | E16: one-way direction preserved through extraction | **done, tested** (`test_extract.py`) |
 | B11: turn-aware Euler tour + rough riding time / turn counts | **done, tested** (in `test_solve.py`) |
+| B12: posted speed limits in the data + `limits` profile + release-numbered history | **done, tested** |
 | V3+: real time costs, pass pairing, GPX compare, per-letterbox sequencing, exact ILP | backlog |
 
 ---
@@ -100,7 +101,7 @@ Schemas (all CSV utf-8-sig, Excel-friendly; **node ids are strings
 everywhere**):
 
 - `edges.csv`:
-  `edge_id,name,highway,oneway,length_m,service,note,u,v,geometry_wkt`
+  `edge_id,name,highway,oneway,maxspeed_kmh,length_m,service,note,u,v,geometry_wkt`
   (`service` ∈ {0,1,2,x}; `oneway` steers nothing by default — the
   model is undirected — but feeds the `against_oneway` flag and the
   optional `--wrong-way-penalty`, see E13 / B10)
@@ -118,6 +119,13 @@ Migration notes:
 - 2026-08: `service` gained the value `x` (excluded — the edge is
   dropped from the graph at load). Files without any `x` behave
   exactly as before; no migration needed.
+- 2026-08: `edges.csv` gained `maxspeed_kmh` (posted limit in km/h,
+  empty when OSM says nothing usable; "40 mph" and "walk" normalised,
+  "AU:urban"/"signals" dropped). Files without the column still load --
+  the solver treats a missing limit as unknown and falls back to the
+  profile's per-type speed. Coverage on the real round: 30% of edges,
+  but 0% of the 5 890 footway/path edges, which is why footpath speed
+  stays a property of the profile, never of the map.
 - 2026-08: `route.csv` gained `against_oneway` (second-to-last column,
   before `edge_id`): `yes` when that traversal runs against a one-way,
   else empty. Purely informational — the model stays undirected.
@@ -511,6 +519,8 @@ is the only networked step — keep it thin, and keep everything after
 | 2026-08 | Point picking on the maps: editor right-click copies `lat,lon` / `--start=` / `--end=`; the extraction preview gets folium's LatLngPopup | Coordinates are the CLI primitive (reproducible, scriptable), but hunting them in an external map was needless friction |
 | 2026-08 | Endpoints became data, not just arguments: right-click sets START/END into `data/endpoints.json`, the editor draws them, `solve_route.py` loads the file when `--start`/`--end` are absent, `prepare_round.py` carries it across re-extractions; a Solve button runs the solver server-side and serves the route map | Copy-pasting coordinates into a terminal was still the last manual step. Storing the pins makes the browser flow complete (edit → Save → Solve → view) while the CLI stays authoritative and scriptable |
 | 2026-08 | Editor: Leaflet `boxZoom` disabled; contextmenu `preventDefault`; added a "click sets" mode selector | Two real bugs found in use: shift+click (the x gesture) was eaten by box-zoom, since a 1 px wobble zooms to a box, and the right-click popup was hidden behind the browser's native menu. The mode selector removes the reliance on modifier keys altogether |
+| 2026-08 | Speed model: footpath speed comes from the profile, every other surface uses the posted limit (`--profile limits`), with an optional `cap_kmh` | The rider's own model, and the data agrees with it: 0 of 5 890 footway edges carry a maxspeed, while trunk/primary/secondary carry one 96-100% of the time. A posted limit describes the carriageway, so it is the honest number exactly where you ride on the carriageway, and meaningless where you do not. The cap exists because a limit is not a vehicle capability |
+| 2026-08 | History versions numbered like an app release (major/minor/patch), auto-classified from what changed, `--bump` to force | "How big was this change?" is the question the user actually asks of a history list, and a timestamp cannot answer it. Touching one street stays minor whatever the percentage |
 | 2026-08 | SPEC-2's pinned mode now starts the circuit at the pinned **end** and crosses the virtual edge first, instead of rotating afterwards and reversing when the circuit happened to cross it the other way | The reversal mirrored **every** traversal in the route, so a coin flip decided whether the tour's carefully chosen directions survived: measured 2.47 km ridden against one-ways where the tour had produced 0.03 km. Reversing a walk is not direction-neutral once anything cares about direction |
 | 2026-08 | Riding time and turn counts are reported (rough: profile speeds + a fixed cost per turn), and stored per version | The user asked to compare routes by time. Reported as "excludes every stop" because stop time at letterboxes dominates a real round and would make an absolute estimate fiction; as a *relative* measure between versions it is sound |
 | 2026-08 | One-way direction is captured from the directed graph before `to_undirected()` and written into the u/v columns; `edge_id` stays keyed on iteration order | The undirected view keeps no direction, so 49% of one-way edges had been exported backwards (E16). Everything built on B10 — the `against_oneway` flag and the wrong-way penalty — was reasoning about a coin flip. Keeping `edge_id` stable meant the fix cost one re-extraction and zero annotation |

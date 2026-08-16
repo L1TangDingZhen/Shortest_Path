@@ -12,9 +12,15 @@ and what that did to the distance.
     python round_history.py list
     python round_history.py show <id>
     python round_history.py diff <old> <new>
-        <id> may be a prefix of a version id, or a negative index:
-        -1 is the newest version, -2 the one before it.  `diff` with no
-        arguments compares the two newest versions.
+        <id> may be a version number ("1.2.0"), a timestamp id or its
+        prefix, or a negative index: -1 is the newest version, -2 the
+        one before it.  `diff` with no arguments compares the two
+        newest versions.
+
+Versions are numbered like an app release, so the number tells you how
+big the change was: major = the network was re-extracted or the round
+changed substantially, minor = streets added/dropped/changed, patch =
+same round solved with different settings.
 
 Layout (inside the gitignored round directory):
 
@@ -41,10 +47,46 @@ from pathlib import Path
 
 DEFAULT_HISTORY = "round.local/history"
 INDEX = "index.csv"
-FIELDS = ["id", "timestamp", "note", "mode", "service_edges",
+
+
+def next_version(previous, summary, digest, bump=None):
+    """Version the round like an app release, so the size of the number
+    tells you the size of the change:
+
+      major  the network itself changed (a re-extraction), or more than
+             5% of the annotated edges did -- and always at least two,
+             so touching a single street stays a minor edit
+      minor  the round definition changed at all -- streets added,
+             dropped or switched between one and two sides
+      patch  same round, different solver settings (profile, penalties,
+             endpoints): the answer changed, the job did not
+    """
+    if not previous:
+        return "1.0.0"
+    major, minor, patch = (int(p) for p in
+                           (previous.get("version") or "1.0.0").split("."))
+    if bump is None:
+        was = int(previous.get("service_edges") or 0)
+        now = int(summary.get("service_edges") or 0)
+        if previous.get("annotation") == digest:
+            bump = "patch"
+        elif (int(previous.get("edges_total") or 0)
+              != int(summary.get("edges_total") or 0)
+              or abs(now - was) > max(1, 0.05 * max(was, 1))):
+            bump = "major"
+        else:
+            bump = "minor"
+    if bump == "major":
+        return f"{major + 1}.0.0"
+    if bump == "minor":
+        return f"{major}.{minor + 1}.0"
+    return f"{major}.{minor}.{patch + 1}"
+
+
+FIELDS = ["id", "version", "timestamp", "note", "mode", "service_edges",
           "mandatory_km", "total_km", "deadhead_km", "islands",
           "bridge_km", "profile", "wrong_way_km", "time_min",
-          "turns_cross", "turns_u", "annotation"]
+          "turns_cross", "turns_u", "edges_total", "annotation"]
 
 
 # ----------------------------------------------------------------------
@@ -95,7 +137,7 @@ def read_service(version_dir: Path):
 # ----------------------------------------------------------------------
 
 def record(history_dir: Path, data_dir: Path, summary: dict,
-           out_dir: Path = None, note: str = ""):
+           out_dir: Path = None, note: str = "", bump: str = None):
     """File one solved version. Returns (version_id, is_new)."""
     rows, digest = read_annotation(data_dir)
     index = read_index(history_dir)
@@ -106,7 +148,7 @@ def record(history_dir: Path, data_dir: Path, summary: dict,
                 and last["mode"] == summary.get("mode", "")
                 and abs(float(last["total_km"]) -
                         summary.get("total_km", 0)) < 5e-4):
-            return last["id"], False
+            return f"{last.get('version') or '?'} ({last['id']})", False
 
     # second-resolution ids collide when two solves land in the same
     # second (small rounds solve in well under a second)
@@ -127,6 +169,8 @@ def record(history_dir: Path, data_dir: Path, summary: dict,
 
     full = dict(summary)
     full.update(id=version_id, note=note, annotation=digest,
+                version=next_version(index[-1] if index else None,
+                                     summary, digest, bump),
                 timestamp=datetime.now().isoformat(timespec="seconds"))
     (version_dir / "summary.json").write_text(
         json.dumps(full, indent=1, ensure_ascii=False), encoding="utf-8")
@@ -139,7 +183,7 @@ def record(history_dir: Path, data_dir: Path, summary: dict,
 
     index.append({k: full.get(k, "") for k in FIELDS})
     write_index(history_dir, index)
-    return version_id, True
+    return f"{full['version']} ({version_id})", True
 
 
 # ----------------------------------------------------------------------
@@ -147,7 +191,8 @@ def record(history_dir: Path, data_dir: Path, summary: dict,
 # ----------------------------------------------------------------------
 
 def resolve(index, ref):
-    """Version id from a prefix or a negative index (-1 = newest)."""
+    """Version id from a version number ("1.2.0"), an id or id prefix,
+    or a negative index (-1 = newest)."""
     if not index:
         sys.exit("no versions recorded yet -- solve with --history first")
     if ref is None:
@@ -157,6 +202,9 @@ def resolve(index, ref):
             return index[int(ref)]["id"]
         except IndexError:
             sys.exit(f"only {len(index)} version(s) recorded")
+    versions = [r["id"] for r in index if r.get("version") == ref]
+    if versions:
+        return versions[-1]
     # an exact id always wins: collision suffixes ("...-2") make one id
     # a prefix of another, which would otherwise read as ambiguous
     if any(r["id"] == ref for r in index):
@@ -174,21 +222,27 @@ def cmd_list(history_dir: Path, _args):
     index = read_index(history_dir)
     if not index:
         sys.exit("no versions recorded yet -- solve with --history first")
-    print(f"{'id':<16}{'service':>8}{'total':>8}{'dead':>7}"
-          f"{'time':>7}{'wrong':>7}{'X-turn':>7}{'U':>4}  note")
+    print(f"{'ver':<9}{'date':<12}{'service':>8}{'total':>8}{'dead':>7}"
+          f"{'time':>7}{'wrong':>7}{'X':>4}{'U':>4}  note")
     prev = None
     for r in index:
         total = float(r["total_km"])
-        delta = "" if prev is None else f" ({total - prev:+.2f})"
-        prev = total
         mins = float(r.get("time_min") or 0)
+        delta = ""
+        if prev is not None:
+            delta = f" ({total - prev[0]:+.2f} km"
+            if mins and prev[1]:
+                delta += f", {mins - prev[1]:+.0f} min"
+            delta += ")"
+        prev = (total, mins)
         time = f"{int(mins) // 60}h{int(mins) % 60:02d}" if mins else "-"
         note = r["note"] or r["mode"]
-        print(f"{r['id']:<16}{float(r['mandatory_km']):>7.2f}k"
+        print(f"{(r.get('version') or '-'):<9}{r['id'][:8]:<12}"
+              f"{float(r['mandatory_km']):>7.2f}k"
               f"{total:>7.2f}k{float(r['deadhead_km']):>6.2f}k"
               f"{time:>7}{float(r.get('wrong_way_km') or 0):>6.2f}k"
-              f"{(r.get('turns_cross') or '-'):>7}{(r.get('turns_u') or '-'):>4}"
-              f"  {note[:38]}{delta}")
+              f"{(r.get('turns_cross') or '-'):>4}{(r.get('turns_u') or '-'):>4}"
+              f"  {note[:34]}{delta}")
     print(f"\n{len(index)} version(s) in {history_dir}")
 
 

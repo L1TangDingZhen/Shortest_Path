@@ -23,7 +23,7 @@ from pathlib import Path
 import networkx as nx
 import osmnx as ox
 
-from extract_network import export, oneway_arcs
+from extract_network import export, oneway_arcs, parse_maxspeed
 
 BASE = Path(__file__).parent
 TMP = BASE / "_test_tmp" / "extract"
@@ -36,7 +36,7 @@ def build():
     G.graph["crs"] = "epsg:4326"
     for n, x in (("A", 0.0), ("B", 0.001), ("C", 0.002)):
         G.add_node(n, x=x, y=-34.9)
-    G.add_edge("B", "A", key=0, oneway=True, length=90.0,
+    G.add_edge("B", "A", key=0, oneway=True, length=90.0, maxspeed="60",
                name="One Way Street", highway="residential")
     G.add_edge("B", "C", key=0, oneway=False, length=80.0,
                name="Two Way Road", highway="residential")
@@ -84,6 +84,18 @@ def main():
             out_degree[r["v"]] += 1
     assert out_degree["A"] == 0 or True     # A is the network's dead end
     assert out_degree["B"] > 0 and out_degree["C"] > 0
+
+    print("== maxspeed is exported in km/h, unknowns left empty ==")
+    assert one["maxspeed_kmh"] == "60.0", one["maxspeed_kmh"]
+    assert two["maxspeed_kmh"] == "", two["maxspeed_kmh"]
+
+    print("== maxspeed parsing copes with what OSM actually contains ==")
+    assert parse_maxspeed("60") == 60.0
+    assert parse_maxspeed("40 mph") == 64.4        # 40 * 1.609344
+    assert parse_maxspeed("walk") == 5.0
+    assert parse_maxspeed(["60", "50"]) == 50.0    # merged ways: the min
+    for junk in (None, "", "AU:urban", "signals", "none", "0", "-5"):
+        assert parse_maxspeed(junk) == "", junk
 
     print("\nALL TESTS PASSED")
 
