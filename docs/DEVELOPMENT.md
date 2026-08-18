@@ -24,6 +24,7 @@ project evolves — especially the decision log.
 | E16: one-way direction preserved through extraction | **done, tested** (`test_extract.py`) |
 | B11: turn-aware Euler tour + rough riding time / turn counts | **done, tested** (in `test_solve.py`) |
 | B12: posted speed limits in the data + `limits` profile + release-numbered history | **done, tested** |
+| B3 pass pairing (`--pair-passes`) + operational metrics in history | **done, tested** — pairing off by default, see B3 |
 | V3+: real time costs, pass pairing, GPX compare, per-letterbox sequencing, exact ILP | backlog |
 
 ---
@@ -426,10 +427,19 @@ stands, honestly). Option B was not needed.
      constraint is the Mixed CPP: NP-hard (E13), needs the ILP /
      branch-and-cut backend of B8. Only worth it with a concrete
      street that must be ridden on the carriageway.
-- **B3 Prefer paired passes.** Soft constraint nudging 1/2 and 2/2 of
-  the same street to be adjacent when nearly free (E5). *Now cheap to
-  build:* it is the same lever as B11 — a preference inside the tour
-  chooser, costing no distance.
+- **B3 Prefer paired passes.** *Shipped 2026-08 as `--pair-passes`,
+  off by default, because it measurably does not pay.* The bonus makes
+  the tour chooser take the sibling pass of the edge it just rode, and
+  it costs no distance. On the real round it moved pairing from 16.8%
+  to 22.1% while adding 6 crossing turns and 6 U-turns — three minutes
+  for five points. Raising the bonus does nothing: 30 s, 90 s and 300 s
+  all give exactly 22.1%, which locates the ceiling. **Hierholzer
+  splices sub-tours into the middle of the walk**, so two edges chosen
+  consecutively during the forward pass need not be adjacent in the
+  emitted tour, and no choice-time weight can change that. Doing this
+  properly means rearranging the finished tour (moving the closed
+  sub-walk that sits between the two passes to another visit of the
+  same node) — a real algorithm, not a weight.
 - **B11 Choosing WHICH Euler tour (turn comfort, wrong-way).**
   *Shipped 2026-08.* Every Euler tour over the same augmented graph
   covers the same edges, so they all have the same length: the choice
@@ -519,6 +529,8 @@ is the only networked step — keep it thin, and keep everything after
 | 2026-08 | Point picking on the maps: editor right-click copies `lat,lon` / `--start=` / `--end=`; the extraction preview gets folium's LatLngPopup | Coordinates are the CLI primitive (reproducible, scriptable), but hunting them in an external map was needless friction |
 | 2026-08 | Endpoints became data, not just arguments: right-click sets START/END into `data/endpoints.json`, the editor draws them, `solve_route.py` loads the file when `--start`/`--end` are absent, `prepare_round.py` carries it across re-extractions; a Solve button runs the solver server-side and serves the route map | Copy-pasting coordinates into a terminal was still the last manual step. Storing the pins makes the browser flow complete (edit → Save → Solve → view) while the CLI stays authoritative and scriptable |
 | 2026-08 | Editor: Leaflet `boxZoom` disabled; contextmenu `preventDefault`; added a "click sets" mode selector | Two real bugs found in use: shift+click (the x gesture) was eaten by box-zoom, since a 1 px wobble zooms to a box, and the right-click popup was hidden behind the browser's native menu. The mode selector removes the reliance on modifier keys altogether |
+| 2026-08 | Route quality is tracked by operational metrics, not distance alone: % of two-sided streets done back to back, number of continuous delivery runs, visits per street — reported and stored per version | Distance is 63% constant on this round, so it is a poor yardstick; what differs between routes is overhead and how pleasant the result is to *work*. A street entered three times is three places in the sort frame, and that costs nothing in metres |
+| 2026-08 | `--pair-passes` ships off by default | Measured: +5.3 points of pairing for +3 min of turning, and it saturates at 22.1% however large the bonus, because Hierholzer splices sub-tours between the two passes. Shipping it on would have made routes worse for a metric that barely moved (B3) |
 | 2026-08 | Exactly two speed profiles, both posted-limit based: `edv` caps at the vehicle's 50 km/h, `limits` does not. `distance` removed; cost is always seconds, so the optimiser minimises the same quantity it reports | Two questions worth asking -- "how fast can I do this?" and "how fast does the road allow?" -- and they differ only by the cap. A pure-distance mode answered a third question nobody was asking once time became the yardstick; km are still reported exactly, they are just no longer what gets minimised |
 | 2026-08 | Speed model: footpath speed comes from the profile, every other surface uses the posted limit (`--profile limits`), with an optional `cap_kmh` | The rider's own model, and the data agrees with it: 0 of 5 890 footway edges carry a maxspeed, while trunk/primary/secondary carry one 96-100% of the time. A posted limit describes the carriageway, so it is the honest number exactly where you ride on the carriageway, and meaningless where you do not. The cap exists because a limit is not a vehicle capability |
 | 2026-08 | History versions numbered like an app release (major/minor/patch), auto-classified from what changed, `--bump` to force | "How big was this change?" is the question the user actually asks of a history list, and a timestamp cannot answer it. Touching one street stays minor whatever the percentage |

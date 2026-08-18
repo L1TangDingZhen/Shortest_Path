@@ -483,6 +483,11 @@ TURN_SECONDS = {"straight": 0.0, "easy": 4.0, "cross": 12.0, "u": 25.0}
 STRAIGHT_DEG = 30      # within this, it is not a turn
 U_TURN_DEG = 150       # beyond this, it is a U-turn
 WRONG_WAY_TOUR_WEIGHT = 0.5   # seconds per metre, per unit of penalty
+# B3: doing both sides of a street back to back keeps its mail in one
+# bundle. It means turning at the far end and riding back, so the bonus
+# has to outweigh the U-turn it implies -- and it still costs no
+# distance, because every Euler tour is the same length.
+PAIR_SECONDS = 30.0
 
 
 def turn_kind(bearing_in, bearing_out, traffic_side="left"):
@@ -536,7 +541,7 @@ def tour_meta(R, F, D, nodes):
                        else wrong,
                        v: 0.0 if not edata["oneway"] or v == edata["cu"]
                        else wrong}
-        info = {}
+        info = {"base": data.get("base")}
         for start, chain in chains.items():
             info[start] = {
                 "out": bearing_of(chain[0], chain[1]) if len(chain) > 1
@@ -550,9 +555,11 @@ def tour_meta(R, F, D, nodes):
 
 
 def euler_tour(R, source, meta, traffic_side="left", optimise=True,
-               wrong_way_penalty=1.0, first_key=None):
-    """Hierholzer, picking the next edge by turn comfort and by not
-    riding one-way streets backwards. Returns [(u, v, key), ...].
+               wrong_way_penalty=1.0, first_key=None,
+               pair_passes=False):
+    """Hierholzer, picking the next edge by turn comfort, by not riding
+    one-way streets backwards, and by finishing a two-sided street
+    while you are on it. Returns [(u, v, key), ...].
 
     The choice never changes the tour's length -- see the note above --
     so this is pure gain; with optimise=False the first available edge
@@ -582,7 +589,7 @@ def euler_tour(R, source, meta, traffic_side="left", optimise=True,
                                   None)
         return total
 
-    def choose(node, bearing_in):
+    def choose(node, bearing_in, prev_key=None):
         if first_key is not None and not used:
             forced = next(((i, n, k) for i, (n, k) in enumerate(adj[node])
                            if k == first_key), None)
@@ -599,6 +606,10 @@ def euler_tour(R, source, meta, traffic_side="left", optimise=True,
                                             traffic_side)]
                      + wrong_weight * (run_against(node, key)
                                        if wrong_weight else 0.0))
+            if pair_passes and prev_key is not None:
+                base = meta.get(key, {}).get("base")
+                if base and meta.get(prev_key, {}).get("base") == base:
+                    score -= PAIR_SECONDS        # the other side of it
             if best is None or score < best[0]:
                 best = (score, i, nbr, key)
         return None if best is None else best[1:]
@@ -607,7 +618,7 @@ def euler_tour(R, source, meta, traffic_side="left", optimise=True,
     out = []
     while stack:
         node, in_key, bearing_in = stack[-1]
-        picked = choose(node, bearing_in)
+        picked = choose(node, bearing_in, in_key)
         if picked is None:
             stack.pop()
             if stack and in_key is not None:
@@ -623,7 +634,7 @@ def euler_tour(R, source, meta, traffic_side="left", optimise=True,
 
 def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None,
              traffic_side="left", optimise_tour=True,
-             wrong_way_penalty=1.0):
+             wrong_way_penalty=1.0, pair_passes=False):
     """Walk the Euler circuit/path and expand connectors into real
     street segments. Returns a list of segment dicts.
 
@@ -652,7 +663,7 @@ def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None,
         source = start_node if (start_node in R) else next(iter(R.nodes))
         first = None
     euler = euler_tour(R, source, meta, traffic_side, optimise_tour,
-                       wrong_way_penalty, first)
+                       wrong_way_penalty, first, pair_passes)
 
     if pin_start is not None:
         assert euler[0][2] == VIRTUAL_KEY, "virtual edge must be first"
@@ -699,6 +710,35 @@ def annotate_turns(segments, nodes, traffic_side="left"):
             counts[s["turn"]] += 1
         previous = into if into is not None else previous
     return counts
+
+
+def operational_metrics(segments):
+    """How pleasant the route is to *work*, which distance cannot see.
+
+    A street whose two sides are delivered far apart in the sequence has
+    its mail split across two bundles, and a street entered three times
+    is three places in the sort frame. Neither costs a metre."""
+    service = [s for s in segments if s["kind"] == "service"]
+    at = defaultdict(list)
+    for i, s in enumerate(service):
+        at[s["edge_id"]].append(i)
+    both = [v for v in at.values() if len(v) == 2]
+    paired = sum(1 for v in both if v[1] - v[0] == 1)
+
+    runs, streets = 0, set()
+    previous = None
+    for s in service:
+        streets.add(s["name"])
+        if s["name"] != previous:
+            runs += 1
+        previous = s["name"]
+    return {
+        "paired_pct": round(100 * paired / len(both), 1) if both else 100.0,
+        "two_sided": len(both),
+        "street_runs": runs,
+        "streets": len(streets),
+        "runs_per_street": round(runs / len(streets), 2) if streets else 0,
+    }
 
 
 def estimate_seconds(segments, profile):
@@ -1077,6 +1117,14 @@ def main():
                     help="which side traffic drives on, so the solver "
                          "knows which turn crosses the oncoming stream "
                          "(default left: AU/UK/JP/NZ)")
+    ap.add_argument("--pair-passes", action="store_true",
+                    help="prefer finishing a two-sided street while you "
+                         "are on it, so its mail stays in one bundle. "
+                         "Costs no distance, but implies a turn at the "
+                         "far end and Hierholzer splices sub-tours "
+                         "between the passes anyway: measured +5 points "
+                         "of pairing for +3 min of turning, so it is "
+                         "off by default (B3)")
     ap.add_argument("--no-turn-optimisation", action="store_true",
                     help="take any Euler tour instead of preferring one "
                          "with fewer awkward turns and less wrong-way "
@@ -1184,6 +1232,7 @@ def main():
     print("Extracting Euler traversal ...")
     tour_opts = {"traffic_side": args.traffic_side,
                  "optimise_tour": not args.no_turn_optimisation,
+                 "pair_passes": args.pair_passes,
                  "wrong_way_penalty": args.wrong_way_penalty}
     if pin_start is not None:                        # --start + --end
         endpoints, extra = parity_repair(R, D, False, None)
@@ -1227,6 +1276,7 @@ def main():
             kind += " + return to start"
 
     turns = annotate_turns(segments, nodes, args.traffic_side)
+    ops = operational_metrics(segments)
     riding_s, turning_s = estimate_seconds(segments, profile)
     wrong_km = sum(s["length"] for s in segments if s.get("against")) / 1000
 
@@ -1263,6 +1313,9 @@ def main():
                 "wrong_way_penalty": args.wrong_way_penalty,
                 "wrong_way_km": round(wrong_km, 3),
                 "time_min": round((riding_s + turning_s) / 60, 1),
+                "paired_pct": ops["paired_pct"],
+                "street_runs": ops["street_runs"],
+                "runs_per_street": ops["runs_per_street"],
                 "turns_cross": turns["cross"],
                 "turns_u": turns["u"],
                 "turn_optimised": not args.no_turn_optimisation,
@@ -1283,6 +1336,10 @@ Riding time (rough)      : {hhmm(riding_s + turning_s):>9}   \
 Turns                    : {turns['cross']} crossing + {turns['u']} U-turn + \
 {turns['easy']} easy + {turns['straight']} straight
 Against a one-way        : {wrong_km:7.2f} km   (ride the footpath there)
+Both sides back to back  : {ops['paired_pct']:6.1f}%   \
+({ops['two_sided']} two-sided streets; one bundle each when paired)
+Street runs              : {ops['street_runs']:7d}   \
+({ops['streets']} streets, so {ops['runs_per_street']} visits each)
 Outputs                  : {route_csv}
                            {route_map}
 =================================================

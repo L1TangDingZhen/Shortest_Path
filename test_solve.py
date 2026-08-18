@@ -26,7 +26,7 @@ import re
 import shutil
 import subprocess
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 BASE = Path(__file__).parent
@@ -173,21 +173,30 @@ def check_walk(rows, edges_by_id, service_spec, closed):
     # deadhead may only use existing edges
     for r in rows:
         assert r["edge_id"] in service_spec, f"unknown edge {r['edge_id']}"
-    # 2. continuity: consecutive segments share a node.  route.csv does
-    #    not carry u/v, so verify via edge endpoints chaining.
+    # 2. continuity: consecutive segments share a node.  route.csv
+    #    carries no u/v, so the walk is rebuilt from edge endpoints --
+    #    and the very first segment's direction is genuinely ambiguous
+    #    (pass pairing makes segments 1 and 2 the same edge, so "which
+    #    end did we start at" cannot be read off the next segment).
+    #    Try both and accept the one that chains.
     ends = [edges_by_id[r["edge_id"]] for r in rows]
-    cur = None
-    for i, (u, v) in enumerate(ends):
-        if cur is None:
-            nxt = set(ends[i + 1]) if i + 1 < len(ends) else set()
-            cur = v if v in nxt or u not in nxt else u
-            first = u if cur == v else v
-            continue
-        assert cur in (u, v), f"walk breaks at segment {i + 1}"
-        cur = v if cur == u else u
-    if closed:
-        assert cur == first, "circuit does not close"
-    return cur, first
+    failure = None
+    for start in (0, 1):
+        first, cur = ends[0][start], ends[0][1 - start]
+        for i, (u, v) in enumerate(ends[1:], 1):
+            if cur == u:
+                cur = v
+            elif cur == v:
+                cur = u
+            else:
+                failure = f"walk breaks at segment {i + 1}"
+                break
+        else:
+            if closed and cur != first:
+                failure = "circuit does not close"
+                continue
+            return cur, first
+    raise AssertionError(failure or "walk breaks")
 
 
 def total_km(rows):
@@ -230,6 +239,25 @@ def main():
         f"every Euler tour has the same length: {total_km(rows_raw)} " \
         f"vs {total_km(rows1)}"
     assert len(rows_raw) == len(rows1), "same number of traversals"
+
+    print("== pass pairing puts both sides back to back, free ==")
+    out_pair = TMP / "paired"
+    stdout = run(data, out_pair, "--pair-passes")
+    rows_pair = read_route(out_pair)
+    check_walk(rows_pair, edges_by_id, spec, closed=True)
+    assert abs(total_km(rows_pair) - total_km(rows1)) < 1e-6, \
+        "pairing must not change the distance"
+
+    def paired_pct(rows):
+        at = defaultdict(list)
+        for i, r in enumerate([r for r in rows if r["type"] == "service"]):
+            at[r["edge_id"]].append(i)
+        both = [v for v in at.values() if len(v) == 2]
+        return 100 * sum(1 for v in both if v[1] - v[0] == 1) / len(both)
+
+    assert paired_pct(rows_pair) >= paired_pct(rows1), \
+        f"pairing {paired_pct(rows_pair):.0f}% vs default {paired_pct(rows1):.0f}%"
+    assert "Both sides back to back" in stdout, stdout
 
     print("== open mode ==")
     out2 = TMP / "open"

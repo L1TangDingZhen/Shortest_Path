@@ -86,7 +86,8 @@ def next_version(previous, summary, digest, bump=None):
 FIELDS = ["id", "version", "timestamp", "note", "mode", "service_edges",
           "mandatory_km", "total_km", "deadhead_km", "islands",
           "bridge_km", "profile", "wrong_way_km", "time_min",
-          "turns_cross", "turns_u", "edges_total", "annotation"]
+          "turns_cross", "turns_u", "paired_pct", "street_runs",
+          "runs_per_street", "edges_total", "annotation"]
 
 
 # ----------------------------------------------------------------------
@@ -223,7 +224,7 @@ def cmd_list(history_dir: Path, _args):
     if not index:
         sys.exit("no versions recorded yet -- solve with --history first")
     print(f"{'ver':<9}{'date':<12}{'service':>8}{'total':>8}{'dead':>7}"
-          f"{'time':>7}{'wrong':>7}{'X':>4}{'U':>4}  note")
+          f"{'time':>7}{'wrong':>7}{'X':>4}{'U':>4}{'pair':>6}  note")
     prev = None
     for r in index:
         total = float(r["total_km"])
@@ -242,7 +243,8 @@ def cmd_list(history_dir: Path, _args):
               f"{total:>7.2f}k{float(r['deadhead_km']):>6.2f}k"
               f"{time:>7}{float(r.get('wrong_way_km') or 0):>6.2f}k"
               f"{(r.get('turns_cross') or '-'):>4}{(r.get('turns_u') or '-'):>4}"
-              f"  {note[:34]}{delta}")
+              f"{(r.get('paired_pct') or '-'):>5}%"
+              f"  {note[:30]}{delta}")
     print(f"\n{len(index)} version(s) in {history_dir}")
 
 
