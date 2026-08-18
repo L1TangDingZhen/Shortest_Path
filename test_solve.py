@@ -259,6 +259,31 @@ def main():
         f"pairing {paired_pct(rows_pair):.0f}% vs default {paired_pct(rows1):.0f}%"
     assert "Both sides back to back" in stdout, stdout
 
+    print("== turn-aware routing covers the same work ==")
+    out_turn = TMP / "turn"
+    run(data, out_turn, "--algorithm", "turn")
+    rows_turn = read_route(out_turn)
+    check_walk(rows_turn, edges_by_id, spec, closed=True)
+    assert total_km(rows_turn) * 1000 >= bound - 1
+
+    print("== --algorithm all lays the alternatives side by side ==")
+    out_all = TMP / "alts"
+    stdout = run(data, out_all, "--algorithm", "all")
+    assert "ALGORITHMS" in stdout and "Quickest:" in stdout, stdout
+    for algo in ("node", "turn"):
+        assert (out_all / algo / "route.csv").exists(), algo
+        check_walk(read_route(out_all / algo), edges_by_id, spec,
+                   closed=True)
+    page = (out_all / "alternatives.html").read_text(encoding="utf-8")
+    payload = json.loads(re.search(
+        r'<script id="alt-data" type="application/json">(.*?)</script>',
+        page, re.DOTALL).group(1))
+    assert len(payload["routes"]) == 2, payload["routes"]
+    assert {r["algorithm"] for r in payload["routes"]} == {"node", "turn"}
+    assert all(r["segs"] for r in payload["routes"])
+    # the top-level outputs describe one of the alternatives
+    assert (out_all / "route.csv").exists()
+
     print("== open mode ==")
     out2 = TMP / "open"
     run(data, out2, "--open")

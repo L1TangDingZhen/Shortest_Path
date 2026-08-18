@@ -25,6 +25,7 @@ project evolves — especially the decision log.
 | B11: turn-aware Euler tour + rough riding time / turn counts | **done, tested** (in `test_solve.py`) |
 | B12: posted speed limits in the data + `limits` profile + release-numbered history | **done, tested** |
 | B3 pass pairing (`--pair-passes`) + operational metrics in history | **done, tested** — pairing off by default, see B3 |
+| B13: turn-aware routing (line graph) as a second algorithm + `--algorithm all` comparison | **done, tested** (in `test_solve.py`) |
 | V3+: real time costs, pass pairing, GPX compare, per-letterbox sequencing, exact ILP | backlog |
 
 ---
@@ -487,6 +488,22 @@ stands, honestly). Option B was not needed.
   listing; `round_history.py list/show/diff` compares versions.
   Deduplicates unchanged re-solves by hashing the annotation. Answers
   "did that edit help?" with numbers instead of memory.
+- **B13 Turn-aware routing (line graph).** *Shipped 2026-08.* Turn
+  cost used to reach only the choice of Euler tour, never the choice of
+  path: Dijkstra over a road graph cannot price a manoeuvre, because a
+  node has no memory of how you arrived. `--algorithm turn` routes over
+  the **line graph** instead -- a vertex is "travelling along this arc",
+  an edge is a turn, and its weight is the next arc's seconds plus what
+  the turn costs. 86 676 manoeuvres priced on the real round; measured
+  against the plain algorithm on identical work: **crossing turns
+  36 -> 20**, wrong-way 0.94 -> 0.42 km, riding 57 -> 55 min, for
+  +0.20 km. Routers return **arc** paths, so the arcs the search priced
+  are the arcs that reach the route -- expansion no longer re-picks
+  them. The reversed search builds its line graph for the other side of
+  the road, because mirroring the network swaps left and right.
+  `--algorithm all` solves with every entry in `ALGORITHMS` and writes
+  `alternatives.html`, one map with a switcher, the way a directions
+  app offers a choice.
 - **B6 Per-letterbox sequencing.** Join route order with the G-NAF
   open address database to emit house-number ranges per pass —
   turning route.csv into a literal sort plan.
@@ -529,6 +546,7 @@ is the only networked step — keep it thin, and keep everything after
 | 2026-08 | Point picking on the maps: editor right-click copies `lat,lon` / `--start=` / `--end=`; the extraction preview gets folium's LatLngPopup | Coordinates are the CLI primitive (reproducible, scriptable), but hunting them in an external map was needless friction |
 | 2026-08 | Endpoints became data, not just arguments: right-click sets START/END into `data/endpoints.json`, the editor draws them, `solve_route.py` loads the file when `--start`/`--end` are absent, `prepare_round.py` carries it across re-extractions; a Solve button runs the solver server-side and serves the route map | Copy-pasting coordinates into a terminal was still the last manual step. Storing the pins makes the browser flow complete (edit → Save → Solve → view) while the CLI stays authoritative and scriptable |
 | 2026-08 | Editor: Leaflet `boxZoom` disabled; contextmenu `preventDefault`; added a "click sets" mode selector | Two real bugs found in use: shift+click (the x gesture) was eaten by box-zoom, since a 1 px wobble zooms to a box, and the right-click popup was hidden behind the browser's native menu. The mode selector removes the reliance on modifier keys altogether |
+| 2026-08 | Algorithms became a list rather than a replacement: `ALGORITHMS` maps a name to the routers to run, `--algorithm all` solves with each and emits a side-by-side map | The two answer different questions ("which is shortest" vs "which rides best"), and neither is wrong. Showing both, with the numbers that separate them, is more honest than picking one -- and adding a third is now a dict entry, not a rewrite |
 | 2026-08 | Route quality is tracked by operational metrics, not distance alone: % of two-sided streets done back to back, number of continuous delivery runs, visits per street — reported and stored per version | Distance is 63% constant on this round, so it is a poor yardstick; what differs between routes is overhead and how pleasant the result is to *work*. A street entered three times is three places in the sort frame, and that costs nothing in metres |
 | 2026-08 | `--pair-passes` ships off by default | Measured: +5.3 points of pairing for +3 min of turning, and it saturates at 22.1% however large the bonus, because Hierholzer splices sub-tours between the two passes. Shipping it on would have made routes worse for a metric that barely moved (B3) |
 | 2026-08 | Exactly two speed profiles, both posted-limit based: `edv` caps at the vehicle's 50 km/h, `limits` does not. `distance` removed; cost is always seconds, so the optimiser minimises the same quantity it reports | Two questions worth asking -- "how fast can I do this?" and "how fast does the road allow?" -- and they differ only by the cap. A pure-distance mode answered a third question nobody was asking once time became the yardstick; km are still reported exactly, they are just no longer what gets minimised |

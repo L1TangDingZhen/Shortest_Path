@@ -269,20 +269,151 @@ def cheapest_arc(D, x, y):
     return min(D[x][y].items(), key=lambda kv: kv[1]["cost"])
 
 
-def path_length_m(D, path):
-    """Real metres along a node path (whose cost may be weighted)."""
-    return sum(cheapest_arc(D, x, y)[1]["length"]
-               for x, y in zip(path, path[1:]))
+def path_length_m(D, arc_path):
+    """Real metres along an arc path (whose cost may be weighted)."""
+    return sum(D[u][v][k]["length"] for u, v, k in arc_path)
 
 
-def both_ways(D, a, b):
-    """Cheapest node path a->b and b->a. Connectivity is symmetric --
-    every edge contributes both arcs -- so both always exist."""
-    return {a: nx.shortest_path(D, a, b, weight="cost"),
-            b: nx.shortest_path(D, b, a, weight="cost")}
+# ----------------------------------------------------------------------
+# Routing: two algorithms, same interface
+# ----------------------------------------------------------------------
+#
+# `node`  Dijkstra over the road graph. A turn costs nothing, because a
+#         node has no memory of how you arrived. This is what the
+#         solver has always done.
+#
+# `turn`  Dijkstra one level up, over the LINE GRAPH: a vertex is
+#         "travelling along this arc", an edge is a manoeuvre, and its
+#         weight is the next arc's seconds plus what the turn costs.
+#         Now "right onto a 60 km/h road" is priced where the route is
+#         actually chosen, not just when picking between equal tours.
+#         This is how real routing engines do it.
+#
+# Both return ARC paths -- [(u, v, key), ...] -- so the arcs the search
+# priced are exactly the arcs that end up in the route.
+
+SOURCE = ("<virtual source>",)
+
+# The algorithm list. Adding one here is all it takes for `--algorithm
+# all` to solve with it and put its route beside the others.
+ALGORITHMS = {"node": ["node"], "turn": ["turn"],
+              "all": ["node", "turn"]}
+ALGORITHM_LABEL = {
+    "node": "shortest (turns free)",
+    "turn": "turn-aware (manoeuvres priced)",
+}
 
 
-def ensure_required_connected(R, D, pinned_endpoints=False):
+def arc_bearings(D, nodes):
+    """(bearing leaving, bearing arriving) for every arc."""
+    out = {}
+    for u, v, k, d in D.edges(keys=True, data=True):
+        chain = segment_coords({"wkt": d["wkt"], "u": u, "v": v}, nodes)
+        out[(u, v, k)] = (
+            bearing_of(chain[0], chain[1]) if len(chain) > 1 else None,
+            bearing_of(chain[-2], chain[-1]) if len(chain) > 1 else None)
+    return out
+
+
+def build_line_graph(D, nodes, traffic_side="left"):
+    """Vertices are arcs, edges are turns. Size is sum over nodes of
+    in-degree x out-degree -- a few times the road graph, no more."""
+    ends = arc_bearings(D, nodes)
+    L = nx.DiGraph()
+    for (u, v, k), (_, arriving) in ends.items():
+        for _, w, k2 in D.out_edges(v, keys=True):
+            leaving = ends[(v, w, k2)][0]
+            L.add_edge((u, v, k), (v, w, k2),
+                       weight=D[v][w][k2]["cost"]
+                       + TURN_SECONDS[turn_kind(arriving, leaving,
+                                                traffic_side)])
+    return L
+
+
+def make_router(D, nodes, algorithm="node", traffic_side="left"):
+    router = {"kind": algorithm, "D": D}
+    if algorithm == "turn":
+        other = "right" if traffic_side == "left" else "left"
+        router["L"] = build_line_graph(D, nodes, traffic_side)
+        # Searching paths that END at a target means walking the network
+        # backwards; mirroring it swaps left and right, so the reversed
+        # copy is built for the other side of the road to keep real
+        # turns priced correctly.
+        router["L_rev"] = build_line_graph(D.reverse(copy=True), nodes,
+                                           other)
+    return router
+
+
+def node_path_to_arcs(D, node_path):
+    return [(x, y, cheapest_arc(D, x, y)[0])
+            for x, y in zip(node_path, node_path[1:])]
+
+
+def _dijkstra_arcs(router, sources, reverse):
+    """Cheapest arc path from (or into) any source node, per node."""
+    D = router["D"]
+    L = router["L_rev" if reverse else "L"]
+    L.add_node(SOURCE)
+    try:
+        for s in sources:
+            for u, v, k in D.in_edges(s, keys=True) if reverse \
+                    else D.out_edges(s, keys=True):
+                arc = (v, u, k) if reverse else (u, v, k)
+                L.add_edge(SOURCE, arc, weight=D[u][v][k]["cost"])
+        dist, paths = nx.single_source_dijkstra(L, SOURCE, weight="weight")
+    finally:
+        L.remove_node(SOURCE)
+
+    best_cost, best_path = {}, {}
+    for arc, cost in dist.items():
+        if arc is SOURCE or arc == SOURCE:
+            continue
+        head = arc[0] if reverse else arc[1]
+        if head not in best_cost or cost < best_cost[head]:
+            best_cost[head] = cost
+            chain = [a for a in paths[arc] if a != SOURCE]
+            if reverse:                      # stored on the mirror image
+                chain = [(v, u, k) for u, v, k in reversed(chain)]
+            best_path[head] = chain
+    for s in sources:
+        best_cost[s], best_path[s] = 0.0, []
+    return best_cost, best_path
+
+
+def route_from(router, sources, reverse=False):
+    """(cost, arc path) to every reachable node, from any of `sources`
+    (or into them, with reverse=True)."""
+    if router["kind"] == "turn":
+        return _dijkstra_arcs(router, sources, reverse)
+    D = router["D"]
+    graph = D.reverse(copy=False) if reverse else D
+    dist, paths = nx.multi_source_dijkstra(graph, sources=set(sources),
+                                           weight="cost")
+    arcs = {}
+    for n, p in paths.items():
+        arcs[n] = node_path_to_arcs(D, list(reversed(p)) if reverse else p)
+    return dist, arcs
+
+
+def route_path(router, a, b):
+    """Cheapest arc path a -> b."""
+    if router["kind"] == "turn":
+        _, paths = _dijkstra_arcs(router, [a], False)
+        if b not in paths:
+            raise nx.NetworkXNoPath(f"{a} -> {b}")
+        return paths[b]
+    return node_path_to_arcs(
+        router["D"], nx.shortest_path(router["D"], a, b, weight="cost"))
+
+
+def both_ways(router, a, b):
+    """A connector is ridden in whichever direction the tour needs, and
+    with turn costs the two directions are different paths."""
+    return {a: route_path(router, a, b), b: route_path(router, b, a)}
+
+
+
+def ensure_required_connected(R, router, pinned_endpoints=False):
     """If the required work falls into several islands, bridge them with
     the cheapest paths through the full network. Prints a warning, since
     the result is then near-optimal rather than provably optimal.
@@ -301,22 +432,21 @@ def ensure_required_connected(R, D, pinned_endpoints=False):
         others = set().union(*comps[1:])
         best = None
         # cheapest link either way out of the growing component
-        for graph, reverse in ((D, False), (D.reverse(copy=False), True)):
-            dist, paths = nx.multi_source_dijkstra(graph, sources=base,
-                                                   weight="cost")
+        for reverse in (False, True):
+            dist, paths = route_from(router, base, reverse=reverse)
             for n, c in dist.items():
                 if n in others and (best is None or c < best[0]):
-                    path = paths[n]
-                    best = (c, list(reversed(path)) if reverse else path)
+                    best = (c, paths[n])
         if best is None:
             sys.exit("Service streets are disconnected and no rideable "
                      "edges link them. Extract a larger area, or check "
                      "that a linking street was not excluded (service=x).")
-        _, path = best
-        a, b = path[0], path[-1]
-        R.add_edge(a, b, key=f"bridge|{bridges}", paths=both_ways(D, a, b))
+        _, arcs = best
+        a, b = arcs[0][0], arcs[-1][1]
+        R.add_edge(a, b, key=f"bridge|{bridges}",
+                   paths=both_ways(router, a, b))
         bridges += 1
-        bridge_len += path_length_m(D, path)
+        bridge_len += path_length_m(router["D"], arcs)
         comps = list(nx.connected_components(R))
     if bridges:
         islands = bridges + 1 - (1 if pinned_endpoints else 0)
@@ -343,7 +473,7 @@ def odd_nodes(R):
     return sorted(n for n in R.nodes if R.degree(n) % 2 == 1)
 
 
-def pairwise_shortest(D, targets):
+def pairwise_shortest(router, targets):
     """Cheapest cost and node path for every ORDERED pair of targets,
     over the full network (service-0 edges are fair game). Costs are
     asymmetric once a wrong-way penalty is in play, so both directions
@@ -351,7 +481,7 @@ def pairwise_shortest(D, targets):
     dist, path = {}, {}
     tset = set(targets)
     for s in targets:
-        d, p = nx.single_source_dijkstra(D, s, weight="cost")
+        d, p = route_from(router, [s])
         for t in tset:
             if t != s:
                 if t not in d:
@@ -388,14 +518,14 @@ def min_matching(nodes_subset, dist):
     return list(M), cost
 
 
-def parity_repair(R, D, open_route, start_node):
+def parity_repair(R, router, open_route, start_node):
     """Add matching connectors to R. Returns (endpoints, extra_cost).
     endpoints is (s, t) for an open route, else None."""
     odd = odd_nodes(R)
     if not odd:
         return None, 0.0
 
-    dist, path = pairwise_shortest(D, odd)
+    dist, path = pairwise_shortest(router, odd)
     sdist = symmetrise(dist)
 
     def add_connectors(pairs):
@@ -418,7 +548,7 @@ def parity_repair(R, D, open_route, start_node):
         if start_node in odd:
             s_fixed = start_node
         else:
-            d, _ = nx.single_source_dijkstra(D, start_node, weight="cost")
+            d, _ = route_from(router, [start_node])
             s_fixed = min((n for n in odd if n in d),
                           key=lambda n: d[n], default=odd[0])
         pairs_to_try = [(s_fixed, t) for t in odd if t != s_fixed]
@@ -440,12 +570,12 @@ def parity_repair(R, D, open_route, start_node):
 VIRTUAL_KEY = "virtual|endpin"
 
 
-def deadhead_segments(D, node_path):
-    """Expand a node path into deadhead segments, taking the cheapest
-    arc between each pair of adjacent nodes."""
+def deadhead_segments(D, arc_path):
+    """Turn an arc path into deadhead segments. These are the very arcs
+    the router priced, so nothing is re-chosen behind its back."""
     segs = []
-    for x, y in zip(node_path, node_path[1:]):
-        key, data = cheapest_arc(D, x, y)
+    for x, y, key in arc_path:
+        data = D[x][y][key]
         segs.append(dict(kind="deadhead", edge_id=key, u=x, v=y,
                          name=data["name"], length=data["length"],
                          wkt=data["wkt"], pass_label="-",
@@ -523,14 +653,14 @@ def tour_meta(R, F, D, nodes):
             meta[key] = {u: blank, v: blank}   # the virtual end->start
             continue
         if "paths" in data:
-            chains = {d: [nodes[n] for n in p]
-                      for d, p in data["paths"].items()}
-            against = {}
-            for d, path in data["paths"].items():
-                against[d] = sum(
-                    a[1]["length"] for a in
-                    (cheapest_arc(D, x, y) for x, y in zip(path, path[1:]))
-                    if a[1]["against"])
+            chains, against = {}, {}
+            for start, arcs in data["paths"].items():
+                chains[start] = ([nodes[arcs[0][0]]] +
+                                 [nodes[y] for _, y, _ in arcs]) \
+                    if arcs else [nodes[start], nodes[start]]
+                against[start] = sum(D[x][y][k]["length"]
+                                     for x, y, k in arcs
+                                     if D[x][y][k]["against"])
         else:
             edata = F[u][v][data["base"]]
             chain = segment_coords({"wkt": edata["wkt"], "u": u, "v": v},
@@ -1068,6 +1198,254 @@ def snap_to_node(latlon_str, candidates, nodes):
                              (nodes[n][1] - lon) ** 2)
 
 
+def summarise_result(res, nodes, args, profile):
+    """The numbers one algorithm's route is judged on."""
+    segments = res["segments"]
+    turns = annotate_turns(segments, nodes, args.traffic_side)
+    ops = operational_metrics(segments)
+    riding, turning = estimate_seconds(segments, profile)
+    total = sum(s["length"] for s in segments)
+    return {
+        "algorithm": res["algorithm"],
+        "label": ALGORITHM_LABEL.get(res["algorithm"], res["algorithm"]),
+        "total_km": round(total / 1000, 3),
+        "deadhead_km": round((total - res["service_len"]) / 1000, 3),
+        "time_min": round((riding + turning) / 60, 1),
+        "turning_min": round(turning / 60, 1),
+        "turns_cross": turns["cross"], "turns_u": turns["u"],
+        "wrong_way_km": round(sum(s["length"] for s in segments
+                                  if s.get("against")) / 1000, 3),
+        "paired_pct": ops["paired_pct"], "street_runs": ops["street_runs"],
+        "turns": turns, "ops": ops, "riding_s": riding,
+        "turning_s": turning,
+    }
+
+
+def print_comparison(rows):
+    print("\n================ ALGORITHMS ================")
+    print(f"{'algorithm':<32}{'total':>9}{'dead':>8}{'time':>8}"
+          f"{'X-turn':>8}{'U':>5}{'wrong':>8}")
+    for r in rows:
+        print(f"{r['label'][:30]:<32}{r['total_km']:>8.2f}k"
+              f"{r['deadhead_km']:>7.2f}k{hhmm(r['time_min'] * 60):>8}"
+              f"{r['turns_cross']:>8}{r['turns_u']:>5}"
+              f"{r['wrong_way_km']:>7.2f}k")
+    best = min(rows, key=lambda r: r["time_min"])
+    print(f"\nQuickest: {best['label']} "
+          f"({hhmm(best['time_min'] * 60)}). They cover the same streets, "
+          f"so the difference is all overhead --\nsame job, different "
+          f"way of getting between the work.")
+
+
+COMPARE_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>route alternatives</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  html, body { height: 100%; margin: 0; }
+  #map { height: 100%; }
+  #panel { position: absolute; top: 10px; left: 50px; z-index: 1000;
+    background: rgba(255,255,255,.97); border: 1px solid #bbb;
+    border-radius: 6px; padding: 10px 12px; width: 330px;
+    font: 13px/1.5 system-ui, sans-serif;
+    box-shadow: 0 1px 4px rgba(0,0,0,.2); }
+  .opt { border: 1px solid #ddd; border-radius: 5px; padding: 7px 9px;
+    margin-top: 7px; cursor: pointer; }
+  .opt.on { border-color: #2b6cb0; background: #ebf4fb; }
+  .opt b { font-size: 14px; }
+  .num { color: #555; }
+  .best { color: #2f855a; font-weight: 600; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <b>route alternatives</b>
+  <div style="color:#666">same streets, same work &mdash; only the way
+    between them differs</div>
+  <div id="opts"></div>
+</div>
+<script id="alt-data" type="application/json">__PAYLOAD__</script>
+<script>
+"use strict";
+const P = JSON.parse(document.getElementById("alt-data").textContent);
+const renderer = L.canvas({tolerance: 4});
+const map = L.map("map", {renderer: renderer, maxZoom: 22});
+L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+  {maxZoom: 22, maxNativeZoom: 20,
+   attribution: "&copy; OpenStreetMap contributors &copy; CARTO"}).addTo(map);
+
+function esc(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+                  .replace(/>/g, "&gt;");
+}
+const layers = P.routes.map(function (r) {
+  const g = L.featureGroup();
+  r.segs.forEach(function (s) {
+    L.polyline(s.c, s.k === "s"
+      ? {color: "#2b6cb0", weight: 4, opacity: 0.9}
+      : {color: "#dd6b20", weight: 3, opacity: 0.9, dashArray: "5 7"}
+    ).addTo(g);
+  });
+  return g;
+});
+const quickest = P.routes.reduce((a, b) => b.time_min < a.time_min ? b : a);
+
+function show(i) {
+  layers.forEach(function (g, j) {
+    if (j === i) { g.addTo(map); } else if (map.hasLayer(g)) {
+      map.removeLayer(g);
+    }
+  });
+  document.querySelectorAll(".opt").forEach(function (el, j) {
+    el.classList.toggle("on", j === i);
+  });
+}
+document.getElementById("opts").innerHTML = P.routes.map(function (r, i) {
+  const h = Math.floor(r.time_min / 60), m = Math.round(r.time_min % 60);
+  return '<div class="opt" data-i="' + i + '"><b>' + esc(r.label) +
+    "</b>" + (r === quickest ? ' <span class="best">quickest</span>' : "") +
+    '<br><span class="num">' + (h ? h + "h " : "") +
+    String(m).padStart(2, "0") + "m &middot; " + r.total_km.toFixed(2) +
+    " km &middot; " + r.turns_cross + " crossing turns, " + r.turns_u +
+    " U-turns<br>" + r.wrong_way_km.toFixed(2) +
+    " km against a one-way</span></div>";
+}).join("");
+document.getElementById("opts").addEventListener("click", function (ev) {
+  const el = ev.target.closest(".opt");
+  if (el) show(+el.dataset.i);
+});
+map.fitBounds(layers[0].getBounds());
+show(P.routes.indexOf(quickest));
+</script>
+</body>
+</html>
+"""
+
+
+def write_comparison(rows, results, nodes, out_dir: Path):
+    """One map, one route per algorithm, switched like a directions app."""
+    routes = []
+    for row, res in zip(rows, results):
+        segs = [{"k": "s" if s["kind"] == "service" else "d",
+                 "c": [[round(a, 6), round(b, 6)]
+                       for a, b in segment_coords(s, nodes)]}
+                for s in res["segments"]]
+        routes.append({k: row[k] for k in
+                       ("algorithm", "label", "total_km", "time_min",
+                        "turns_cross", "turns_u", "wrong_way_km")}
+                      | {"segs": segs})
+    payload = json.dumps({"routes": routes},
+                         ensure_ascii=False).replace("</", "<\\/")
+    path = out_dir / "alternatives.html"
+    path.write_text(COMPARE_TEMPLATE.replace("__PAYLOAD__", payload),
+                    encoding="utf-8")
+    return path
+
+
+def solve_round(algorithm, nodes, edges, args, profile, profile_name):
+    """One complete solve under one routing algorithm. Everything above
+    this is shared (the data, the annotation, the endpoints); everything
+    the outputs and the comparison need comes back in the result."""
+    F, R, D = build_graphs(edges, profile, args.wrong_way_penalty)
+    print(f"  speed profile: {profile_name}"
+          + (f", wrong-way penalty x{args.wrong_way_penalty:g}"
+             if args.wrong_way_penalty > 1.0 else "")
+          + " -- minimising riding time, reporting real metres")
+    n_service_edges = sum(1 for e in edges if e["service"] > 0)
+    if n_service_edges == 0:
+        sys.exit("No edges have service 1 or 2 -- nothing to route. "
+                 "Edit the service column in edges.csv first.")
+    service_len = sum(e["length"] * e["service"] for e in edges)
+    print(f"  {len(edges)} edges total | {n_service_edges} service streets "
+          f"| mandatory riding: {service_len / 1000:.2f} km")
+
+    pin_start = pin_end = None
+    if args.end and args.start:
+        # SPEC-2: zero-length virtual required edge end -> start; the
+        # Euler circuit is later rotated around it (see traverse).
+        pin_end = snap_to_node(args.end, list(F.nodes), nodes)
+        pin_start = snap_to_node(args.start, list(F.nodes), nodes)
+        print(f"  start snapped to node {pin_start} at {nodes[pin_start]}")
+        print(f"  end snapped to node {pin_end} at {nodes[pin_end]}")
+        R.add_edge(pin_end, pin_start, key=VIRTUAL_KEY, length=0.0)
+
+    router = make_router(D, nodes, algorithm, args.traffic_side)
+    if algorithm == "turn":
+        print(f"  routing: turn-aware (line graph, "
+              f"{router['L'].number_of_edges()} manoeuvres priced)")
+    bridges, bridge_len = ensure_required_connected(
+        R, router, pinned_endpoints=pin_start is not None)
+
+    start_node = None
+    if args.start and pin_start is None:
+        start_node = snap_to_node(args.start, list(R.nodes), nodes)
+        print(f"  start snapped to node {start_node} "
+              f"at {nodes[start_node]}")
+    if args.end and pin_end is None:
+        pin_end = snap_to_node(args.end, list(R.nodes), nodes)
+        print(f"  end snapped to node {pin_end} at {nodes[pin_end]}")
+
+    n_odd = len(odd_nodes(R))
+    print(f"Parity repair: {n_odd} odd-degree nodes to match ...")
+    print("Extracting Euler traversal ...")
+    tour_opts = {"traffic_side": args.traffic_side,
+                 "optimise_tour": not args.no_turn_optimisation,
+                 "pair_passes": args.pair_passes,
+                 "wrong_way_penalty": args.wrong_way_penalty}
+    if pin_start is not None:                        # --start + --end
+        endpoints, extra = parity_repair(R, router, False, None)
+        segments = traverse(F, R, D, nodes, None, None,
+                            pin_start=pin_start, **tour_opts)
+        kind = "open path, start & end pinned"
+    elif pin_end is not None:                        # --end only
+        endpoints, extra = parity_repair(R, router, True, pin_end)
+        if endpoints:
+            # orient the walk so it ENDS at the pin (or, if parity
+            # forces both endpoints, at the forced endpoint nearest it)
+            e_pin = snap_to_node(args.end, list(endpoints), nodes)
+            endpoints = tuple(n for n in endpoints if n != e_pin) \
+                + (e_pin,)
+            segments = traverse(F, R, D, nodes, endpoints, None,
+                                **tour_opts)
+            kind = "open path, end pinned"
+        else:  # no odd nodes: the route is a circuit; close it there
+            segments = traverse(F, R, D, nodes, None, pin_end,
+                                **tour_opts)
+            kind = "closed circuit (starts and ends at --end)"
+    else:
+        endpoints, extra = parity_repair(R, router, args.open, start_node)
+        segments = traverse(F, R, D, nodes, endpoints, start_node,
+                            **tour_opts)
+        kind = "open path" if endpoints else "closed circuit"
+
+    if args.return_to_start:
+        last, first = segments[-1]["v"], segments[0]["u"]
+        if last != first:
+            try:
+                path = route_path(router, last, first)
+            except nx.NetworkXNoPath:
+                sys.exit("--return-to-start: no path from the end back "
+                         "to the start exists in the network.")
+            tail = deadhead_segments(D, path)
+            segments.extend(tail)
+            print(f"  return leg after the end: "
+                  f"{sum(s['length'] for s in tail) / 1000:.2f} km "
+                  f"back to the start")
+            kind += " + return to start"
+
+    return {
+        "algorithm": algorithm, "segments": segments, "F": F, "kind": kind,
+        "bridges": bridges, "bridge_len": bridge_len,
+        "service_len": service_len, "n_service_edges": n_service_edges,
+        "pin_start": pin_start, "edges_total": len(edges),
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--data", default="data",
@@ -1112,6 +1490,15 @@ def main():
                          "extract with --network-type all. Riding the "
                          "footpath is direction-free, so leave this off "
                          "unless you ride on the carriageway.")
+    ap.add_argument("--algorithm", default="node",
+                    choices=list(ALGORITHMS),
+                    help="how paths are found. 'node' (default) is "
+                         "plain Dijkstra, where a turn is free. 'turn' "
+                         "routes over the line graph, pricing every "
+                         "manoeuvre -- so turning right across traffic "
+                         "onto a fast road costs what it costs. "
+                         "'all' solves with every algorithm and writes "
+                         "them side by side for comparison")
     ap.add_argument("--traffic-side", choices=["left", "right"],
                     default="left",
                     help="which side traffic drives on, so the solver "
@@ -1192,88 +1579,30 @@ def main():
     print("Loading network ...")
     nodes, edges = load_data(data_dir)
     profile_name, profile = load_profile(args.profile)
-    F, R, D = build_graphs(edges, profile, args.wrong_way_penalty)
-    print(f"  speed profile: {profile_name}"
-          + (f", wrong-way penalty x{args.wrong_way_penalty:g}"
-             if args.wrong_way_penalty > 1.0 else "")
-          + " -- minimising riding time, reporting real metres")
-    n_service_edges = sum(1 for e in edges if e["service"] > 0)
-    if n_service_edges == 0:
-        sys.exit("No edges have service 1 or 2 -- nothing to route. "
-                 "Edit the service column in edges.csv first.")
-    service_len = sum(e["length"] * e["service"] for e in edges)
-    print(f"  {len(edges)} edges total | {n_service_edges} service streets "
-          f"| mandatory riding: {service_len / 1000:.2f} km")
-
-    pin_start = pin_end = None
-    if args.end and args.start:
-        # SPEC-2: zero-length virtual required edge end -> start; the
-        # Euler circuit is later rotated around it (see traverse).
-        pin_end = snap_to_node(args.end, list(F.nodes), nodes)
-        pin_start = snap_to_node(args.start, list(F.nodes), nodes)
-        print(f"  start snapped to node {pin_start} at {nodes[pin_start]}")
-        print(f"  end snapped to node {pin_end} at {nodes[pin_end]}")
-        R.add_edge(pin_end, pin_start, key=VIRTUAL_KEY, length=0.0)
-
-    bridges, bridge_len = ensure_required_connected(
-        R, D, pinned_endpoints=pin_start is not None)
-
-    start_node = None
-    if args.start and pin_start is None:
-        start_node = snap_to_node(args.start, list(R.nodes), nodes)
-        print(f"  start snapped to node {start_node} "
-              f"at {nodes[start_node]}")
-    if args.end and pin_end is None:
-        pin_end = snap_to_node(args.end, list(R.nodes), nodes)
-        print(f"  end snapped to node {pin_end} at {nodes[pin_end]}")
-
-    n_odd = len(odd_nodes(R))
-    print(f"Parity repair: {n_odd} odd-degree nodes to match ...")
-    print("Extracting Euler traversal ...")
-    tour_opts = {"traffic_side": args.traffic_side,
-                 "optimise_tour": not args.no_turn_optimisation,
-                 "pair_passes": args.pair_passes,
-                 "wrong_way_penalty": args.wrong_way_penalty}
-    if pin_start is not None:                        # --start + --end
-        endpoints, extra = parity_repair(R, D, False, None)
-        segments = traverse(F, R, D, nodes, None, None,
-                            pin_start=pin_start, **tour_opts)
-        kind = "open path, start & end pinned"
-    elif pin_end is not None:                        # --end only
-        endpoints, extra = parity_repair(R, D, True, pin_end)
-        if endpoints:
-            # orient the walk so it ENDS at the pin (or, if parity
-            # forces both endpoints, at the forced endpoint nearest it)
-            e_pin = snap_to_node(args.end, list(endpoints), nodes)
-            endpoints = tuple(n for n in endpoints if n != e_pin) \
-                + (e_pin,)
-            segments = traverse(F, R, D, nodes, endpoints, None,
-                                **tour_opts)
-            kind = "open path, end pinned"
-        else:  # no odd nodes: the route is a circuit; close it there
-            segments = traverse(F, R, D, nodes, None, pin_end,
-                                **tour_opts)
-            kind = "closed circuit (starts and ends at --end)"
-    else:
-        endpoints, extra = parity_repair(R, D, args.open, start_node)
-        segments = traverse(F, R, D, nodes, endpoints, start_node,
-                            **tour_opts)
-        kind = "open path" if endpoints else "closed circuit"
-
-    if args.return_to_start:
-        last, first = segments[-1]["v"], segments[0]["u"]
-        if last != first:
-            try:
-                path = nx.shortest_path(D, last, first, weight="cost")
-            except nx.NetworkXNoPath:
-                sys.exit("--return-to-start: no path from the end back "
-                         "to the start exists in the network.")
-            tail = deadhead_segments(D, path)
-            segments.extend(tail)
-            print(f"  return leg after the end: "
-                  f"{sum(s['length'] for s in tail) / 1000:.2f} km "
-                  f"back to the start")
-            kind += " + return to start"
+    results = [solve_round(a, nodes, edges, args, profile, profile_name)
+               for a in ALGORITHMS[args.algorithm]]
+    rows = [summarise_result(r, nodes, args, profile) for r in results]
+    if len(results) > 1:
+        print_comparison(rows)
+        for row, res in zip(rows, results):
+            sub = out_dir / row["algorithm"]
+            sub.mkdir(parents=True, exist_ok=True)
+            write_route_csv(res["segments"], res["F"], nodes, sub)
+            write_map(res["segments"], nodes, sub, row["time_min"])
+        alt = write_comparison(rows, results, nodes, out_dir)
+        print(f"Per-algorithm routes : {out_dir}/<algorithm>/")
+        print(f"Side by side         : {alt}")
+        # the quickest one is what the top-level outputs describe
+        best = min(range(len(rows)), key=lambda i: rows[i]["time_min"])
+        results, rows = [results[best]], [rows[best]]
+        print(f"Top-level outputs    : {rows[0]['label']}\n")
+    chosen = results[0]
+    segments = chosen["segments"]
+    F, kind = chosen["F"], chosen["kind"]
+    bridges, bridge_len = chosen["bridges"], chosen["bridge_len"]
+    service_len = chosen["service_len"]
+    n_service_edges = chosen["n_service_edges"]
+    pin_start = chosen["pin_start"]
 
     turns = annotate_turns(segments, nodes, args.traffic_side)
     ops = operational_metrics(segments)
