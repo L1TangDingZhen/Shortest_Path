@@ -280,10 +280,18 @@ def test_serve():
         # solve on the stored endpoints, then serve the map
         req = urllib.request.Request(f"{base}/solve", data=b"",
                                      method="POST")
-        out = urllib.request.urlopen(req, timeout=120).read().decode()
-        assert "RESULT" in out and "return to start" in out, out
-        assert "speed profile: edv" in out, \
-            "the solver must pick up the profile stored by the editor"
+        reply = json.loads(
+            urllib.request.urlopen(req, timeout=300).read().decode())
+        out = reply["output"]
+        assert reply["ok"] and "RESULT" in out, out
+        assert "return to start" in out, out
+        # Solve runs every preference and hands them back for the panel
+        assert len(reply["routes"]) >= 2, reply["routes"]
+        assert {"variant", "label", "time_min", "total_km"} <= \
+            set(reply["routes"][0]), reply["routes"][0]
+        page = urllib.request.urlopen(
+            f"{base}/alternatives.html", timeout=10).read()
+        assert b"alt-data" in page, "comparison map not served"
         assert (TMP / "serve_out" / "route.csv").exists()
         page = urllib.request.urlopen(f"{base}/route_map.html",
                                       timeout=10).read()

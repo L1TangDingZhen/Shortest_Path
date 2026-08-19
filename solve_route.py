@@ -248,6 +248,7 @@ def build_graphs(edges, profile=None, wrong_way=1.0):
     for e in edges:
         cost = edge_cost(e["length"], e["highway"], e["maxspeed"],
                          profile)
+        kmh = speed_kmh(e["highway"], e["maxspeed"], profile)
         F.add_edge(e["u"], e["v"], key=e["edge_id"],
                    length=e["length"], name=e["name"],
                    service=e["service"], wkt=e["wkt"],
@@ -255,7 +256,7 @@ def build_graphs(edges, profile=None, wrong_way=1.0):
                    maxspeed=e["maxspeed"], cu=e["u"], cv=e["v"])
         common = dict(length=e["length"], name=e["name"], wkt=e["wkt"],
                       highway=e["highway"], oneway=e["oneway"],
-                      maxspeed=e["maxspeed"])
+                      maxspeed=e["maxspeed"], kmh=kmh)
         D.add_edge(e["u"], e["v"], key=e["edge_id"], cost=cost,
                    against=False, **common)
         D.add_edge(e["v"], e["u"], key=e["edge_id"],
@@ -346,11 +347,13 @@ def build_line_graph(D, nodes, traffic_side="left",
     for (u, v, k), (_, arriving) in ends.items():
         for _, w, k2 in D.out_edges(v, keys=True):
             leaving = ends[(v, w, k2)][0]
+            entered = D[v][w][k2]
             L.add_edge((u, v, k), (v, w, k2),
-                       weight=D[v][w][k2]["cost"]
+                       weight=entered["cost"]
                        + turn_weight
-                       * TURN_SECONDS[turn_kind(arriving, leaving,
-                                                traffic_side)])
+                       * turn_seconds(turn_kind(arriving, leaving,
+                                                traffic_side),
+                                      entered.get("kmh")))
     return L
 
 
@@ -635,6 +638,20 @@ def deadhead_segments(D, arc_path):
 # better).
 
 TURN_SECONDS = {"straight": 0.0, "easy": 4.0, "cross": 12.0, "u": 25.0}
+# Crossing traffic to enter a road costs what that road's traffic makes
+# you wait for, so the cost scales with how fast the road you are
+# joining runs. Going straight on or turning with the traffic does not
+# cross anything, so it is unaffected.
+TURN_REFERENCE_KMH = 50.0
+TURN_GRADE_RANGE = (0.4, 2.0)
+
+
+def turn_seconds(kind, entering_kmh=None):
+    base = TURN_SECONDS[kind]
+    if not base or kind not in ("cross", "u") or not entering_kmh:
+        return base
+    lo, hi = TURN_GRADE_RANGE
+    return base * min(hi, max(lo, entering_kmh / TURN_REFERENCE_KMH))
 STRAIGHT_DEG = 30      # within this, it is not a turn
 U_TURN_DEG = 150       # beyond this, it is a U-turn
 WRONG_WAY_TOUR_WEIGHT = 0.5   # seconds per metre, per unit of penalty
@@ -757,8 +774,9 @@ def euler_tour(R, source, meta, traffic_side="left", optimise=True,
             if not optimise:
                 return i, nbr, key
             info = meta.get(key, {}).get(node, {})
-            score = (TURN_SECONDS[turn_kind(bearing_in, info.get("out"),
-                                            traffic_side)]
+            score = (turn_seconds(turn_kind(bearing_in, info.get("out"),
+                                            traffic_side),
+                                  meta.get(key, {}).get("kmh"))
                      + wrong_weight * (run_against(node, key)
                                        if wrong_weight else 0.0))
             if pair_passes and prev_key is not None:
@@ -785,6 +803,51 @@ def euler_tour(R, source, meta, traffic_side="left", optimise=True,
                           meta.get(key, {}).get(node, {}).get("in")))
     out.reverse()
     return out
+
+
+def pair_passes_in_tour(euler, R):
+    """Bring the two passes of a street together, after the fact.
+
+    A choice-time bonus cannot do this: Hierholzer splices sub-tours
+    into the middle of the walk, so edges chosen one after the other
+    need not end up adjacent. Rearranging the finished tour can.
+
+    When both passes run the SAME way (u->v twice) the fix is local and
+    always legal: ride the second pass back immediately, then take the
+    walk that used to sit between them in reverse.
+
+        ... E(u->v)  W(v..u)  E(u->v)  S(v..)
+        ... E(u->v)  E(v->u)  W'(u..v) S(v..)
+
+    Same edges, same length, and the walk still chains. When the two
+    passes run in opposite directions the piece between them is a
+    closed loop hanging off v, which has nowhere else to go unless the
+    tour visits v again -- those are left alone."""
+    moved = 0
+    changed = True
+    while changed:
+        changed = False
+        at = defaultdict(list)
+        for i, (u, v, key) in enumerate(euler):
+            base = R[u][v][key].get("base")
+            if base:
+                at[base].append(i)
+        for positions in at.values():
+            if len(positions) != 2:
+                continue
+            i, j = positions
+            if j == i + 1:
+                continue
+            (au, av, _), (bu, bv, bk) = euler[i], euler[j]
+            if (au, av) != (bu, bv):
+                continue                     # opposite directions
+            euler[i + 1:j + 1] = ([(bv, bu, bk)] +
+                                  [(y, x, k) for x, y, k in
+                                   reversed(euler[i + 1:j])])
+            moved += 1
+            changed = True
+            break
+    return moved
 
 
 def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None,
@@ -819,6 +882,8 @@ def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None,
         first = None
     euler = euler_tour(R, source, meta, traffic_side, optimise_tour,
                        wrong_way_penalty, first, pair_passes)
+    if pair_passes:
+        pair_passes_in_tour(euler, R)
 
     if pin_start is not None:
         assert euler[0][2] == VIRTUAL_KEY, "virtual edge must be first"
@@ -850,7 +915,7 @@ def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None,
     return segments
 
 
-def annotate_turns(segments, nodes, traffic_side="left"):
+def annotate_turns(segments, nodes, traffic_side="left", profile=None):
     """Record the turn made when entering each segment, and count them.
     Done on the expanded route, so turns inside connectors count too."""
     counts = defaultdict(int)
@@ -861,6 +926,9 @@ def annotate_turns(segments, nodes, traffic_side="left"):
         into = bearing_of(chain[-2], chain[-1]) if len(chain) > 1 else None
         s["turn"] = ("start" if i == 0 else
                      turn_kind(previous, out, traffic_side))
+        s["turn_s"] = 0.0 if i == 0 else turn_seconds(
+            s["turn"], speed_kmh(s.get("highway", ""), s.get("maxspeed"),
+                                 profile) if profile else None)
         if i:
             counts[s["turn"]] += 1
         previous = into if into is not None else previous
@@ -906,8 +974,7 @@ def estimate_seconds(segments, profile):
                  (speed_kmh(s.get("highway", ""), s.get("maxspeed"),
                             table) / 3.6)
                  for s in segments)
-    turning = sum(TURN_SECONDS.get(s.get("turn", "straight"), 0.0)
-                  for s in segments)
+    turning = sum(s.get("turn_s", 0.0) for s in segments)
     return riding, turning
 
 
@@ -1229,7 +1296,7 @@ def summarise_result(res, nodes, args, profile):
     measured in different units and could not be compared."""
     """The numbers one algorithm's route is judged on."""
     segments = res["segments"]
-    turns = annotate_turns(segments, nodes, args.traffic_side)
+    turns = annotate_turns(segments, nodes, args.traffic_side, profile)
     ops = operational_metrics(segments)
     riding, turning = estimate_seconds(segments, profile)
     total = sum(s["length"] for s in segments)
@@ -1374,6 +1441,11 @@ def write_comparison(rows, results, nodes, out_dir: Path):
     path = out_dir / "alternatives.html"
     path.write_text(COMPARE_TEMPLATE.replace("__PAYLOAD__", payload),
                     encoding="utf-8")
+    # the same numbers without the geometry, for the editor's panel
+    (out_dir / "alternatives.json").write_text(json.dumps(
+        {"routes": [{k: v for k, v in r.items() if k != "segs"}
+                    for r in routes]}, ensure_ascii=False),
+        encoding="utf-8")
     return path
 
 
@@ -1668,7 +1740,7 @@ def main():
     pin_start = chosen["pin_start"]
     profile, profile_name = chosen["profile"], chosen["profile_name"]
 
-    turns = annotate_turns(segments, nodes, args.traffic_side)
+    turns = annotate_turns(segments, nodes, args.traffic_side, profile)
     ops = operational_metrics(segments)
     riding_s, turning_s = estimate_seconds(segments, profile)
     wrong_km = sum(s["length"] for s in segments if s.get("against")) / 1000

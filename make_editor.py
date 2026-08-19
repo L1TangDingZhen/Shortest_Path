@@ -254,6 +254,7 @@ TEMPLATE = r"""<!DOCTYPE html>
            style="width:150px">
     <button id="solve">Solve route</button>
     <span id="solvemsg"></span>
+    <div id="routes" style="margin-top:4px"></div>
     <div id="history" style="margin-top:4px"></div>
     <pre id="solveout" style="display:none;max-height:170px;overflow:auto;
       background:#f4f4f4;padding:6px;white-space:pre-wrap;
@@ -572,6 +573,26 @@ document.getElementById("epww").addEventListener("change", function () {
   saveEndpoints();
 });
 
+function showRoutes(routes) {
+  const el = document.getElementById("routes");
+  if (!routes.length) { el.innerHTML = ""; return; }
+  const quickest = routes.reduce((a, b) => b.time_min < a.time_min ? b : a);
+  el.innerHTML = "<b>route preferences</b> (same streets, different "
+    + "way between them)<br>" + routes.map(function (r) {
+      const h = Math.floor(r.time_min / 60), m = Math.round(r.time_min % 60);
+      return '<div style="margin-top:3px">'
+        + '<a href="/' + encodeURIComponent(r.variant)
+        + '/route_map.html" target="_blank"><b>' + esc(r.label) + "</b></a>"
+        + (r === quickest ? ' <span style="color:#2f855a">quickest</span>'
+           : "")
+        + '<br><span style="color:#555">' + (h ? h + "h " : "")
+        + String(m).padStart(2, "0") + "m &middot; "
+        + r.total_km.toFixed(2) + " km &middot; " + r.turns_cross
+        + " crossing turns &middot; " + r.wrong_way_km.toFixed(2)
+        + " km wrong-way</span></div>";
+    }).join("");
+}
+
 async function loadHistory() {
   if (!SERVE) return;
   let rows;
@@ -611,13 +632,15 @@ document.getElementById("solve").onclick = async function () {
   try {
     const resp = await fetch("/solve", {method: "POST",
       body: document.getElementById("note").value});
-    const text = await resp.text();
+    let data;
+    try { data = await resp.json(); }
+    catch (e) { data = {ok: false, output: "no reply", routes: []}; }
     out.style.display = "block";
-    out.textContent = text;
+    out.textContent = data.output;
     msg.innerHTML = resp.ok
-      ? ' <a href="/alternatives.html" target="_blank">compare routes</a>'
-        + ' &middot; <a href="/route_map.html" target="_blank">step through</a>'
+      ? ' <a href="/alternatives.html" target="_blank">compare on a map</a>'
       : " failed";
+    showRoutes(data.routes || []);
     if (resp.ok) loadHistory();
   } catch (err) {
     msg.textContent = " failed: " + err;
@@ -912,7 +935,18 @@ def serve(data_dir: Path, port: int, out_dir: Path, history_dir: Path):
                 ok, output = run_solver(data_dir, out_dir, history_dir,
                                         note)
                 print(f"  solve {'ok' if ok else 'FAILED'}", flush=True)
-                self._reply(200 if ok else 400, output)
+                routes = []
+                alt = out_dir / "alternatives.json"
+                if ok and alt.exists():
+                    try:
+                        routes = json.loads(
+                            alt.read_text(encoding="utf-8"))["routes"]
+                    except (ValueError, KeyError):
+                        routes = []
+                self._reply(200 if ok else 400,
+                            json.dumps({"ok": ok, "output": output,
+                                        "routes": routes}),
+                            "application/json; charset=utf-8")
             else:
                 self.send_error(404)
 
