@@ -25,7 +25,7 @@ project evolves — especially the decision log.
 | B11: turn-aware Euler tour + rough riding time / turn counts | **done, tested** (in `test_solve.py`) |
 | B12: posted speed limits in the data + `limits` profile + release-numbered history | **done, tested** |
 | B3 pass pairing (`--pair-passes`) + operational metrics in history | **done, tested** — pairing off by default, see B3 |
-| B13: turn-aware routing (line graph) as a second algorithm + `--algorithm all` comparison | **done, tested** (in `test_solve.py`) |
+| B13: turn-aware routing (line graph) + `--variants` route preferences | **done, tested** (in `test_solve.py`) |
 | V3+: real time costs, pass pairing, GPX compare, per-letterbox sequencing, exact ILP | backlog |
 
 ---
@@ -501,9 +501,18 @@ stands, honestly). Option B was not needed.
   are the arcs that reach the route -- expansion no longer re-picks
   them. The reversed search builds its line graph for the other side of
   the road, because mirroring the network swaps left and right.
-  `--algorithm all` solves with every entry in `ALGORITHMS` and writes
-  `alternatives.html`, one map with a switcher, the way a directions
-  app offers a choice.
+  `--variants` turns this into what a directions app offers: each entry
+  of `VARIANTS` is one objective (shortest distance / fastest /
+  recommended / fewest awkward turns / stay with the traffic), solved
+  separately and then **all measured with the same profile**, so the
+  numbers beside the options can honestly be compared. Output:
+  `result/<preference>/` plus `alternatives.html`, one map with a
+  switcher; the editor's Solve button runs the whole set. Measured on
+  the real round -- shortest 29.35 km but 1h04 and 41 crossing turns,
+  fastest 29.68 km / 55 min but 5.4 km against one-ways, recommended
+  30.59 km / 55 min with 20 crossing turns and 0.4 km wrong-way.
+  "Shortest" being the slowest option is the whole argument for
+  offering the choice.
 - **B6 Per-letterbox sequencing.** Join route order with the G-NAF
   open address database to emit house-number ranges per pass —
   turning route.csv into a literal sort plan.

@@ -266,23 +266,30 @@ def main():
     check_walk(rows_turn, edges_by_id, spec, closed=True)
     assert total_km(rows_turn) * 1000 >= bound - 1
 
-    print("== --algorithm all lays the alternatives side by side ==")
+    print("== --variants lays the preferences side by side ==")
     out_all = TMP / "alts"
-    stdout = run(data, out_all, "--algorithm", "all")
-    assert "ALGORITHMS" in stdout and "Quickest:" in stdout, stdout
-    for algo in ("node", "turn"):
-        assert (out_all / algo / "route.csv").exists(), algo
-        check_walk(read_route(out_all / algo), edges_by_id, spec,
+    stdout = run(data, out_all, "--variants",
+                 "shortest,fastest,recommended")
+    assert "ROUTE PREFERENCES" in stdout and "Quickest:" in stdout, stdout
+    for name in ("shortest", "fastest", "recommended"):
+        assert (out_all / name / "route.csv").exists(), name
+        check_walk(read_route(out_all / name), edges_by_id, spec,
                    closed=True)
     page = (out_all / "alternatives.html").read_text(encoding="utf-8")
     payload = json.loads(re.search(
         r'<script id="alt-data" type="application/json">(.*?)</script>',
         page, re.DOTALL).group(1))
-    assert len(payload["routes"]) == 2, payload["routes"]
-    assert {r["algorithm"] for r in payload["routes"]} == {"node", "turn"}
+    assert len(payload["routes"]) == 3, payload["routes"]
+    assert {r["variant"] for r in payload["routes"]} == \
+        {"shortest", "fastest", "recommended"}
     assert all(r["segs"] for r in payload["routes"])
     # the top-level outputs describe one of the alternatives
     assert (out_all / "route.csv").exists()
+    res = subprocess.run(
+        [sys.executable, str(BASE / "solve_route.py"), "--data", str(data),
+         "--out", str(TMP / "badvar"), "--variants", "nonsense"],
+        capture_output=True, text=True)
+    assert res.returncode != 0, "unknown preference must be rejected"
 
     print("== open mode ==")
     out2 = TMP / "open"

@@ -169,6 +169,9 @@ ROAD_FALLBACK = {"service": 25, "living_street": 20,
 EDV_TOP_SPEED = 50.0        # what the vehicle can actually do
 
 PROFILES = {
+    # One speed everywhere, so cost is proportional to metres: this is
+    # what "shortest distance" means once cost is measured in seconds.
+    "distance": {"speeds": {}, "use_maxspeed": False, "cap_kmh": None},
     # What the vehicle does: the posted limit where it is slower than
     # the vehicle, the vehicle's own top speed where it is not.
     "edv": {"speeds": {**EDV_SURFACE, **ROAD_FALLBACK},
@@ -296,12 +299,31 @@ SOURCE = ("<virtual source>",)
 
 # The algorithm list. Adding one here is all it takes for `--algorithm
 # all` to solve with it and put its route beside the others.
-ALGORITHMS = {"node": ["node"], "turn": ["turn"],
-              "all": ["node", "turn"]}
-ALGORITHM_LABEL = {
-    "node": "shortest (turns free)",
-    "turn": "turn-aware (manoeuvres priced)",
+ALGORITHMS = {"node": ["node"], "turn": ["turn"]}
+
+# What a directions app calls a preference: one objective each, solved
+# separately, then all of them measured on the SAME yardstick so the
+# numbers beside them can be compared. Adding one is a dict entry.
+VARIANTS = {
+    "shortest": {"label": "shortest distance", "algorithm": "node",
+                 "profile": "distance", "wrong_way_penalty": 1.0,
+                 "turn_weight": 0.0},
+    "fastest": {"label": "fastest", "algorithm": "node",
+                "profile": "edv", "wrong_way_penalty": 1.0,
+                "turn_weight": 0.0},
+    "recommended": {"label": "recommended", "algorithm": "turn",
+                    "profile": "edv", "wrong_way_penalty": 3.0,
+                    "turn_weight": 1.0},
+    "gentle": {"label": "fewest awkward turns", "algorithm": "turn",
+               "profile": "edv", "wrong_way_penalty": 3.0,
+               "turn_weight": 4.0},
+    "with_traffic": {"label": "stay with the traffic", "algorithm": "turn",
+                     "profile": "edv", "wrong_way_penalty": 12.0,
+                     "turn_weight": 1.0},
 }
+VARIANT_ORDER = ["recommended", "fastest", "shortest", "gentle",
+                 "with_traffic"]
+SCORE_PROFILE = "edv"      # every variant is measured with this one
 
 
 def arc_bearings(D, nodes):
@@ -315,7 +337,8 @@ def arc_bearings(D, nodes):
     return out
 
 
-def build_line_graph(D, nodes, traffic_side="left"):
+def build_line_graph(D, nodes, traffic_side="left",
+                     turn_weight=1.0):
     """Vertices are arcs, edges are turns. Size is sum over nodes of
     in-degree x out-degree -- a few times the road graph, no more."""
     ends = arc_bearings(D, nodes)
@@ -325,22 +348,24 @@ def build_line_graph(D, nodes, traffic_side="left"):
             leaving = ends[(v, w, k2)][0]
             L.add_edge((u, v, k), (v, w, k2),
                        weight=D[v][w][k2]["cost"]
-                       + TURN_SECONDS[turn_kind(arriving, leaving,
+                       + turn_weight
+                       * TURN_SECONDS[turn_kind(arriving, leaving,
                                                 traffic_side)])
     return L
 
 
-def make_router(D, nodes, algorithm="node", traffic_side="left"):
+def make_router(D, nodes, algorithm="node", traffic_side="left",
+                turn_weight=1.0):
     router = {"kind": algorithm, "D": D}
     if algorithm == "turn":
         other = "right" if traffic_side == "left" else "left"
-        router["L"] = build_line_graph(D, nodes, traffic_side)
+        router["L"] = build_line_graph(D, nodes, traffic_side, turn_weight)
         # Searching paths that END at a target means walking the network
         # backwards; mirroring it swaps left and right, so the reversed
         # copy is built for the other side of the road to keep real
         # turns priced correctly.
         router["L_rev"] = build_line_graph(D.reverse(copy=True), nodes,
-                                           other)
+                                           other, turn_weight)
     return router
 
 
@@ -1199,6 +1224,9 @@ def snap_to_node(latlon_str, candidates, nodes):
 
 
 def summarise_result(res, nodes, args, profile):
+    """`profile` is the common yardstick, not the one this variant was
+    optimised with -- otherwise the times beside the options would be
+    measured in different units and could not be compared."""
     """The numbers one algorithm's route is judged on."""
     segments = res["segments"]
     turns = annotate_turns(segments, nodes, args.traffic_side)
@@ -1207,7 +1235,8 @@ def summarise_result(res, nodes, args, profile):
     total = sum(s["length"] for s in segments)
     return {
         "algorithm": res["algorithm"],
-        "label": ALGORITHM_LABEL.get(res["algorithm"], res["algorithm"]),
+        "variant": res["variant"]["name"],
+        "label": res["variant"]["label"],
         "total_km": round(total / 1000, 3),
         "deadhead_km": round((total - res["service_len"]) / 1000, 3),
         "time_min": round((riding + turning) / 60, 1),
@@ -1222,8 +1251,9 @@ def summarise_result(res, nodes, args, profile):
 
 
 def print_comparison(rows):
-    print("\n================ ALGORITHMS ================")
-    print(f"{'algorithm':<32}{'total':>9}{'dead':>8}{'time':>8}"
+    print(f"\n============ ROUTE PREFERENCES ============"
+          f"   (all measured with the '{SCORE_PROFILE}' profile)")
+    print(f"{'preference':<32}{'total':>9}{'dead':>8}{'time':>8}"
           f"{'X-turn':>8}{'U':>5}{'wrong':>8}")
     for r in rows:
         print(f"{r['label'][:30]:<32}{r['total_km']:>8.2f}k"
@@ -1231,10 +1261,10 @@ def print_comparison(rows):
               f"{r['turns_cross']:>8}{r['turns_u']:>5}"
               f"{r['wrong_way_km']:>7.2f}k")
     best = min(rows, key=lambda r: r["time_min"])
-    print(f"\nQuickest: {best['label']} "
-          f"({hhmm(best['time_min'] * 60)}). They cover the same streets, "
-          f"so the difference is all overhead --\nsame job, different "
-          f"way of getting between the work.")
+    print(f"\nQuickest: {best['label']} ({hhmm(best['time_min'] * 60)}). "
+          f"Every option covers the same streets, so what differs is "
+          f"only\nthe overhead -- same job, different way of getting "
+          f"between the work.")
 
 
 COMPARE_TEMPLATE = r"""<!DOCTYPE html>
@@ -1336,7 +1366,7 @@ def write_comparison(rows, results, nodes, out_dir: Path):
                        for a, b in segment_coords(s, nodes)]}
                 for s in res["segments"]]
         routes.append({k: row[k] for k in
-                       ("algorithm", "label", "total_km", "time_min",
+                       ("variant", "label", "total_km", "time_min",
                         "turns_cross", "turns_u", "wrong_way_km")}
                       | {"segs": segs})
     payload = json.dumps({"routes": routes},
@@ -1347,10 +1377,14 @@ def write_comparison(rows, results, nodes, out_dir: Path):
     return path
 
 
-def solve_round(algorithm, nodes, edges, args, profile, profile_name):
-    """One complete solve under one routing algorithm. Everything above
-    this is shared (the data, the annotation, the endpoints); everything
-    the outputs and the comparison need comes back in the result."""
+def solve_round(variant, nodes, edges, args, profile, profile_name):
+    """One complete solve under one preference. Everything above this is
+    shared (the data, the annotation, the endpoints); everything the
+    outputs and the comparison need comes back in the result."""
+    algorithm = variant["algorithm"]
+    profile_name, profile = load_profile(variant["profile"])
+    args = argparse.Namespace(**vars(args))
+    args.wrong_way_penalty = variant["wrong_way_penalty"]
     F, R, D = build_graphs(edges, profile, args.wrong_way_penalty)
     print(f"  speed profile: {profile_name}"
           + (f", wrong-way penalty x{args.wrong_way_penalty:g}"
@@ -1374,7 +1408,8 @@ def solve_round(algorithm, nodes, edges, args, profile, profile_name):
         print(f"  end snapped to node {pin_end} at {nodes[pin_end]}")
         R.add_edge(pin_end, pin_start, key=VIRTUAL_KEY, length=0.0)
 
-    router = make_router(D, nodes, algorithm, args.traffic_side)
+    router = make_router(D, nodes, algorithm, args.traffic_side,
+                         variant.get("turn_weight", 1.0))
     if algorithm == "turn":
         print(f"  routing: turn-aware (line graph, "
               f"{router['L'].number_of_edges()} manoeuvres priced)")
@@ -1439,7 +1474,9 @@ def solve_round(algorithm, nodes, edges, args, profile, profile_name):
             kind += " + return to start"
 
     return {
-        "algorithm": algorithm, "segments": segments, "F": F, "kind": kind,
+        "variant": variant, "algorithm": algorithm,
+        "segments": segments, "F": F, "kind": kind,
+        "profile_name": profile_name, "profile": profile,
         "bridges": bridges, "bridge_len": bridge_len,
         "service_len": service_len, "n_service_edges": n_service_edges,
         "pin_start": pin_start, "edges_total": len(edges),
@@ -1490,6 +1527,14 @@ def main():
                          "extract with --network-type all. Riding the "
                          "footpath is direction-free, so leave this off "
                          "unless you ride on the carriageway.")
+    ap.add_argument("--variants", metavar="NAMES",
+                    help="solve several preferences and lay them side "
+                         "by side, the way a directions app offers a "
+                         "choice: 'all', or a comma-separated list of "
+                         + ", ".join(VARIANT_ORDER) + ". Every option "
+                         "covers the same streets; they differ in what "
+                         "they treat as expensive. Overrides --profile "
+                         "/ --algorithm / --wrong-way-penalty")
     ap.add_argument("--algorithm", default="node",
                     choices=list(ALGORITHMS),
                     help="how paths are found. 'node' (default) is "
@@ -1579,18 +1624,36 @@ def main():
     print("Loading network ...")
     nodes, edges = load_data(data_dir)
     profile_name, profile = load_profile(args.profile)
-    results = [solve_round(a, nodes, edges, args, profile, profile_name)
-               for a in ALGORITHMS[args.algorithm]]
-    rows = [summarise_result(r, nodes, args, profile) for r in results]
+    if args.variants:
+        names = (VARIANT_ORDER if args.variants == "all"
+                 else [n.strip() for n in args.variants.split(",")])
+        unknown = [n for n in names if n not in VARIANTS]
+        if unknown:
+            ap.error(f"unknown preference(s): {', '.join(unknown)} "
+                     f"(have: {', '.join(VARIANT_ORDER)})")
+        chosen_variants = [dict(VARIANTS[n], name=n) for n in names]
+    else:
+        # no preference asked for: honour the individual flags as given
+        chosen_variants = [{"name": args.algorithm, "label": profile_name,
+                            "algorithm": args.algorithm,
+                            "profile": args.profile,
+                            "wrong_way_penalty": args.wrong_way_penalty,
+                            "turn_weight": 1.0}]
+    _, score_profile = load_profile(SCORE_PROFILE)
+    results = [solve_round(v, nodes, edges, args, profile, profile_name)
+               for v in chosen_variants]
+    rows = [summarise_result(r, nodes, args,
+                             score_profile if len(results) > 1
+                             else r["profile"]) for r in results]
     if len(results) > 1:
         print_comparison(rows)
         for row, res in zip(rows, results):
-            sub = out_dir / row["algorithm"]
+            sub = out_dir / row["variant"]
             sub.mkdir(parents=True, exist_ok=True)
             write_route_csv(res["segments"], res["F"], nodes, sub)
             write_map(res["segments"], nodes, sub, row["time_min"])
         alt = write_comparison(rows, results, nodes, out_dir)
-        print(f"Per-algorithm routes : {out_dir}/<algorithm>/")
+        print(f"Each preference      : {out_dir}/<preference>/")
         print(f"Side by side         : {alt}")
         # the quickest one is what the top-level outputs describe
         best = min(range(len(rows)), key=lambda i: rows[i]["time_min"])
@@ -1603,6 +1666,7 @@ def main():
     service_len = chosen["service_len"]
     n_service_edges = chosen["n_service_edges"]
     pin_start = chosen["pin_start"]
+    profile, profile_name = chosen["profile"], chosen["profile_name"]
 
     turns = annotate_turns(segments, nodes, args.traffic_side)
     ops = operational_metrics(segments)

@@ -615,7 +615,8 @@ document.getElementById("solve").onclick = async function () {
     out.style.display = "block";
     out.textContent = text;
     msg.innerHTML = resp.ok
-      ? ' <a href="/route_map.html" target="_blank">open route map</a>'
+      ? ' <a href="/alternatives.html" target="_blank">compare routes</a>'
+        + ' &middot; <a href="/route_map.html" target="_blank">step through</a>'
       : " failed";
     if (resp.ok) loadHistory();
   } catch (err) {
@@ -829,7 +830,7 @@ def run_solver(data_dir: Path, out_dir: Path, history_dir: Path,
     ep = load_endpoints(data_dir)
     cmd = [sys.executable, str(BASE / "solve_route.py"),
            "--data", str(data_dir), "--out", str(out_dir),
-           "--history", str(history_dir)]
+           "--history", str(history_dir), "--variants", "all"]
     if note:
         cmd += ["--note", note]
     if ep.get("start"):
@@ -867,8 +868,10 @@ def serve(data_dir: Path, port: int, out_dir: Path, history_dir: Path):
                 rows = round_history.read_index(history_dir)
                 self._reply(200, json.dumps(rows[-8:]),
                             "application/json; charset=utf-8")
-            elif path == "/route_map.html":
-                target = out_dir / "route_map.html"
+            elif path.endswith(".html") and ".." not in path:
+                # route_map.html, alternatives.html, or one preference's
+                # own map at /<preference>/route_map.html
+                target = out_dir / path.lstrip("/")
                 if not target.exists():
                     self._reply(404, "No route yet -- press Solve first.")
                     return
