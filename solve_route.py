@@ -64,6 +64,7 @@ import csv
 import itertools
 import json
 import math
+import random
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -84,10 +85,14 @@ except ImportError:  # geometry is optional; straight lines still work
 
 def load_data(data_dir: Path):
     """Read nodes.csv and edges.csv. Node ids are kept as strings."""
-    nodes = {}
+    nodes, control = {}, {}
     with open(data_dir / "nodes.csv", newline="", encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
             nodes[row["node_id"]] = (float(row["lat"]), float(row["lon"]))
+            kind = (row.get("control") or "").strip()
+            if kind:
+                control[row["node_id"]] = (
+                    kind, (row.get("control_group") or "").strip())
 
     edges, blank_service, excluded = [], 0, 0
     with open(data_dir / "edges.csv", newline="", encoding="utf-8-sig") as f:
@@ -129,7 +134,7 @@ def load_data(data_dir: Path):
     if excluded:
         print(f"  note: {excluded} edges excluded (service=x) -> the "
               f"route will never use them, not even as shortcuts")
-    return nodes, edges
+    return nodes, edges, control
 
 
 # ----------------------------------------------------------------------
@@ -339,7 +344,7 @@ def arc_bearings(D, nodes):
 
 
 def build_line_graph(D, nodes, traffic_side="left",
-                     turn_weight=1.0):
+                     turn_weight=1.0, control=None):
     """Vertices are arcs, edges are turns. Size is sum over nodes of
     in-degree x out-degree -- a few times the road graph, no more."""
     ends = arc_bearings(D, nodes)
@@ -350,6 +355,7 @@ def build_line_graph(D, nodes, traffic_side="left",
             entered = D[v][w][k2]
             L.add_edge((u, v, k), (v, w, k2),
                        weight=entered["cost"]
+                       + (node_delay(control, u, v) if control else 0.0)
                        + turn_weight
                        * turn_seconds(turn_kind(arriving, leaving,
                                                 traffic_side),
@@ -358,17 +364,18 @@ def build_line_graph(D, nodes, traffic_side="left",
 
 
 def make_router(D, nodes, algorithm="node", traffic_side="left",
-                turn_weight=1.0):
+                turn_weight=1.0, control=None):
     router = {"kind": algorithm, "D": D}
     if algorithm == "turn":
         other = "right" if traffic_side == "left" else "left"
-        router["L"] = build_line_graph(D, nodes, traffic_side, turn_weight)
+        router["L"] = build_line_graph(D, nodes, traffic_side, turn_weight,
+                                       control)
         # Searching paths that END at a target means walking the network
         # backwards; mirroring it swaps left and right, so the reversed
         # copy is built for the other side of the road to keep real
         # turns priced correctly.
         router["L_rev"] = build_line_graph(D.reverse(copy=True), nodes,
-                                           other, turn_weight)
+                                           other, turn_weight, control)
     return router
 
 
@@ -642,6 +649,26 @@ TURN_SECONDS = {"straight": 0.0, "easy": 4.0, "cross": 12.0, "u": 25.0}
 # you wait for, so the cost scales with how fast the road you are
 # joining runs. Going straight on or turning with the traffic does not
 # cross anything, so it is unaffected.
+# Waiting is not riding, and on a footpath round it is a large part of
+# the day: crossings are where the time goes. Charged once per
+# intersection entered, never per tagged node -- an intersection is 4.5
+# tagged nodes on average, so per-node would over-count by that much.
+DELAY_SECONDS = {"signals": 25.0, "crossing": 5.0,
+                 "give_way": 3.0, "stop": 5.0}
+
+
+def node_delay(control, previous, node):
+    """Seconds lost entering `node` from `previous`. Zero when both are
+    already inside the same intersection: you only wait once."""
+    here = control.get(node)
+    if not here:
+        return 0.0
+    there = control.get(previous)
+    if there and there[1] and there[1] == here[1]:
+        return 0.0
+    return DELAY_SECONDS.get(here[0], 0.0)
+
+
 TURN_REFERENCE_KMH = 50.0
 TURN_GRADE_RANGE = (0.4, 2.0)
 
@@ -805,6 +832,120 @@ def euler_tour(R, source, meta, traffic_side="left", optimise=True,
     return out
 
 
+
+# ----------------------------------------------------------------------
+# Choosing WHICH Euler tour, part two: search instead of guess
+# ----------------------------------------------------------------------
+#
+# The greedy chooser samples one tour. Since every Euler tour over the
+# same edges has the same length, anything better it finds is free, so
+# it is worth searching rather than settling for the first sample.
+#
+# Two moves keep the walk valid, and both act on a CLOSED sub-walk --
+# a stretch that leaves a node and comes back to it:
+#
+#   reverse   ride that loop the other way round
+#   relocate  do it at a different visit of the same node
+#
+# Nothing else is needed: any Euler tour is reachable from any other by
+# such moves, and neither changes which edges are ridden.
+
+STREET_RUN_SECONDS = 20.0   # what breaking a street into one more
+                            # visit costs the person sorting the mail
+
+
+def tour_nodes(euler):
+    return [euler[0][0]] + [v for _, v, _ in euler] if euler else []
+
+
+def tour_score(euler, meta, control, traffic_side, names,
+               wrong_weight=0.0, run_weight=STREET_RUN_SECONDS):
+    """Everything the tour can still influence, in seconds. Distance is
+    absent on purpose -- it is the same for every tour."""
+    turn = delay = wrong = 0.0
+    runs = 0
+    previous_in = previous_node = last_street = None
+    for u, v, key in euler:
+        info = meta.get(key, {})
+        side = info.get(u, {})
+        if previous_in is not None:
+            turn += turn_seconds(
+                turn_kind(previous_in, side.get("out"), traffic_side),
+                info.get("kmh"))
+        if control and previous_node is not None:
+            delay += node_delay(control, previous_node, u)
+        wrong += side.get("against_m", 0.0)
+        base = info.get("base")
+        if base:
+            street = names.get(base)
+            if street != last_street:
+                runs += 1
+            last_street = street
+        if side.get("in") is not None:
+            previous_in = side["in"]
+        previous_node = u
+    return turn + delay + wrong_weight * wrong + run_weight * runs
+
+
+def local_search_tour(euler, meta, control, traffic_side, names,
+                      wrong_weight=0.0, run_weight=STREET_RUN_SECONDS,
+                      iterations=4000, seed=12345):
+    """Hill-climb over closed sub-walks. Returns (moves kept, before,
+    after) so the gain can be reported honestly."""
+    rnd = random.Random(seed)
+    score = tour_score(euler, meta, control, traffic_side, names,
+                       wrong_weight, run_weight)
+    before, kept = score, 0
+    best_score, best_tour, temperature = score, list(euler), 1.0
+    for _ in range(iterations):
+        seq = tour_nodes(euler)
+        spots = defaultdict(list)
+        for i, node in enumerate(seq):
+            spots[node].append(i)
+        repeated = [v for v in spots.values() if len(v) > 1]
+        if not repeated:
+            break
+        # consecutive visits of the same node bound the SMALLEST closed
+        # sub-walks, and those are the ones worth shuffling: picking two
+        # visits at random mostly proposes huge blocks that never improve
+        where = rnd.choice(repeated)
+        at = rnd.randrange(len(where) - 1)
+        a, b = where[at], where[at + 1]
+        if b - a < 2:
+            continue
+        block = euler[a:b]
+        if rnd.random() < 0.5:
+            trial = (euler[:a]
+                     + [(y, x, k) for x, y, k in reversed(block)]
+                     + euler[b:])
+        else:
+            rest = euler[:a] + euler[b:]
+            rest_seq = tour_nodes(rest)
+            landing = [i for i, node in enumerate(rest_seq)
+                       if node == seq[a] and i != a]
+            if not landing:
+                continue
+            at = rnd.choice(landing)
+            trial = rest[:at] + block + rest[at:]
+        trial_score = tour_score(trial, meta, control, traffic_side, names,
+                                 wrong_weight, run_weight)
+        delta = trial_score - score
+        # Strict hill climbing settles within a few dozen moves, so a
+        # cooling schedule is what makes the budget worth spending.
+        if delta < -1e-9 or (temperature > 0 and delta < 40 * temperature
+                             and rnd.random() < math.exp(-delta
+                                                         / max(temperature
+                                                               * 40, 1e-9))):
+            euler[:] = trial
+            score = trial_score
+            if score < best_score:
+                best_score, best_tour = score, list(euler)
+            kept += 1
+        temperature = max(0.0, temperature - 1.0 / max(iterations, 1))
+    euler[:] = best_tour
+    return kept, before, best_score
+
+
 def pair_passes_in_tour(euler, R):
     """Bring the two passes of a street together, after the fact.
 
@@ -852,7 +993,8 @@ def pair_passes_in_tour(euler, R):
 
 def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None,
              traffic_side="left", optimise_tour=True,
-             wrong_way_penalty=1.0, pair_passes=False):
+             wrong_way_penalty=1.0, pair_passes=False, control=None,
+             search_iterations=4000):
     """Walk the Euler circuit/path and expand connectors into real
     street segments. Returns a list of segment dicts.
 
@@ -884,6 +1026,21 @@ def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None,
                        wrong_way_penalty, first, pair_passes)
     if pair_passes:
         pair_passes_in_tour(euler, R)
+    if optimise_tour and search_iterations:
+        names = {d["base"]: F[u][v][d["base"]]["name"]
+                 for u, v, k, d in R.edges(keys=True, data=True)
+                 if "base" in d}
+        head = euler[:1] if pin_start is not None else []
+        body = euler[len(head):]
+        kept, before, after = local_search_tour(
+            body, meta, control, traffic_side, names,
+            max(0.0, wrong_way_penalty - 1.0) * WRONG_WAY_TOUR_WEIGHT,
+            iterations=search_iterations)
+        euler = head + body
+        if kept:
+            print(f"  tour search: {kept} improvements, "
+                  f"{(before - after) / 60:.1f} min of turning, waiting "
+                  f"and re-visits removed at no extra distance")
 
     if pin_start is not None:
         assert euler[0][2] == VIRTUAL_KEY, "virtual edge must be first"
@@ -915,7 +1072,8 @@ def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None,
     return segments
 
 
-def annotate_turns(segments, nodes, traffic_side="left", profile=None):
+def annotate_turns(segments, nodes, traffic_side="left", profile=None,
+                   control=None):
     """Record the turn made when entering each segment, and count them.
     Done on the expanded route, so turns inside connectors count too."""
     counts = defaultdict(int)
@@ -929,6 +1087,8 @@ def annotate_turns(segments, nodes, traffic_side="left", profile=None):
         s["turn_s"] = 0.0 if i == 0 else turn_seconds(
             s["turn"], speed_kmh(s.get("highway", ""), s.get("maxspeed"),
                                  profile) if profile else None)
+        s["wait_s"] = (node_delay(control, s["u"], s["v"])
+                       if control else 0.0)
         if i:
             counts[s["turn"]] += 1
         previous = into if into is not None else previous
@@ -975,7 +1135,8 @@ def estimate_seconds(segments, profile):
                             table) / 3.6)
                  for s in segments)
     turning = sum(s.get("turn_s", 0.0) for s in segments)
-    return riding, turning
+    waiting = sum(s.get("wait_s", 0.0) for s in segments)
+    return riding, turning, waiting
 
 
 def hhmm(seconds):
@@ -1290,15 +1451,16 @@ def snap_to_node(latlon_str, candidates, nodes):
                              (nodes[n][1] - lon) ** 2)
 
 
-def summarise_result(res, nodes, args, profile):
+def summarise_result(res, nodes, args, profile, control=None):
     """`profile` is the common yardstick, not the one this variant was
     optimised with -- otherwise the times beside the options would be
     measured in different units and could not be compared."""
     """The numbers one algorithm's route is judged on."""
     segments = res["segments"]
-    turns = annotate_turns(segments, nodes, args.traffic_side, profile)
+    turns = annotate_turns(segments, nodes, args.traffic_side, profile,
+                           control)
     ops = operational_metrics(segments)
-    riding, turning = estimate_seconds(segments, profile)
+    riding, turning, waiting = estimate_seconds(segments, profile)
     total = sum(s["length"] for s in segments)
     return {
         "algorithm": res["algorithm"],
@@ -1306,8 +1468,9 @@ def summarise_result(res, nodes, args, profile):
         "label": res["variant"]["label"],
         "total_km": round(total / 1000, 3),
         "deadhead_km": round((total - res["service_len"]) / 1000, 3),
-        "time_min": round((riding + turning) / 60, 1),
+        "time_min": round((riding + turning + waiting) / 60, 1),
         "turning_min": round(turning / 60, 1),
+        "waiting_min": round(waiting / 60, 1),
         "turns_cross": turns["cross"], "turns_u": turns["u"],
         "wrong_way_km": round(sum(s["length"] for s in segments
                                   if s.get("against")) / 1000, 3),
@@ -1449,7 +1612,8 @@ def write_comparison(rows, results, nodes, out_dir: Path):
     return path
 
 
-def solve_round(variant, nodes, edges, args, profile, profile_name):
+def solve_round(variant, nodes, edges, args, profile, profile_name,
+                control):
     """One complete solve under one preference. Everything above this is
     shared (the data, the annotation, the endpoints); everything the
     outputs and the comparison need comes back in the result."""
@@ -1481,7 +1645,7 @@ def solve_round(variant, nodes, edges, args, profile, profile_name):
         R.add_edge(pin_end, pin_start, key=VIRTUAL_KEY, length=0.0)
 
     router = make_router(D, nodes, algorithm, args.traffic_side,
-                         variant.get("turn_weight", 1.0))
+                         variant.get("turn_weight", 1.0), control)
     if algorithm == "turn":
         print(f"  routing: turn-aware (line graph, "
               f"{router['L'].number_of_edges()} manoeuvres priced)")
@@ -1503,7 +1667,10 @@ def solve_round(variant, nodes, edges, args, profile, profile_name):
     tour_opts = {"traffic_side": args.traffic_side,
                  "optimise_tour": not args.no_turn_optimisation,
                  "pair_passes": args.pair_passes,
-                 "wrong_way_penalty": args.wrong_way_penalty}
+                 "wrong_way_penalty": args.wrong_way_penalty,
+                 "control": control,
+                 "search_iterations": 0 if args.no_tour_search
+                 else args.search_iterations}
     if pin_start is not None:                        # --start + --end
         endpoints, extra = parity_repair(R, router, False, None)
         segments = traverse(F, R, D, nodes, None, None,
@@ -1629,6 +1796,13 @@ def main():
                          "between the passes anyway: measured +5 points "
                          "of pairing for +3 min of turning, so it is "
                          "off by default (B3)")
+    ap.add_argument("--no-tour-search", action="store_true",
+                    help="skip the search over Euler tours. Every tour "
+                         "is the same length, so the search only ever "
+                         "removes turning, waiting and street re-visits")
+    ap.add_argument("--search-iterations", type=int, default=4000,
+                    metavar="N", help="how hard to search for a better "
+                                      "tour (default 4000)")
     ap.add_argument("--no-turn-optimisation", action="store_true",
                     help="take any Euler tour instead of preferring one "
                          "with fewer awkward turns and less wrong-way "
@@ -1694,7 +1868,7 @@ def main():
         ap.error("--wrong-way-penalty must be >= 1.0")
 
     print("Loading network ...")
-    nodes, edges = load_data(data_dir)
+    nodes, edges, control = load_data(data_dir)
     profile_name, profile = load_profile(args.profile)
     if args.variants:
         names = (VARIANT_ORDER if args.variants == "all"
@@ -1712,11 +1886,12 @@ def main():
                             "wrong_way_penalty": args.wrong_way_penalty,
                             "turn_weight": 1.0}]
     _, score_profile = load_profile(SCORE_PROFILE)
-    results = [solve_round(v, nodes, edges, args, profile, profile_name)
+    results = [solve_round(v, nodes, edges, args, profile, profile_name,
+                           control)
                for v in chosen_variants]
     rows = [summarise_result(r, nodes, args,
                              score_profile if len(results) > 1
-                             else r["profile"]) for r in results]
+                             else r["profile"], control) for r in results]
     if len(results) > 1:
         print_comparison(rows)
         for row, res in zip(rows, results):
@@ -1740,16 +1915,17 @@ def main():
     pin_start = chosen["pin_start"]
     profile, profile_name = chosen["profile"], chosen["profile_name"]
 
-    turns = annotate_turns(segments, nodes, args.traffic_side, profile)
+    turns = annotate_turns(segments, nodes, args.traffic_side, profile,
+                           control)
     ops = operational_metrics(segments)
-    riding_s, turning_s = estimate_seconds(segments, profile)
+    riding_s, turning_s, waiting_s = estimate_seconds(segments, profile)
     wrong_km = sum(s["length"] for s in segments if s.get("against")) / 1000
 
     total = sum(s["length"] for s in segments)
     deadhead = total - service_len
     route_csv = write_route_csv(segments, F, nodes, out_dir)
     route_map = write_map(segments, nodes, out_dir,
-                          (riding_s + turning_s) / 60)
+                          (riding_s + turning_s + waiting_s) / 60)
 
     if args.history:
         import round_history
@@ -1777,7 +1953,8 @@ def main():
                 "profile": profile_name,
                 "wrong_way_penalty": args.wrong_way_penalty,
                 "wrong_way_km": round(wrong_km, 3),
-                "time_min": round((riding_s + turning_s) / 60, 1),
+                "time_min": round((riding_s + turning_s + waiting_s) / 60, 1),
+                "waiting_min": round(waiting_s / 60, 1),
                 "paired_pct": ops["paired_pct"],
                 "street_runs": ops["street_runs"],
                 "runs_per_street": ops["runs_per_street"],
@@ -1796,8 +1973,9 @@ Route total              : {total / 1000:7.2f} km
 Extra / deadhead         : {deadhead / 1000:7.2f} km   ({100 * deadhead / max(total, 1):.1f}% of route)
 Segments                 : {sum(1 for s in segments if s['kind'] == 'service')} service + \
 {sum(1 for s in segments if s['kind'] == 'deadhead')} deadhead
-Riding time (rough)      : {hhmm(riding_s + turning_s):>9}   \
-({hhmm(riding_s)} moving + {hhmm(turning_s)} turning; excludes every stop)
+Riding time (rough)      : {hhmm(riding_s + turning_s + waiting_s):>9}   \
+({hhmm(riding_s)} moving + {hhmm(turning_s)} turning + \
+{hhmm(waiting_s)} waiting at crossings; excludes delivery stops)
 Turns                    : {turns['cross']} crossing + {turns['u']} U-turn + \
 {turns['easy']} easy + {turns['straight']} straight
 Against a one-way        : {wrong_km:7.2f} km   (ride the footpath there)

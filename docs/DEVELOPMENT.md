@@ -26,6 +26,8 @@ project evolves — especially the decision log.
 | B12: posted speed limits in the data + `limits` profile + release-numbered history | **done, tested** |
 | B3 pass pairing (`--pair-passes`) + operational metrics in history | **done, tested** — pairing off by default, see B3 |
 | B13: turn-aware routing (line graph) + `--variants` route preferences | **done, tested** (in `test_solve.py`) |
+| B14: intersection delay in the data and the routing | **done, tested** |
+| B15: search over Euler tours (annealing) | **done** — measured at 0.5 min, the lever is exhausted |
 | V3+: real time costs, pass pairing, GPX compare, per-letterbox sequencing, exact ILP | backlog |
 
 ---
@@ -529,6 +531,31 @@ stands, honestly). Option B was not needed.
   30.59 km / 55 min with 20 crossing turns and 0.4 km wrong-way.
   "Shortest" being the slowest option is the whole argument for
   offering the choice.
+- **B14 Intersection delay.** *Shipped 2026-08.* Waiting is not
+  riding, and on a footpath round it is a quarter of the day. Node tags
+  were being thrown away (`nodes.csv` held only id/lat/lon) while the
+  area holds 301 `traffic_signals`, 1804 `crossing`, 320 `give_way` and
+  91 `stop` nodes. Extraction now keeps them **and clusters them into
+  intersections** (40 m): a junction carries 4.5 tagged nodes on
+  average, so charging per node would over-count by that much. The
+  delay is charged once per intersection *entered*, which the line
+  graph can express because its vertex is an arc and therefore knows
+  where you came from. Measured: waiting **20 min -> 10 min** once the
+  router could see crossings, total 1h16 -> 1h09 for +2 km. This is the
+  last change that moved the route's shape.
+- **B15 Searching over Euler tours.** *Shipped 2026-08, and it is
+  exhausted.* Since every tour is the same length, `local_search_tour`
+  hill-climbs (then anneals) over the two moves that preserve an Euler
+  tour: reverse a closed sub-walk, or do it at another visit of the
+  same node. Objective: turn seconds + intersection delay + wrong-way
+  metres + a 20 s charge per extra street visit. Result on the real
+  round: **0.5 min and 4 crossing turns**, and *identical* at 4 000 and
+  20 000 iterations, with strict hill climbing and with annealing
+  accepting 8 985 moves. The greedy chooser is already at a strong
+  local optimum. Street runs did not move at all (43, against a
+  theoretical 23): loop reversal cannot restructure a tour at street
+  scale -- that needs a different construction, building the tour
+  street by street rather than edge by edge.
 - **B6 Per-letterbox sequencing.** Join route order with the G-NAF
   open address database to emit house-number ranges per pass —
   turning route.csv into a literal sort plan.

@@ -108,8 +108,72 @@ def oneway_arcs(G):
     return {(u, v) for u, v, d in G.edges(data=True) if d.get("oneway")}
 
 
+CONTROL_RADIUS_M = 40.0     # nodes this close are one intersection
+
+
+def node_control(d):
+    """What makes you stop at this node, if anything. A signalised
+    crossing is tagged either way round, so both are checked."""
+    highway = norm(d.get("highway"))
+    crossing = norm(d.get("crossing"))
+    if highway == "traffic_signals" or crossing == "traffic_signals":
+        return "signals"
+    if highway == "crossing":
+        return "crossing"
+    if highway in ("give_way", "stop"):
+        return highway
+    return ""
+
+
+def control_groups(G):
+    """One intersection is several tagged nodes -- 4.5 of them on
+    average in the maintainer's area -- so charging a wait per node
+    would over-count by that much. Cluster them, and the solver can
+    charge once per group entered."""
+    import math
+    controlled = [(n, node_control(d)) for n, d in G.nodes(data=True)
+                  if node_control(d)]
+    if not controlled:
+        return {}
+    lat0 = G.nodes[controlled[0][0]]["y"]
+    mlat, mlon = 110540.0, 111320.0 * math.cos(math.radians(lat0))
+    cell = {}
+    size = CONTROL_RADIUS_M
+    for n, _ in controlled:                      # grid buckets, then union
+        d = G.nodes[n]
+        cell.setdefault((int(d["y"] * mlat / size),
+                         int(d["x"] * mlon / size)), []).append(n)
+    parent = {n: n for n, _ in controlled}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for (cy, cx), members in cell.items():
+        near = [m for dy in (-1, 0, 1) for dx in (-1, 0, 1)
+                for m in cell.get((cy + dy, cx + dx), [])]
+        for a in members:
+            for b in near:
+                if a == b:
+                    continue
+                da, db = G.nodes[a], G.nodes[b]
+                if math.hypot((da["y"] - db["y"]) * mlat,
+                              (da["x"] - db["x"]) * mlon) <= size:
+                    parent[find(a)] = find(b)
+    ids, out = {}, {}
+    for n, kind in controlled:
+        root = find(n)
+        out[n] = (kind, ids.setdefault(root, len(ids) + 1))
+    return out
+
+
 def download_graph(poly, network_type):
     import osmnx as ox
+    # node tags are dropped by default; these are what makes you wait
+    ox.settings.useful_tags_node = list(
+        set(ox.settings.useful_tags_node) | {"highway", "crossing"})
     print("Downloading network from OpenStreetMap ...")
     G = ox.graph_from_polygon(poly, network_type=network_type,
                               simplify=True, truncate_by_edge=True)
@@ -131,11 +195,18 @@ def export(G, out_dir: Path, default_service=2):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     nodes_path = out_dir / "nodes.csv"
+    control = control_groups(G)
     with open(nodes_path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["node_id", "lat", "lon"])
+        w.writerow(["node_id", "lat", "lon", "control", "control_group"])
         for n, d in G.nodes(data=True):
-            w.writerow([n, d["y"], d["x"]])
+            kind, group = control.get(n, ("", ""))
+            w.writerow([n, d["y"], d["x"], kind, group])
+    n_ctrl = len(control)
+    n_groups = len({g for _, g in control.values()})
+    if n_ctrl:
+        print(f"  {n_ctrl} controlled nodes in {n_groups} intersections "
+              f"(signals, crossings, give way, stop)")
 
     edges_path = out_dir / "edges.csv"
     arcs = G.graph.get("oneway_arcs") or set()
