@@ -161,6 +161,13 @@ Migration notes:
   matching sometimes supplies connectivity for free. Closing that last
   gap needs a different algorithm class (ILP with connectivity
   constraints, branch-and-cut) — deliberately out of scope; see B8.
+  The editor lists the gaps themselves, not just the islands: a
+  `service=0` sliver whose two ends lie in different islands is exactly
+  what has to be fixed, and "join" gives it the value the rest of its
+  street already carries. Measured on the real round: 8 islands, joined
+  by 18 slivers of 5-17 m; fixing them all leaves 2. Nine of them lie on
+  one line of junctions, each the little piece of a delivered street
+  that crosses the intersection.
   **In practice most islands are annotation gaps, not geography**: on
   the maintainer's round the "islands" sat 12 m, 26 m and 114 m apart,
   i.e. one missing footway sliver each. Check with the editor's island

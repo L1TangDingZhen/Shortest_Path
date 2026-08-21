@@ -16,6 +16,10 @@ them.  Open it in a browser:
       upscales past its native 20).
     * search by street name or road type ("trunk", "steps", ...),
       then bulk-set every matched edge at once
+    * "show islands" colours each connected piece of the round and
+      lists the metres-long service=0 slivers that would merge them --
+      "go" zooms to one, "join" gives it the value the rest of its own
+      street already carries
     * right-click anywhere to set that point as the round's START or
       END, or just copy the coordinates
     * with --serve: Solve runs the solver on the saved endpoints and
@@ -304,6 +308,7 @@ let hoverI = -1;
 let islandMode = false;
 let comp = {};      // edge index -> island number
 let islands = [];   // [{idxs, km, bounds}] biggest first
+let gaps = [];      // service=0 slivers that would merge two islands
 const ISLAND_COLORS = ["#d73027", "#1a9850", "#7570b3", "#e6ab02",
                        "#66a61e", "#e7298a", "#a6761d", "#525252"];
 
@@ -341,6 +346,28 @@ function computeIslands() {
   islands.forEach(function (isl, ci) {
     isl.idxs.forEach(function (i) { comp[i] = ci; });
   });
+  // The gaps are what you actually have to fix: a service=0 edge whose
+  // two ends sit in different islands. They are metres long and sit
+  // inside junctions, which is exactly why they are invisible.
+  // island of each node, built once -- looking it up per edge would be
+  // quadratic, and there are ~13 000 edges
+  const nodeIsland = {};
+  edges.forEach(function (e, i) {
+    if (e.service > 0) {
+      nodeIsland[e.row.u] = comp[i];
+      nodeIsland[e.row.v] = comp[i];
+    }
+  });
+  gaps = [];
+  edges.forEach(function (e, i) {
+    if (e.service !== 0) return;
+    const a = nodeIsland[e.row.u], b = nodeIsland[e.row.v];
+    if (a === undefined || b === undefined || a === b) return;
+    gaps.push({i: i, a: a, b: b,
+               m: parseFloat(e.row.length_m) || 0,
+               name: e.row.name || "(unnamed)"});
+  });
+  gaps.sort(function (x, y) { return x.m - y.m; });
 }
 
 function renderIslandList() {
@@ -355,11 +382,53 @@ function renderIslandList() {
   }).join("") + (islands.length > 1
     ? '<div style="color:#666">1 island = exact optimum; extra islands ' +
       "get auto-bridged (fine if intended, fix if stray)</div>"
-    : '<div style="color:#666">single island: solver result is exact</div>');
+    : '<div style="color:#666">single island: solver result is exact</div>')
+    + (gaps.length
+       ? '<div style="margin-top:6px"><b>gaps that would merge them</b>' +
+         ' <span style="color:#666">(metres long, inside junctions)' +
+         "</span></div>" + gaps.map(function (g, gi) {
+           return '<div>' + g.m.toFixed(0) + " m " + esc(g.name).slice(0, 20) +
+             " &middot; #" + g.a + "&#8596;#" + g.b +
+             ' <button data-gap="' + gi + '">go</button>' +
+             ' <button data-join="' + gi + '">join</button></div>';
+         }).join("")
+       : "");
 }
+function streetValue(gap) {
+  // the value the rest of this street already carries
+  const counts = {};
+  edges.forEach(function (e) {
+    if (e.service > 0 && (e.row.name || "") === gap.name) {
+      counts[e.service] = (counts[e.service] || 0) + 1;
+    }
+  });
+  const best = Object.keys(counts).sort(function (a, b) {
+    return counts[b] - counts[a];
+  })[0];
+  return best === undefined ? 2 : +best;
+}
+
 document.getElementById("islelist").addEventListener("click", function (ev) {
-  const b = ev.target.closest("button[data-isl]");
-  if (b) map.fitBounds(islands[+b.dataset.isl].bounds.pad(0.35));
+  const isl = ev.target.closest("button[data-isl]");
+  if (isl) {
+    map.fitBounds(islands[+isl.dataset.isl].bounds.pad(0.35));
+    return;
+  }
+  const go = ev.target.closest("button[data-gap]");
+  if (go) {
+    const g = gaps[+go.dataset.gap];
+    map.fitBounds(L.latLngBounds(edges[g.i].coords).pad(6));
+    setHover(g.i, edges[g.i].coords[0]);
+    return;
+  }
+  const join = ev.target.closest("button[data-join]");
+  if (join) {
+    const g = gaps[+join.dataset.join];
+    const value = streetValue(g);
+    undoStack.push([[g.i, edges[g.i].service, value]]);
+    apply(g.i, value);
+    refresh();
+  }
 });
 document.getElementById("islands").onclick = function () {
   islandMode = !islandMode;
