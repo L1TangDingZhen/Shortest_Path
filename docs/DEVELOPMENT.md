@@ -168,8 +168,17 @@ Migration notes:
   by 18 slivers of 5-17 m; fixing them all leaves 2. Nine of them lie on
   one line of junctions, each the little piece of a delivered street
   that crosses the intersection.
-  **In practice most islands are annotation gaps, not geography**: on
-  the maintainer's round the "islands" sat 12 m, 26 m and 114 m apart,
+  **Do not chase a single island.** Measured on the real round: joining
+  all 18 gaps (5-17 m each) took it from 8 islands to 2, and made the
+  route *worse* -- mandatory +375 m, total +160 m, while bridging fell
+  only 1.24 -> 1.18 km, because the bulk of the bridging is reaching
+  the pinned depot and office, which sit ~1 km off the delivery streets
+  and always will. `service` means "the route must traverse this", not
+  "there are letterboxes here": the bit of road inside a junction has
+  none, so 0 is the correct value and the solver rides it as deadhead
+  anyway. Marking it 2 would force two traversals of a junction stub
+  for nothing. Only join a gap when that piece really is delivered.
+  Earlier note, kept because the shape of the observation still holds:
   i.e. one missing footway sliver each. Check with the editor's island
   view before blaming the algorithm. Note that pinned `--start`/`--end`
   outside the service area always form one extra component, so the

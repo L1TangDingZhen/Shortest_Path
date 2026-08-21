@@ -380,8 +380,8 @@ function renderIslandList() {
       isl.km.toFixed(2) + ' km <button data-isl="' + ci + '">go</button>' +
       "</div>";
   }).join("") + (islands.length > 1
-    ? '<div style="color:#666">1 island = exact optimum; extra islands ' +
-      "get auto-bridged (fine if intended, fix if stray)</div>"
+    ? '<div style="color:#666">extra islands are bridged automatically ' +
+      "and cost almost nothing -- do not chase a single island</div>"
     : '<div style="color:#666">single island: solver result is exact</div>')
     + (gaps.length
        ? '<div style="margin-top:6px"><b>gaps that would merge them</b>' +
