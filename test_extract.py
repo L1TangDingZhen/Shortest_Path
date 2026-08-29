@@ -23,7 +23,8 @@ from pathlib import Path
 import networkx as nx
 import osmnx as ox
 
-from extract_network import export, oneway_arcs, parse_maxspeed
+from extract_network import (export, oneway_arcs, parse_maxspeed,
+                             control_groups, node_control)
 
 BASE = Path(__file__).parent
 TMP = BASE / "_test_tmp" / "extract"
@@ -96,6 +97,25 @@ def main():
     assert parse_maxspeed(["60", "50"]) == 50.0    # merged ways: the min
     for junk in (None, "", "AU:urban", "signals", "none", "0", "-5"):
         assert parse_maxspeed(junk) == "", junk
+
+    print("== controlled nodes are clustered into intersections ==")
+    assert node_control({"highway": "traffic_signals"}) == "signals"
+    assert node_control({"crossing": "traffic_signals"}) == "signals"
+    assert node_control({"highway": "crossing"}) == "crossing"
+    assert node_control({"highway": "residential"}) == ""
+    J = nx.MultiDiGraph()
+    J.graph["crs"] = "epsg:4326"
+    # two corners of one junction, plus a crossing 300 m away
+    J.add_node("c1", x=138.60000, y=-34.90000, highway="traffic_signals")
+    J.add_node("c2", x=138.60020, y=-34.90000, highway="traffic_signals")
+    J.add_node("far", x=138.60400, y=-34.90000, highway="crossing")
+    J.add_node("plain", x=138.60600, y=-34.90000)
+    groups = control_groups(J)
+    assert "plain" not in groups, "untagged nodes carry no delay"
+    assert groups["c1"][1] == groups["c2"][1], \
+        "18 m apart is one intersection, so one wait"
+    assert groups["far"][1] != groups["c1"][1], "300 m apart is not"
+    assert groups["far"][0] == "crossing"
 
     print("\nALL TESTS PASSED")
 

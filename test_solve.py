@@ -15,6 +15,10 @@ circuit and open modes, and asserts the core invariants:
   * SPEC-2: --start + --end yields an open walk from the snapped start
     to the snapped end; --end alone pins the finish; --end + --open is
     rejected
+  * waiting at a signalised crossing is priced where the path is chosen:
+    turn-aware routing takes 300 m of clear road over 200 m through a
+    signal, plain Dijkstra does not
+  * searching over Euler tours never changes the distance
 
 Run:  python test_solve.py
 """
@@ -108,6 +112,40 @@ def write_cost_case(data_dir: Path):
         for eid, nm, hw, ow, ms, ln, sv, u, v in rows:
             w.writerow([eid, nm, hw, ow, ms, ln, sv, "", u, v, ""])
     return {eid: sv for eid, _, _, _, _, _, sv, _, _ in rows}
+
+
+def write_delay_case(data_dir: Path):
+    """One street to deliver and two ways back: a short one through a
+    signalised crossing, a longer one without. Which one the deadhead
+    takes says whether waiting is priced where the path is chosen."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    # both detours bend the same way and barely at all, so turn cost is
+    # zero on each and only length and waiting decide
+    nodes = [("A", -37.84500, 144.9500, "", ""),
+             ("B", -37.84500, 144.9530, "", ""),
+             ("M", -37.84505, 144.9515, "signals", "1"),
+             ("N", -37.84510, 144.9515, "", "")]
+    with open(data_dir / "nodes.csv", "w", newline="",
+              encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["node_id", "lat", "lon", "control", "control_group"])
+        w.writerows(nodes)
+    # 200 m through the signal (14 s riding + 25 s waiting) against
+    # 300 m clear (22 s); going back along the street itself is 72 s
+    rows = [("svc", "Long Street", "residential", 1000, 1, "A", "B"),
+            ("sig_a", "Quick Way", "residential", 100, 0, "A", "M"),
+            ("sig_b", "Quick Way", "residential", 100, 0, "M", "B"),
+            ("free_a", "Clear Way", "residential", 150, 0, "A", "N"),
+            ("free_b", "Clear Way", "residential", 150, 0, "N", "B")]
+    with open(data_dir / "edges.csv", "w", newline="",
+              encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["edge_id", "name", "highway", "oneway", "maxspeed_kmh",
+                    "length_m", "service", "note", "u", "v",
+                    "geometry_wkt"])
+        for eid, nm, hw, ln, sv, u, v in rows:
+            w.writerow([eid, nm, hw, "False", "", ln, sv, "", u, v, ""])
+    return {eid: sv for eid, _, _, _, sv, _, _ in rows}
 
 
 def deadhead_ids(rows):
@@ -290,6 +328,46 @@ def main():
          "--out", str(TMP / "badvar"), "--variants", "nonsense"],
         capture_output=True, text=True)
     assert res.returncode != 0, "unknown preference must be rejected"
+
+    print("== waiting at crossings is priced where paths are chosen ==")
+    dd = TMP / "delay"
+    dspec = write_delay_case(dd)
+    dby = {"svc": ("A", "B"), "sig_a": ("A", "M"), "sig_b": ("M", "B"),
+           "free_a": ("A", "N"), "free_b": ("N", "B")}
+
+    out_nd, hist = TMP / "delay_node", TMP / "delay_hist"
+    stdout = run(dd, out_nd, "--algorithm", "node",
+                 "--history", str(hist), "--note", "delay")
+    rows_nd = read_route(out_nd)
+    check_walk(rows_nd, dby, dspec, closed=True)
+    # plain Dijkstra cannot see the signal: it takes the short way
+    assert set(deadhead_ids(rows_nd)) == {"sig_a", "sig_b"}, \
+        deadhead_ids(rows_nd)
+    assert "waiting at crossings" in stdout, stdout
+    # 25 s rounds to "0m" on screen, so check the number that was stored
+    summary = json.loads(next(hist.glob("*/summary.json"))
+                         .read_text(encoding="utf-8"))
+    assert summary["waiting_min"] > 0, summary
+    assert summary["time_min"] > 0
+
+    out_td = TMP / "delay_turn"
+    run(dd, out_td, "--algorithm", "turn")
+    rows_td = read_route(out_td)
+    check_walk(rows_td, dby, dspec, closed=True)
+    # 100 m + a 25 s wait is dearer than 150 m of clear footway
+    assert set(deadhead_ids(rows_td)) == {"free_a", "free_b"}, \
+        deadhead_ids(rows_td)
+    assert total_km(rows_td) > total_km(rows_nd), \
+        "avoiding the signal is longer -- that is the trade"
+
+    print("== the tour search never breaks or lengthens the tour ==")
+    out_ns = TMP / "nosearch"
+    run(data, out_ns, "--no-tour-search")
+    rows_ns = read_route(out_ns)
+    check_walk(rows_ns, edges_by_id, spec, closed=True)
+    assert abs(total_km(rows_ns) - total_km(rows1)) < 1e-6, \
+        f"searching tours must not change distance: {total_km(rows_ns)} " \
+        f"vs {total_km(rows1)}"
 
     print("== open mode ==")
     out2 = TMP / "open"
