@@ -740,7 +740,11 @@ def tour_meta(R, F, D, nodes):
                        else wrong,
                        v: 0.0 if not edata["oneway"] or v == edata["cu"]
                        else wrong}
-        info = {"base": data.get("base")}
+        info = {"base": data.get("base"),
+                "street": (F[u][v][data["base"]]["name"]
+                           if "base" in data else None),
+                "kmh": (F[u][v][data["base"]].get("kmh")
+                        if "base" in data else None)}
         for start, chain in chains.items():
             info[start] = {
                 "out": bearing_of(chain[0], chain[1]) if len(chain) > 1
@@ -755,7 +759,7 @@ def tour_meta(R, F, D, nodes):
 
 def euler_tour(R, source, meta, traffic_side="left", optimise=True,
                wrong_way_penalty=1.0, first_key=None,
-               pair_passes=False):
+               pair_passes=False, street_first=False):
     """Hierholzer, picking the next edge by turn comfort, by not riding
     one-way streets backwards, and by finishing a two-sided street
     while you are on it. Returns [(u, v, key), ...].
@@ -806,6 +810,10 @@ def euler_tour(R, source, meta, traffic_side="left", optimise=True,
                                   meta.get(key, {}).get("kmh"))
                      + wrong_weight * (run_against(node, key)
                                        if wrong_weight else 0.0))
+            if street_first and prev_key is not None:
+                street = meta.get(key, {}).get("street")
+                if street and meta.get(prev_key, {}).get("street") == street:
+                    score -= STREET_CONTINUE_SECONDS   # finish the street
             if pair_passes and prev_key is not None:
                 base = meta.get(key, {}).get("base")
                 if base and meta.get(prev_key, {}).get("base") == base:
@@ -852,6 +860,11 @@ def euler_tour(R, source, meta, traffic_side="left", optimise=True,
 
 STREET_RUN_SECONDS = 20.0   # what breaking a street into one more
                             # visit costs the person sorting the mail
+# Staying on a street until it is finished is what keeps its mail in one
+# bundle. Rearranging a finished tour cannot deliver this -- reversing
+# loops does not restructure at street scale -- but biasing the
+# construction can, because that is where the structure comes from.
+STREET_CONTINUE_SECONDS = 45.0
 
 
 def tour_nodes(euler):
@@ -994,7 +1007,7 @@ def pair_passes_in_tour(euler, R):
 def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None,
              traffic_side="left", optimise_tour=True,
              wrong_way_penalty=1.0, pair_passes=False, control=None,
-             search_iterations=4000):
+             search_iterations=4000, street_first=False):
     """Walk the Euler circuit/path and expand connectors into real
     street segments. Returns a list of segment dicts.
 
@@ -1023,7 +1036,7 @@ def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None,
         source = start_node if (start_node in R) else next(iter(R.nodes))
         first = None
     euler = euler_tour(R, source, meta, traffic_side, optimise_tour,
-                       wrong_way_penalty, first, pair_passes)
+                       wrong_way_penalty, first, pair_passes, street_first)
     if pair_passes:
         pair_passes_in_tour(euler, R)
     if optimise_tour and search_iterations:
@@ -1670,7 +1683,8 @@ def solve_round(variant, nodes, edges, args, profile, profile_name,
                  "wrong_way_penalty": args.wrong_way_penalty,
                  "control": control,
                  "search_iterations": 0 if args.no_tour_search
-                 else args.search_iterations}
+                 else args.search_iterations,
+                 "street_first": args.street_first}
     if pin_start is not None:                        # --start + --end
         endpoints, extra = parity_repair(R, router, False, None)
         segments = traverse(F, R, D, nodes, None, None,
@@ -1796,6 +1810,12 @@ def main():
                          "between the passes anyway: measured +5 points "
                          "of pairing for +3 min of turning, so it is "
                          "off by default (B3)")
+    ap.add_argument("--street-first", action="store_true",
+                    help="prefer finishing a street before moving on, so "
+                         "its mail stays in one bundle. Costs no "
+                         "distance, but measured on a real round it "
+                         "changed street visits 43 -> 44 and crossing "
+                         "turns 24 -> 27, so it is off by default")
     ap.add_argument("--no-tour-search", action="store_true",
                     help="skip the search over Euler tours. Every tour "
                          "is the same length, so the search only ever "

@@ -28,6 +28,8 @@ project evolves — especially the decision log.
 | B13: turn-aware routing (line graph) + `--variants` route preferences | **done, tested** (in `test_solve.py`) |
 | B14: intersection delay in the data and the routing | **done, tested** |
 | B15: search over Euler tours (annealing) | **done** — measured at 0.5 min, the lever is exhausted |
+| B6: sort plan (`sort_plan.py`) + printable/phone sheet | **done, tested** (`test_sortplan.py`) — blocked on address data, not code |
+| Street-first construction (`--street-first`) | **done** — off by default, measured slightly worse |
 | V3+: real time costs, pass pairing, GPX compare, per-letterbox sequencing, exact ILP | backlog |
 
 ---
@@ -556,9 +558,20 @@ stands, honestly). Option B was not needed.
   theoretical 23): loop reversal cannot restructure a tour at street
   scale -- that needs a different construction, building the tour
   street by street rather than edge by edge.
-- **B6 Per-letterbox sequencing.** Join route order with the G-NAF
-  open address database to emit house-number ranges per pass —
-  turning route.csv into a literal sort plan.
+- **B6 Per-letterbox sequencing.** *Built 2026-08 as `sort_plan.py`;
+  the code works, the Australian data does not.* It attaches every
+  address to the nearest edge carrying its street name, splits a
+  two-sided street between its passes by which side the rider is on
+  (left of travel, traffic keeping left), merges consecutive runs on
+  one street, and writes `sort_plan.csv` plus a printable, phone-sized
+  `sort_plan.html`. **Coverage killed it, not the algorithm**: of 1 923
+  OSM addresses in the area only 125 sit on a delivered street, and
+  those are its arterials (64, 32 and 14 on the three biggest) — the
+  residential streets that are the actual round carry 0 to 3 each,
+  because Australian addresses live in G-NAF and were never imported
+  into OSM. The input is a plain `addresses.csv` of
+  `lat,lon,housenumber,street`, so a G-NAF extract drops straight in
+  and the plan fills out; that conversion is the remaining work.
 
 ## 8. Testing strategy
 
@@ -598,6 +611,8 @@ is the only networked step — keep it thin, and keep everything after
 | 2026-08 | Point picking on the maps: editor right-click copies `lat,lon` / `--start=` / `--end=`; the extraction preview gets folium's LatLngPopup | Coordinates are the CLI primitive (reproducible, scriptable), but hunting them in an external map was needless friction |
 | 2026-08 | Endpoints became data, not just arguments: right-click sets START/END into `data/endpoints.json`, the editor draws them, `solve_route.py` loads the file when `--start`/`--end` are absent, `prepare_round.py` carries it across re-extractions; a Solve button runs the solver server-side and serves the route map | Copy-pasting coordinates into a terminal was still the last manual step. Storing the pins makes the browser flow complete (edit → Save → Solve → view) while the CLI stays authoritative and scriptable |
 | 2026-08 | Editor: Leaflet `boxZoom` disabled; contextmenu `preventDefault`; added a "click sets" mode selector | Two real bugs found in use: shift+click (the x gesture) was eaten by box-zoom, since a 1 px wobble zooms to a box, and the right-click popup was hidden behind the browser's native menu. The mode selector removes the reliance on modifier keys altogether |
+| 2026-08 | `sort_plan.py` reads a plain `addresses.csv` rather than importing G-NAF itself | The join, the side-splitting and the sheet are the work; where the numbers come from is not. Keeping the input a four-column CSV meant OSM could be tried in an afternoon, and when it turned out to cover 125 of 1 923 addresses on the round, nothing was wasted — a G-NAF extract replaces the file and the rest stands |
+| 2026-08 | Street-first construction measured and left off; `meta` was missing `kmh`, so graded turn costs had been inert in the tour chooser | Biasing construction toward finishing a street changed street visits 43 → 44 and crossing turns 24 → 27 on the real round: within noise, not an improvement. Finding it meant fixing a silent bug — a patch that never matched its anchor, applied without an assertion, had left the tour chooser blind to road speed |
 | 2026-08 | Turn cost is graded by the road being entered: `turn_seconds()` scales a crossing or U-turn by the entered road's speed over a 50 km/h reference, clamped to 0.4-2.0 | What makes a right turn expensive is the traffic you wait for, and the road's speed is the best proxy the data has. Turning onto a laneway and onto a 60 km/h arterial were priced identically before, which is exactly the case the rider raised |
 | 2026-08 | B3 rearrangement built, measured, and still left off — because it improves pairing while making street contiguity worse | Edge-level pairing and street-level sweeping pull against each other, and the sorter cares about the street. Measuring the operational metrics first is what made this visible; without them it would have shipped as an improvement (B3) |
 | 2026-08 | Algorithms became a list rather than a replacement: `ALGORITHMS` maps a name to the routers to run, `--algorithm all` solves with each and emits a side-by-side map | The two answer different questions ("which is shortest" vs "which rides best"), and neither is wrong. Showing both, with the numbers that separate them, is more honest than picking one -- and adding a third is now a dict entry, not a rewrite |

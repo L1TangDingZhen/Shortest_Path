@@ -169,6 +169,36 @@ def control_groups(G):
     return out
 
 
+def export_addresses(poly, out_dir: Path):
+    """Every point in the area that carries a house number, so a pass
+    along a street can be turned into the house numbers it serves.
+
+    OSM rather than G-NAF: it is already the source of the network, it
+    needs no 1.5 GB download, and 97% of the points here carry a street
+    name. Coverage is whatever the local mappers have done -- the sort
+    plan says how many numbers it found per run so you can see."""
+    import osmnx as ox
+    print("Downloading addresses from OpenStreetMap ...")
+    gdf = ox.features_from_polygon(poly, tags={"addr:housenumber": True})
+    path = out_dir / "addresses.csv"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    n = 0
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["lat", "lon", "housenumber", "street"])
+        for _, row in gdf.iterrows():
+            street = row.get("addr:street")
+            number = row.get("addr:housenumber")
+            if not isinstance(number, str) or not isinstance(street, str):
+                continue
+            point = row.geometry.centroid          # ways -> their centre
+            w.writerow([round(point.y, 7), round(point.x, 7),
+                        number.strip(), street.strip()])
+            n += 1
+    print(f"  {n} addresses -> {path}")
+    return path
+
+
 def download_graph(poly, network_type):
     import osmnx as ox
     # node tags are dropped by default; these are what makes you wait
@@ -327,6 +357,9 @@ def main():
     ap.add_argument("--default-service", type=int, default=2,
                     choices=[0, 1, 2],
                     help="initial value of the service column (default 2)")
+    ap.add_argument("--addresses", action="store_true",
+                    help="also fetch house numbers, so sort_plan.py can "
+                         "turn each pass into the numbers it serves")
     ap.add_argument("--out", default="data", help="output directory")
     args = ap.parse_args()
 
@@ -339,6 +372,8 @@ def main():
         poly = places_polygon(args.place, args.buffer)
 
     G = download_graph(poly, args.network_type)
+    if args.addresses:
+        export_addresses(poly, Path(args.out))
     out_dir = Path(args.out)
     nodes_path, edges_path, rows = export(G, out_dir, args.default_service)
     prev_path = preview_map(G, rows, out_dir)
