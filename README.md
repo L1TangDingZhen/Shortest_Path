@@ -317,7 +317,30 @@ python test_split.py
 python test_prepare.py
 python test_history.py
 python test_extract.py
+python test_sortplan.py
 ```
+
+## Keeping your round private
+
+Your round's street names must not reach a public commit — not in a
+file, not in a commit message. Remembering that is not enough, so
+install the guard once after cloning:
+
+```bash
+./tools/install_hooks.sh
+```
+
+A commit that would publish one of your streets is then refused,
+whether the name is in the diff or in the message. The names are read
+at run time from your gitignored round data, so the check always
+matches your real round and no list of names is ever written into the
+repository. Audit what is already there with
+
+```bash
+python tools/privacy_guard.py --tracked --history
+```
+
+and bypass a genuine false positive with `git commit --no-verify`.
 
 Runs the solver on a synthetic street grid (no internet needed) and
 asserts: exact service multiplicities, walk continuity, circuit closure,
