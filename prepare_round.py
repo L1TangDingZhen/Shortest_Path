@@ -252,11 +252,18 @@ def apply(data_dir: Path, round_dir: Path):
                 "geometry_wkt": row.get("geometry_wkt") or "",
             }
 
+    def mandatory_km(rows):
+        return sum(float(r["length_m"] or 0) * int(r["service"])
+                   for r in rows
+                   if (r.get("service") or "").strip() in ("1", "2")) / 1000
+
     header, rows = read_edges(data_dir)
     applied = 0
+    applied_ids = set()
     for r in rows:
         if r["edge_id"] in overrides:
             r["service"] = overrides.pop(r["edge_id"])
+            applied_ids.add(r["edge_id"])
             applied += 1
     fresh = len(rows) - applied
 
@@ -267,8 +274,12 @@ def apply(data_dir: Path, round_dir: Path):
                        if detail.get(eid, {}).get("service", "").lower()
                        in ("1", "2", "x")]
     stale_plain = len(overrides) - len(stale_annotated)
+    was = {id(r): r["service"] for r in rows}
     regained, unplaced = geometric_fallback(
         rows, stale_annotated, read_nodes(data_dir))
+    # a row the geometry fallback re-annotated is not a new street
+    applied_ids |= {r["edge_id"] for r in rows
+                    if r["service"] != was[id(r)]}
     applied += regained
     with open(data_dir / "edges.csv", "w", newline="",
               encoding="utf-8-sig") as f:
@@ -282,7 +293,8 @@ def apply(data_dir: Path, round_dir: Path):
         print("Restored route endpoints -> "
               f"{data_dir / 'endpoints.json'}")
 
-    print(f"\nApplied {applied} service overrides"
+    print(f"\nRound is {mandatory_km(rows):.2f} km of mandatory riding.")
+    print(f"Applied {applied} service overrides"
           + (f", replayed {n_split} split(s)" if n_split else "")
           + (f", {n_split_failed} split(s) FAILED" if n_split_failed
              else "") + ".")
@@ -290,6 +302,14 @@ def apply(data_dir: Path, round_dir: Path):
         print(f"{fresh} edges had no override (new streets from the "
               f"enlarged area) -- they keep the extraction default. "
               f"Review them in the editor (make_editor.py --serve).")
+        added = mandatory_km([r for r in rows
+                              if r["edge_id"] not in applied_ids])
+        if added > 0.05:
+            print(f"WARNING: those {fresh} unannotated edges carry "
+                  f"{added:.1f} km of MANDATORY riding, because the "
+                  f"extraction default was not 0. Your round just grew "
+                  f"by that much. Re-extract with --default-service 0 "
+                  f"and apply again, or zero them in the editor.")
     if regained:
         print(f"{regained} edge(s) whose id had changed were re-found by "
               f"geometry (an old edge often becomes several new ones).")

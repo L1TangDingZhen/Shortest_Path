@@ -199,6 +199,34 @@ def export_addresses(poly, out_dir: Path):
     return path
 
 
+def keep_control_nodes(G):
+    """Simplify, but not over the things that make you stop.
+
+    Simplification straightens a way by deleting the nodes along it,
+    and a traffic signal or a give-way sitting mid-block is one of
+    those nodes. Losing it loses the wait: on the maintainer's round it
+    silently removed 58 whole intersections, mostly give-way and stop
+    lines on side roads. Marking them first makes them junctions in
+    their own right, which costs about 3% more edges and gets all of
+    them back."""
+    import osmnx as ox
+    for _, d in G.nodes(data=True):
+        kind = node_control(d)
+        if kind:
+            d["control"] = kind
+    before = len({g for _, g in control_groups(G).values()})
+    G = ox.simplify_graph(G, node_attrs_include=["control"])
+    after = len({g for _, g in control_groups(G).values()})
+    print(f"  simplified to {G.number_of_nodes()} nodes, "
+          f"{G.number_of_edges()} edges; {after} controlled "
+          f"intersections kept of {before}")
+    if after < before:
+        print(f"  warning: {before - after} controlled intersection(s) "
+              f"were still lost in simplification -- their waiting time "
+              f"will be missing from every route")
+    return G
+
+
 def download_graph(poly, network_type):
     import osmnx as ox
     # node tags are dropped by default; these are what makes you wait
@@ -206,7 +234,8 @@ def download_graph(poly, network_type):
         set(ox.settings.useful_tags_node) | {"highway", "crossing"})
     print("Downloading network from OpenStreetMap ...")
     G = ox.graph_from_polygon(poly, network_type=network_type,
-                              simplify=True, truncate_by_edge=True)
+                              simplify=False, truncate_by_edge=True)
+    G = keep_control_nodes(G)
     arcs = oneway_arcs(G)
     G = ox.convert.to_undirected(G)
     G.graph["oneway_arcs"] = arcs

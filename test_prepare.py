@@ -133,6 +133,23 @@ def main():
     assert "could not be placed" in out and "Ghost Street" in out, out
     assert services(d1)["corridor-0"] == "0", \
         "new edge must keep its extraction default"
+    assert "WARNING" not in out, \
+        "a new edge defaulting to 0 adds no riding; nothing to warn about"
+
+    print("== a new edge that defaults to 2 is called out ==")
+    # Re-extracting without --default-service 0 makes every street the
+    # replay cannot match a delivery street. On a real round that
+    # quietly multiplied the mandatory distance by five, so it has to
+    # be loud.
+    with open(d1 / "edges.csv", "a", newline="",
+              encoding="utf-8-sig") as f:
+        csv.DictWriter(f, fieldnames=header).writerow(
+            {h: {"edge_id": "wide-0", "name": "Wide Avenue",
+                 "highway": "residential", "length_m": "900",
+                 "service": "2", "u": "n00", "v": "n21",
+                 "geometry_wkt": ""}.get(h, "") for h in header})
+    out = run_prepare(d1, rdir)
+    assert "WARNING" in out and "1.8 km of MANDATORY" in out, out
 
     print("\nALL TESTS PASSED")
 

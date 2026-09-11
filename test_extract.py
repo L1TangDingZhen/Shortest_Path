@@ -24,7 +24,8 @@ import networkx as nx
 import osmnx as ox
 
 from extract_network import (export, oneway_arcs, parse_maxspeed,
-                             control_groups, node_control)
+                             control_groups, node_control,
+                             keep_control_nodes)
 
 BASE = Path(__file__).parent
 TMP = BASE / "_test_tmp" / "extract"
@@ -116,6 +117,28 @@ def main():
         "18 m apart is one intersection, so one wait"
     assert groups["far"][1] != groups["c1"][1], "300 m apart is not"
     assert groups["far"][0] == "crossing"
+
+    print("== simplification keeps the nodes that make you stop ==")
+    # A straight run of five nodes with a give-way in the middle: OSMnx
+    # straightens it by deleting every node that is not a junction, and
+    # a give-way sitting mid-block is one of those. Losing it loses the
+    # wait, and control_groups() cannot get it back afterwards.
+    straight = nx.MultiDiGraph()
+    straight.graph["crs"] = "epsg:4326"
+    for i in range(5):
+        straight.add_node(f"s{i}", x=0.001 * i, y=-34.9)
+    straight.nodes["s2"]["highway"] = "give_way"
+    for i in range(4):
+        for a, b in ((f"s{i}", f"s{i+1}"), (f"s{i+1}", f"s{i}")):
+            straight.add_edge(a, b, key=0, oneway=False, length=90.0,
+                              name="Long Street", highway="residential")
+    plain = ox.simplify_graph(straight.copy())
+    assert "s2" not in plain.nodes, \
+        "the test case is wrong: plain simplification should drop s2"
+    kept = keep_control_nodes(straight.copy())
+    assert "s2" in kept.nodes, \
+        "the give-way was simplified away -- its waiting time is gone"
+    assert len(control_groups(kept)) == 1, control_groups(kept)
 
     print("\nALL TESTS PASSED")
 

@@ -23,7 +23,7 @@ The single source of truth is the `service` column of `edges.csv`:
 
 | value | meaning | traversals |
 |------:|---------|-----------|
-| `2` | I deliver **both sides** of this street (default) | 2 — one per side |
+| `2` | I deliver **both sides** of this street (default) | 2 — one per side, guaranteed once each way |
 | `1` | I deliver **one side only**, *or* I zigzag both sides in a single pass | 1 |
 | `0` | **Not my street**, but I may ride along it as a shortcut | 0 required (free deadhead) |
 | `x` | **Never use** — steps, unrideable paths, hostile crossings | edge removed from the graph (not even deadhead) |
@@ -56,8 +56,14 @@ slider (or press ←/→, or hit play) to walk the route step by step;
 the current segment is highlighted with a direction arrow, service
 passes are solid, deadhead dashed. `result/route.csv` is the same
 route as an ordered street list — each row gives street, pass number,
-compass direction, the cross streets at each end, and cumulative
-distance.
+which kerb that pass delivers, compass direction, the cross streets at
+each end, and cumulative distance.
+
+A street marked `2` is always ridden once each way, so its two passes
+deliver opposite kerbs. That is enforced, not hoped for: the tour
+chooser prices a repeat of the same direction, the search scores it,
+a repair fixes anything left, and the solver asserts it before writing
+anything out.
 
 ## Editing the service column graphically
 

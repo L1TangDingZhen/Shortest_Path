@@ -33,3 +33,6 @@ _test_extract/
 
 # ---- claude code local state -------------------------------------
 .claude/settings.local.json
+.claude
+.codex
+.agents

@@ -254,14 +254,14 @@ def build_graphs(edges, profile=None, wrong_way=1.0):
         cost = edge_cost(e["length"], e["highway"], e["maxspeed"],
                          profile)
         kmh = speed_kmh(e["highway"], e["maxspeed"], profile)
-        F.add_edge(e["u"], e["v"], key=e["edge_id"],
-                   length=e["length"], name=e["name"],
-                   service=e["service"], wkt=e["wkt"],
-                   highway=e["highway"], oneway=e["oneway"],
-                   maxspeed=e["maxspeed"], cu=e["u"], cv=e["v"])
+        # One dict for both graphs: F carrying a stale copy of what D
+        # knows is how the graded turn cost went quietly missing once
+        # (`kmh` reached D only, and every lookup through F read None).
         common = dict(length=e["length"], name=e["name"], wkt=e["wkt"],
                       highway=e["highway"], oneway=e["oneway"],
                       maxspeed=e["maxspeed"], kmh=kmh)
+        F.add_edge(e["u"], e["v"], key=e["edge_id"],
+                   service=e["service"], cu=e["u"], cv=e["v"], **common)
         D.add_edge(e["u"], e["v"], key=e["edge_id"], cost=cost,
                    against=False, **common)
         D.add_edge(e["v"], e["u"], key=e["edge_id"],
@@ -403,7 +403,11 @@ def _dijkstra_arcs(router, sources, reverse):
     for arc, cost in dist.items():
         if arc is SOURCE or arc == SOURCE:
             continue
-        head = arc[0] if reverse else arc[1]
+        # arc[1] either way. Forward that is where the path ends;
+        # in the mirrored graph the arcs come back flipped, so it is
+        # where the real path BEGINS -- which is what a caller asking
+        # "how do I get INTO this target" is keying on.
+        head = arc[1]
         if head not in best_cost or cost < best_cost[head]:
             best_cost[head] = cost
             chain = [a for a in paths[arc] if a != SOURCE]
@@ -553,48 +557,61 @@ def min_matching(nodes_subset, dist):
     return list(M), cost
 
 
-def parity_repair(R, router, open_route, start_node):
-    """Add matching connectors to R. Returns (endpoints, extra_cost).
-    endpoints is (s, t) for an open route, else None."""
+def parity_repair(R, router, open_route, pin_start=None, pin_end=None):
+    """Add matching connectors to R. Returns (endpoints, extra_cost),
+    where endpoints is (start, end) for an open route and None for a
+    circuit.
+
+    Which nodes must be matched is not a choice: a walk exists exactly
+    when every node has even degree apart from its two ends, so the set
+    to repair is the odd nodes with the wanted ends flipped in or out
+    of it (a T-join). A pinned end therefore belongs IN that set when
+    its degree is even -- the round has to finish there, so the parity
+    has to be paid for. Choosing the odd node nearest the pin instead
+    is what used to finish the round somewhere else entirely."""
     odd = odd_nodes(R)
-    if not odd:
-        return None, 0.0
 
-    dist, path = pairwise_shortest(router, odd)
-    sdist = symmetrise(dist)
-
-    def add_connectors(pairs):
+    def add_connectors(pairs, path):
         for i, (a, b) in enumerate(pairs):
             R.add_edge(a, b, key=f"match|{i}",
                        paths={a: path[(a, b)], b: path[(b, a)]})
 
     if not open_route:
-        pairs, cost = min_matching(odd, sdist)
-        add_connectors(pairs)
+        if not odd:
+            return None, 0.0
+        dist, path = pairwise_shortest(router, odd)
+        pairs, cost = min_matching(odd, symmetrise(dist))
+        add_connectors(pairs, path)
         return None, cost
 
-    # Open route: leave the best pair of odd nodes unmatched -- they
-    # become the start and end. If a pin was given, fix one endpoint
-    # to the odd node nearest to it (network distance over F).
-    if len(odd) == 2:
-        return tuple(odd), 0.0
-    candidates = []
-    if start_node is not None:
-        if start_node in odd:
-            s_fixed = start_node
-        else:
-            d, _ = route_from(router, [start_node])
-            s_fixed = min((n for n in odd if n in d),
-                          key=lambda n: d[n], default=odd[0])
-        pairs_to_try = [(s_fixed, t) for t in odd if t != s_fixed]
-    else:
-        pairs_to_try = list(itertools.combinations(odd, 2))
-    for s, t in pairs_to_try:
-        rest = [n for n in odd if n not in (s, t)]
-        pairs, cost = min_matching(rest, sdist)
-        candidates.append((cost, (s, t), pairs))
-    cost, endpoints, pairs = min(candidates, key=lambda c: c[0])
-    add_connectors(pairs)
+    # Both ends free and only two odd nodes: they ARE the ends, and
+    # nothing is left to match.
+    if len(odd) == 2 and pin_start is None and pin_end is None:
+        return (odd[0], odd[1]), 0.0
+
+    starts = [pin_start] if pin_start is not None else list(odd)
+    ends = [pin_end] if pin_end is not None else list(odd)
+    targets = sorted(set(odd) | {n for n in (pin_start, pin_end)
+                                 if n is not None})
+    if not targets or not starts or not ends:
+        return None, 0.0        # nothing to open the walk at: a circuit
+
+    dist, path = pairwise_shortest(router, targets)
+    sdist = symmetrise(dist)
+    oddset = set(odd)
+    best = None
+    for a in starts:
+        for b in ends:
+            if a == b:
+                continue
+            rest = sorted(oddset.symmetric_difference({a, b}))
+            pairs, cost = min_matching(rest, sdist)
+            if best is None or cost < best[0]:
+                best = (cost, (a, b), pairs)
+    if best is None:
+        return None, 0.0
+    cost, endpoints, pairs = best
+    add_connectors(pairs, path)
     return endpoints, cost
 
 
@@ -688,6 +705,13 @@ WRONG_WAY_TOUR_WEIGHT = 0.5   # seconds per metre, per unit of penalty
 # distance, because every Euler tour is the same length.
 PAIR_SECONDS = 30.0
 
+# Riding a two-sided street the same way twice delivers one side twice
+# and leaves the other undelivered, so it is not a matter of taste. The
+# penalty is large enough to outrank any turn, and a repair afterwards
+# makes the guarantee absolute -- this only stops the search wasting
+# its budget on tours the repair would have to undo.
+SIDE_PENALTY = 900.0
+
 
 def turn_kind(bearing_in, bearing_out, traffic_side="left"):
     """straight / easy / cross / u. The `cross` turn is the one that
@@ -702,6 +726,21 @@ def turn_kind(bearing_in, bearing_out, traffic_side="left"):
     turning_right = delta > 0
     crosses = turning_right if traffic_side == "left" else not turning_right
     return "cross" if crosses else "easy"
+
+
+WINDS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+
+
+def kerb_side(chain, traffic_side="left"):
+    """Which kerb you deliver riding along `chain`, as a compass point.
+    It is the one on your side of the road, so the answer flips with
+    the direction of travel -- which is what makes it a check that
+    both sides of a street were actually served."""
+    run = bearing_of(chain[0], chain[-1]) if len(chain) > 1 else None
+    if run is None:
+        return ""
+    return WINDS[round((run + (-90 if traffic_side == "left" else 90))
+                       / 45) % 8]
 
 
 def bearing_of(a, b):
@@ -773,6 +812,16 @@ def euler_tour(R, source, meta, traffic_side="left", optimise=True,
         if u != v:
             adj[v].append((u, key))
     used = set()
+    ridden_from = {}                 # key -> the node it was left from
+    sibling = {}                     # the other pass of the same street
+    by_base = defaultdict(list)
+    for _, _, key in R.edges(keys=True):
+        base = meta.get(key, {}).get("base")
+        if base:
+            by_base[base].append(key)
+    for keys in by_base.values():
+        if len(keys) == 2:
+            sibling[keys[0]], sibling[keys[1]] = keys[1], keys[0]
     wrong_weight = max(0.0, wrong_way_penalty - 1.0) * WRONG_WAY_TOUR_WEIGHT
 
     def run_against(node, key):
@@ -814,6 +863,9 @@ def euler_tour(R, source, meta, traffic_side="left", optimise=True,
                 street = meta.get(key, {}).get("street")
                 if street and meta.get(prev_key, {}).get("street") == street:
                     score -= STREET_CONTINUE_SECONDS   # finish the street
+            other = sibling.get(key)
+            if other is not None and ridden_from.get(other) == node:
+                score += SIDE_PENALTY    # that would be the same kerb
             if pair_passes and prev_key is not None:
                 base = meta.get(key, {}).get("base")
                 if base and meta.get(prev_key, {}).get("base") == base:
@@ -834,6 +886,7 @@ def euler_tour(R, source, meta, traffic_side="left", optimise=True,
         else:
             _, nbr, key = picked
             used.add(key)
+            ridden_from[key] = node
             stack.append((nbr, key,
                           meta.get(key, {}).get(node, {}).get("in")))
     out.reverse()
@@ -877,6 +930,7 @@ def tour_score(euler, meta, control, traffic_side, names,
     absent on purpose -- it is the same for every tour."""
     turn = delay = wrong = 0.0
     runs = 0
+    tails = defaultdict(list)
     previous_in = previous_node = last_street = None
     for u, v, key in euler:
         info = meta.get(key, {})
@@ -890,6 +944,7 @@ def tour_score(euler, meta, control, traffic_side, names,
         wrong += side.get("against_m", 0.0)
         base = info.get("base")
         if base:
+            tails[base].append(u)
             street = names.get(base)
             if street != last_street:
                 runs += 1
@@ -897,7 +952,10 @@ def tour_score(euler, meta, control, traffic_side, names,
         if side.get("in") is not None:
             previous_in = side["in"]
         previous_node = u
-    return turn + delay + wrong_weight * wrong + run_weight * runs
+    same_side = sum(1 for t in tails.values()
+                    if len(t) == 2 and t[0] == t[1])
+    return (turn + delay + wrong_weight * wrong + run_weight * runs
+            + SIDE_PENALTY * same_side)
 
 
 def local_search_tour(euler, meta, control, traffic_side, names,
@@ -959,24 +1017,30 @@ def local_search_tour(euler, meta, control, traffic_side, names,
     return kept, before, best_score
 
 
-def pair_passes_in_tour(euler, R):
-    """Bring the two passes of a street together, after the fact.
+def cover_both_sides(euler, R):
+    """Make every two-sided street be ridden once each way, so that each
+    of its kerbs is actually delivered.
 
-    A choice-time bonus cannot do this: Hierholzer splices sub-tours
-    into the middle of the walk, so edges chosen one after the other
-    need not end up adjacent. Rearranging the finished tour can.
+    Two passes in the SAME direction (u->v twice) serve the left-hand
+    kerb twice and never touch the other one. That is not a preference
+    to be traded against turn comfort -- it is half the street missed --
+    so this runs on every tour, whatever the preference.
 
-    When both passes run the SAME way (u->v twice) the fix is local and
-    always legal: ride the second pass back immediately, then take the
-    walk that used to sit between them in reverse.
+    The fix is local and always legal: ride the second pass back
+    immediately, then take the walk that used to sit between them in
+    reverse.
 
         ... E(u->v)  W(v..u)  E(u->v)  S(v..)
         ... E(u->v)  E(v->u)  W'(u..v) S(v..)
 
-    Same edges, same length, and the walk still chains. When the two
-    passes run in opposite directions the piece between them is a
-    closed loop hanging off v, which has nowhere else to go unless the
-    tour visits v again -- those are left alone."""
+    Same edges, same length, and the walk still chains -- the repair
+    is free, which is why it can be unconditional. Passes that already
+    run opposite ways are left where they are.
+
+    It terminates: every fold leaves one more street with its two
+    passes adjacent, reversing a block preserves the adjacencies inside
+    it, and adjacent passes can never run the same way (the first ends
+    where the second begins), so no street is ever folded twice."""
     moved = 0
     changed = True
     while changed:
@@ -1018,7 +1082,8 @@ def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None,
     meta = tour_meta(R, F, D, nodes)
     if endpoints:
         source = endpoints[0]
-        assert nx.has_eulerian_path(R, source=source)
+        assert nx.has_eulerian_path(R, source=source), \
+            "the matching left a graph with no walk from the start"
         first = None
     elif pin_start is not None:
         # SPEC-2: start the circuit at the pinned END and cross the
@@ -1037,8 +1102,6 @@ def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None,
         first = None
     euler = euler_tour(R, source, meta, traffic_side, optimise_tour,
                        wrong_way_penalty, first, pair_passes, street_first)
-    if pair_passes:
-        pair_passes_in_tour(euler, R)
     if optimise_tour and search_iterations:
         names = {d["base"]: F[u][v][d["base"]]["name"]
                  for u, v, k, d in R.edges(keys=True, data=True)
@@ -1055,10 +1118,35 @@ def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None,
                   f"{(before - after) / 60:.1f} min of turning, waiting "
                   f"and re-visits removed at no extra distance")
 
+    # Last, so nothing downstream can undo it.
+    head = euler[:1] if pin_start is not None else []
+    body = euler[len(head):]
+    folded = cover_both_sides(body, R)
+    euler = head + body
+    if folded:
+        print(f"  both sides: {folded} street(s) were being ridden the "
+              f"same way twice; the second pass now comes straight back")
+    two_way = defaultdict(list)
+    for u, v, key in euler:
+        base = R[u][v][key].get("base")
+        if base:
+            two_way[base].append(u)
+    assert not [b for b, t in two_way.items() if len(t) == 2
+                and t[0] == t[1]], "a two-sided street is missing a kerb"
+
     if pin_start is not None:
         assert euler[0][2] == VIRTUAL_KEY, "virtual edge must be first"
+        finish = euler[0][0]           # the virtual edge runs end->start
         euler = euler[1:]
-        assert not euler or euler[0][0] == pin_start
+        assert not euler or euler[0][0] == pin_start, \
+            "the walk must begin at the pinned start"
+        assert not euler or euler[-1][1] == finish, \
+            "the walk must finish at the pinned end"
+    elif endpoints:
+        assert euler[0][0] == endpoints[0], \
+            "the walk must begin at the chosen start"
+        assert euler[-1][1] == endpoints[1], \
+            "the walk must finish at the chosen end"
 
     segments = []
     passes_seen = defaultdict(int)
@@ -1102,6 +1190,11 @@ def annotate_turns(segments, nodes, traffic_side="left", profile=None,
                                  profile) if profile else None)
         s["wait_s"] = (node_delay(control, s["u"], s["v"])
                        if control else 0.0)
+        # The kerb you deliver is the one on your side of the road, so
+        # naming it by compass point says which physical side of the
+        # street got the mail on this pass -- and makes it checkable.
+        s["side"] = ("" if s["kind"] != "service"
+                     else kerb_side(chain, traffic_side))
         if i:
             counts[s["turn"]] += 1
         previous = into if into is not None else previous
@@ -1120,6 +1213,8 @@ def operational_metrics(segments):
         at[s["edge_id"]].append(i)
     both = [v for v in at.values() if len(v) == 2]
     paired = sum(1 for v in both if v[1] - v[0] == 1)
+    kerbs = sum(1 for v in both
+                if service[v[0]].get("side") != service[v[1]].get("side"))
 
     runs, streets = 0, set()
     previous = None
@@ -1131,6 +1226,7 @@ def operational_metrics(segments):
     return {
         "paired_pct": round(100 * paired / len(both), 1) if both else 100.0,
         "two_sided": len(both),
+        "both_sides": kerbs,
         "street_runs": runs,
         "streets": len(streets),
         "runs_per_street": round(runs / len(streets), 2) if streets else 0,
@@ -1160,9 +1256,6 @@ def hhmm(seconds):
 # ----------------------------------------------------------------------
 # Output
 # ----------------------------------------------------------------------
-
-WINDS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
-
 
 def bearing_label(a, b):
     (lat1, lon1), (lat2, lon2) = a, b
@@ -1206,13 +1299,14 @@ def write_route_csv(segments, F, nodes, out_dir: Path):
     cum = 0.0
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["seq", "type", "street", "pass", "direction",
-                    "from_cross", "to_cross", "length_m", "cum_km",
-                    "against_oneway", "edge_id"])
+        w.writerow(["seq", "type", "street", "pass", "side",
+                    "direction", "from_cross", "to_cross", "length_m",
+                    "cum_km", "against_oneway", "edge_id"])
         for i, s in enumerate(segments, 1):
             cum += s["length"]
             w.writerow([
                 i, s["kind"], s["name"], s["pass_label"],
+                s.get("side", ""),
                 bearing_label(nodes[s["u"]], nodes[s["v"]]),
                 cross_streets(F, s["u"], s["name"]),
                 cross_streets(F, s["v"], s["name"]),
@@ -1464,6 +1558,17 @@ def snap_to_node(latlon_str, candidates, nodes):
                              (nodes[n][1] - lon) ** 2)
 
 
+def snap_metres(latlon_str, node, nodes):
+    """How far the pin had to move to land on a junction. Worth saying
+    out loud: the round starts where the node is, not where you
+    clicked, and a pin dropped away from the network can move a long
+    way without anything looking wrong."""
+    lat, lon = (float(x) for x in latlon_str.split(","))
+    y, x = nodes[node]
+    return math.hypot((y - lat) * 110540.0,
+                      (x - lon) * 111320.0 * math.cos(math.radians(lat)))
+
+
 def summarise_result(res, nodes, args, profile, control=None):
     """`profile` is the common yardstick, not the one this variant was
     optimised with -- otherwise the times beside the options would be
@@ -1653,8 +1758,11 @@ def solve_round(variant, nodes, edges, args, profile, profile_name,
         # Euler circuit is later rotated around it (see traverse).
         pin_end = snap_to_node(args.end, list(F.nodes), nodes)
         pin_start = snap_to_node(args.start, list(F.nodes), nodes)
-        print(f"  start snapped to node {pin_start} at {nodes[pin_start]}")
-        print(f"  end snapped to node {pin_end} at {nodes[pin_end]}")
+        print(f"  start snapped to node {pin_start} at "
+              f"{nodes[pin_start]}, "
+              f"{snap_metres(args.start, pin_start, nodes):.0f} m away")
+        print(f"  end snapped to node {pin_end} at {nodes[pin_end]}, "
+              f"{snap_metres(args.end, pin_end, nodes):.0f} m away")
         R.add_edge(pin_end, pin_start, key=VIRTUAL_KEY, length=0.0)
 
     router = make_router(D, nodes, algorithm, args.traffic_side,
@@ -1668,11 +1776,13 @@ def solve_round(variant, nodes, edges, args, profile, profile_name,
     start_node = None
     if args.start and pin_start is None:
         start_node = snap_to_node(args.start, list(R.nodes), nodes)
-        print(f"  start snapped to node {start_node} "
-              f"at {nodes[start_node]}")
+        print(f"  start snapped to node {start_node} at "
+              f"{nodes[start_node]}, "
+              f"{snap_metres(args.start, start_node, nodes):.0f} m away")
     if args.end and pin_end is None:
         pin_end = snap_to_node(args.end, list(R.nodes), nodes)
-        print(f"  end snapped to node {pin_end} at {nodes[pin_end]}")
+        print(f"  end snapped to node {pin_end} at {nodes[pin_end]}, "
+              f"{snap_metres(args.end, pin_end, nodes):.0f} m away")
 
     n_odd = len(odd_nodes(R))
     print(f"Parity repair: {n_odd} odd-degree nodes to match ...")
@@ -1686,18 +1796,13 @@ def solve_round(variant, nodes, edges, args, profile, profile_name,
                  else args.search_iterations,
                  "street_first": args.street_first}
     if pin_start is not None:                        # --start + --end
-        endpoints, extra = parity_repair(R, router, False, None)
+        endpoints, extra = parity_repair(R, router, False)
         segments = traverse(F, R, D, nodes, None, None,
                             pin_start=pin_start, **tour_opts)
         kind = "open path, start & end pinned"
     elif pin_end is not None:                        # --end only
-        endpoints, extra = parity_repair(R, router, True, pin_end)
+        endpoints, extra = parity_repair(R, router, True, pin_end=pin_end)
         if endpoints:
-            # orient the walk so it ENDS at the pin (or, if parity
-            # forces both endpoints, at the forced endpoint nearest it)
-            e_pin = snap_to_node(args.end, list(endpoints), nodes)
-            endpoints = tuple(n for n in endpoints if n != e_pin) \
-                + (e_pin,)
             segments = traverse(F, R, D, nodes, endpoints, None,
                                 **tour_opts)
             kind = "open path, end pinned"
@@ -1706,7 +1811,8 @@ def solve_round(variant, nodes, edges, args, profile, profile_name,
                                 **tour_opts)
             kind = "closed circuit (starts and ends at --end)"
     else:
-        endpoints, extra = parity_repair(R, router, args.open, start_node)
+        endpoints, extra = parity_repair(R, router, args.open,
+                                         pin_start=start_node)
         segments = traverse(F, R, D, nodes, endpoints, start_node,
                             **tour_opts)
         kind = "open path" if endpoints else "closed circuit"
@@ -1803,13 +1909,16 @@ def main():
                          "knows which turn crosses the oncoming stream "
                          "(default left: AU/UK/JP/NZ)")
     ap.add_argument("--pair-passes", action="store_true",
-                    help="prefer finishing a two-sided street while you "
-                         "are on it, so its mail stays in one bundle. "
-                         "Costs no distance, but implies a turn at the "
-                         "far end and Hierholzer splices sub-tours "
-                         "between the passes anyway: measured +5 points "
-                         "of pairing for +3 min of turning, so it is "
-                         "off by default (B3)")
+                    help="while building the tour, prefer taking the "
+                         "second pass of a two-sided street straight "
+                         "after the first, so its mail stays in one "
+                         "bundle. Costs no distance, but implies a turn "
+                         "at the far end and Hierholzer splices "
+                         "sub-tours between the passes anyway: measured "
+                         "+5 points of pairing for +3 min of turning, so "
+                         "it is off by default (B3). Delivering both "
+                         "kerbs does not depend on this -- that is "
+                         "guaranteed either way (E17)")
     ap.add_argument("--street-first", action="store_true",
                     help="prefer finishing a street before moving on, so "
                          "its mail stays in one bundle. Costs no "
@@ -1999,8 +2108,10 @@ Riding time (rough)      : {hhmm(riding_s + turning_s + waiting_s):>9}   \
 Turns                    : {turns['cross']} crossing + {turns['u']} U-turn + \
 {turns['easy']} easy + {turns['straight']} straight
 Against a one-way        : {wrong_km:7.2f} km   (ride the footpath there)
+Both kerbs delivered     : {ops['both_sides']}/{ops['two_sided']}   \
+(two-sided streets ridden once each way -- guaranteed)
 Both sides back to back  : {ops['paired_pct']:6.1f}%   \
-({ops['two_sided']} two-sided streets; one bundle each when paired)
+(when paired, one bundle each in the sort frame)
 Street runs              : {ops['street_runs']:7d}   \
 ({ops['streets']} streets, so {ops['runs_per_street']} visits each)
 Outputs                  : {route_csv}

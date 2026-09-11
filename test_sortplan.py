@@ -55,13 +55,14 @@ def write_route(result_dir: Path):
     with open(result_dir / "route.csv", "w", newline="",
               encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["seq", "type", "street", "pass", "direction",
+        w.writerow(["seq", "type", "street", "pass", "side", "direction",
                     "from_cross", "to_cross", "length_m", "cum_km",
                     "against_oneway", "edge_id"])
-        w.writerow([1, "service", "Main Street", "1/2", "E", "(dead end)",
-                    "(dead end)", 270, 0.27, "", "main"])
-        w.writerow([2, "service", "Main Street", "2/2", "W", "(dead end)",
-                    "(dead end)", 270, 0.54, "", "main"])
+        # traffic keeps left: heading E you deliver the north kerb
+        w.writerow([1, "service", "Main Street", "1/2", "N", "E",
+                    "(dead end)", "(dead end)", 270, 0.27, "", "main"])
+        w.writerow([2, "service", "Main Street", "2/2", "S", "W",
+                    "(dead end)", "(dead end)", 270, 0.54, "", "main"])
 
 
 def main():
@@ -101,10 +102,13 @@ def main():
     left = sorted(n for n, side in attached["main"] if side == "left")
     assert left == ["1", "3", "5"], left      # north of W->E is left
 
-    # direction comes from chaining the whole walk, not from one row:
+    # direction comes from the kerb each pass delivered, row by row:
     # out along W->E, back along E->W
     route = sort_plan.load_route(result)
-    assert sort_plan.traversal_directions(route, edges) == [True, False]
+    assert [r["side"] for r in route] == ["N", "S"], \
+        [r["side"] for r in route]
+    assert sort_plan.traversal_directions(route, edges, nodes) == \
+        [True, False]
     # so the two passes together cover both sides exactly once
     runs = sort_plan.build_runs(route, edges, nodes, attached)
     assert sorted(runs[0]["numbers"], key=int) == \

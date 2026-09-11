@@ -41,6 +41,8 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+from solve_route import kerb_side, segment_coords
+
 TOLERANCE_M = 25.0
 MLAT = 110540.0
 
@@ -144,33 +146,28 @@ def attach_addresses(addresses, edges, nodes, tolerance):
     return attached, placed
 
 
-def traversal_directions(route, edges):
-    """True where a row was ridden u->v. route.csv carries no u/v, so
-    the walk is rebuilt by chaining; the first row's direction is
-    ambiguous, so both are tried and the one that chains wins."""
-    ends = [(edges[r["edge_id"]]["u"], edges[r["edge_id"]]["v"])
-            for r in route]
-    for start in (0, 1):
-        forward, node, ok = [], ends[0][start], True
-        for u, v in ends:
-            if node == u:
-                forward.append(True)
-                node = v
-            elif node == v:
-                forward.append(False)
-                node = u
-            else:
-                ok = False
-                break
-        if ok:
-            return forward
-    return [True] * len(route)
+def traversal_directions(route, edges, nodes):
+    """True where a row was ridden u->v.
+
+    route.csv names the kerb each pass delivered, and the kerb is what
+    fixes the direction: riding u->v where traffic keeps left serves
+    the side 90 degrees to its left. Reading it per row beats chaining
+    the whole walk, which had to guess the first row's direction and
+    fell back to calling every pass u->v when the chain broke -- which
+    put a whole round's mail on one side of every street."""
+    forward = []
+    for r in route:
+        e = edges[r["edge_id"]]
+        uv = kerb_side(segment_coords({"wkt": e.get("geometry_wkt") or "",
+                                       "u": e["u"], "v": e["v"]}, nodes))
+        forward.append(not r.get("side") or r["side"] == uv)
+    return forward
 
 
 def build_runs(route, edges, nodes, attached):
     """One row per continuous delivery run, with the numbers it serves."""
     runs = []
-    forward = traversal_directions(route, edges)
+    forward = traversal_directions(route, edges, nodes)
     for row, travelled_uv in zip(route, forward):
         if row["type"] != "service":
             continue

@@ -19,6 +19,12 @@ circuit and open modes, and asserts the core invariants:
     turn-aware routing takes 300 m of clear road over 200 m through a
     signal, plain Dijkstra does not
   * searching over Euler tours never changes the distance
+  * a two-sided street is ridden once each way, so both kerbs are
+    delivered -- under every preference, not just the lucky ones
+  * a pinned start really starts there, and a pinned end in the middle
+    of a street really finishes there
+  * the reverse arc search returns a path that starts where its key says
+  * the speed of the road being entered reaches the turn cost
 
 Run:  python test_solve.py
 """
@@ -82,6 +88,32 @@ def write_case(data_dir: Path, disconnect=False):
         for eid, nm, u, v, s in edges:
             w.writerow([eid, nm, "residential", L(u, v), s, "", u, v, ""])
     return {eid: s for eid, _, _, _, s in edges}
+
+
+def write_simple(data_dir: Path, nodes, edges):
+    """nodes: {id: (lat, lon)}; edges: (eid, name, u, v, service)."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    with open(data_dir / "nodes.csv", "w", newline="",
+              encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["node_id", "lat", "lon", "control", "control_group"])
+        for n, (la, lo) in nodes.items():
+            w.writerow([n, la, lo, "", ""])
+    with open(data_dir / "edges.csv", "w", newline="",
+              encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["edge_id", "name", "highway", "oneway",
+                    "maxspeed_kmh", "length_m", "service", "note",
+                    "u", "v", "geometry_wkt"])
+        for eid, nm, u, v, sv in edges:
+            (la, lo), (lb, lo2) = nodes[u], nodes[v]
+            m = round((((la - lb) * 111000) ** 2 +
+                       ((lo - lo2) * 111000 *
+                        math.cos(math.radians(la))) ** 2) ** 0.5, 1)
+            w.writerow([eid, nm, "residential", "", "", m, sv, "",
+                        u, v, ""])
+    return {e[0]: (e[2], e[3]) for e in edges}, \
+        {e[0]: e[4] for e in edges}
 
 
 def write_cost_case(data_dir: Path):
@@ -211,6 +243,16 @@ def check_walk(rows, edges_by_id, service_spec, closed):
     # deadhead may only use existing edges
     for r in rows:
         assert r["edge_id"] in service_spec, f"unknown edge {r['edge_id']}"
+    # 1b. a street delivered on both sides must be ridden once each
+    #     way, or one kerb gets the mail twice and the other never
+    sides = defaultdict(list)
+    for r in rows:
+        if r["type"] == "service" and service_spec.get(r["edge_id"]) == 2:
+            sides[r["edge_id"]].append(r["side"])
+    for eid, got in sides.items():
+        assert len(got) == 2 and "" not in got and got[0] != got[1], \
+            f"{eid}: both passes deliver the {got[0]} kerb -- " \
+            f"the other side of the street gets nothing"
     # 2. continuity: consecutive segments share a node.  route.csv
     #    carries no u/v, so the walk is rebuilt from edge endpoints --
     #    and the very first segment's direction is genuinely ambiguous
@@ -509,6 +551,85 @@ def main():
     rows_w = read_route(out_w)
     check_walk(rows_w, cby, cspec, closed=True)
     assert all(r["against_oneway"] == "" for r in rows_w)
+
+    print("== a pinned start really starts there ==")
+    chain = {"A": (-37.845, 144.950), "B": (-37.845, 144.951),
+             "C": (-37.845, 144.952)}
+    cdir = TMP / "chain"
+    cby2, cspec2 = write_simple(cdir, chain,
+                                [("e1", "Chain Street", "A", "B", 1),
+                                 ("e2", "Chain Street", "B", "C", 1)])
+    out_s = TMP / "chain_start"
+    run(cdir, out_s, "--open", "--start=-37.845,144.952")
+    rows_s = read_route(out_s)
+    assert rows_s[0]["edge_id"] == "e2" and rows_s[0]["direction"] == "W", \
+        f"pinned start ignored: first step {rows_s[0]['edge_id']} " \
+        f"heading {rows_s[0]['direction']}"
+
+    print("== a pinned end in mid-street really finishes there ==")
+    out_m = TMP / "chain_end"
+    run(cdir, out_m, "--end=-37.845,144.951")
+    rows_m = read_route(out_m)
+    last = rows_m[-1]
+    assert (last["edge_id"], last["direction"]) in (("e1", "E"), ("e2", "W")), \
+        f"pinned end ignored: last step {last['edge_id']} heading " \
+        f"{last['direction']}"
+    # A-B-C with the finish at B: ride the whole chain, then come back
+    # over one edge. Three segments, no more -- anything shorter cannot
+    # finish at B, and anything longer is not the cheapest way to.
+    one = float(rows_m[0]["length_m"])
+    assert len(rows_m) == 3 and abs(total_km(rows_m) - 3 * one / 1000) < 1e-3, \
+        f"expected 3 segments of {one} m, got {len(rows_m)} totalling " \
+        f"{total_km(rows_m):.3f} km"
+
+    print("== both kerbs of a two-sided street, under every preference ==")
+    # Two disjoint ways round mean the tour CAN take the middle street
+    # twice the same way, and the turn-comfort chooser prefers to.
+    theta = {"u": (-37.845, 144.950), "v": (-37.845, 144.952),
+             "m1": (-37.844, 144.951), "m2": (-37.846, 144.951)}
+    tdir = TMP / "theta"
+    tby, tspec = write_simple(tdir, theta, [
+        ("E", "Both Sides Street", "u", "v", 2),
+        ("p1a", "North Way", "u", "m1", 1),
+        ("p1b", "North Way", "m1", "v", 1),
+        ("p2a", "South Way", "u", "m2", 1),
+        ("p2b", "South Way", "m2", "v", 1)])
+    for extra in ([], ["--no-turn-optimisation"], ["--no-tour-search"],
+                  ["--variants", "all"], ["--algorithm", "turn"]):
+        out_t = TMP / ("theta" + (extra[0].strip("-") if extra else "def"))
+        run(tdir, out_t, *extra)
+        rows_t = read_route(out_t)
+        check_walk(rows_t, tby, tspec, closed=True)
+
+    print("== the reverse arc search agrees with its own keys ==")
+    sys.path.insert(0, str(BASE))
+    import solve_route as S
+    sn = {"A": (0.0, 0.0), "B": (0.0, 0.001), "C": (0.0, 0.002)}
+    se = [dict(edge_id="e1", u="A", v="B", name="Chain Street",
+               highway="residential", oneway=False, maxspeed=None,
+               length=100.0, service=1, wkt=""),
+          dict(edge_id="e2", u="B", v="C", name="Chain Street",
+               highway="residential", oneway=False, maxspeed=None,
+               length=100.0, service=1, wkt="")]
+    F, R, D = S.build_graphs(se, S.load_profile("distance")[1])
+    for kind in ("node", "turn"):
+        _, paths = S.route_from(S.make_router(D, sn, kind), ["C"],
+                                reverse=True)
+        for n, arcs in paths.items():
+            assert not arcs or arcs[0][0] == n, \
+                f"{kind}: path keyed {n} starts at {arcs[0][0]}"
+            assert not arcs or arcs[-1][1] == "C", \
+                f"{kind}: path keyed {n} ends at {arcs[-1][1]}, not C"
+
+    print("== the speed of the road entered reaches the turn cost ==")
+    se[0]["maxspeed"] = se[1]["maxspeed"] = 60.0
+    F, R, D = S.build_graphs(se, S.load_profile("edv")[1])
+    meta = S.tour_meta(R, F, D, sn)
+    speeds = {k: m.get("kmh") for k, m in meta.items()}
+    assert set(speeds.values()) == {50.0}, \
+        f"the tour chooser sees {speeds} -- graded turn costs are inert"
+    assert S.turn_seconds("cross", 60.0) > S.turn_seconds("cross", 20.0), \
+        "turning across a fast road must cost more than across a slow one"
 
     print("== bad profile / penalty are rejected ==")
     for bad in (["--profile", "nonsense"], ["--wrong-way-penalty", "0.5"]):
