@@ -119,7 +119,10 @@ everywhere**):
 - `route.csv`:
   `seq,type,street,pass,side,direction,from_cross,to_cross,length_m,cum_km,against_oneway,edge_id`
   (`side` is the compass point of the kerb that pass delivers — the
-  one on the rider's side of the road — and is empty on deadhead)
+  one on the rider's side of the road — and is empty on deadhead. On a
+  closed way (`u == v`) it is `inner` or `outer` instead, since a ring
+  has no compass direction; empty there means the ring carried no
+  geometry to orient it)
 
 `edge_id` is opaque to the solver — never parse meaning out of it.
 Contract changes require: updating this section, a migration note
@@ -146,7 +149,8 @@ Migration notes:
 - 2026-09: `route.csv` gained `side` (fifth column, after `pass`): the
   compass point of the kerb that pass delivers, empty for deadhead.
   The two passes of a `service=2` street always carry different values
-  — that is the guarantee, and the column is how it is checked.
+  — that is the guarantee, and the column is how it is checked. On a
+  closed way the values are `inner` / `outer`.
   Column *index* readers must be updated from `pass` onwards.
 
 ## 4. Edge-case catalogue
@@ -303,7 +307,18 @@ Migration notes:
   terminates, because each fold leaves one more street with its passes
   adjacent and adjacent passes can never run the same way. An
   assertion at the end of `traverse()` makes it a guarantee rather
-  than a hope.
+  than a hope. **Closed ways are the exception that proves it.** A loop
+  road or cul-de-sac circle has `u == v`, so "which direction" cannot
+  be read off its endpoints at all — both laps looked identical and the
+  assertion fired. But a closed way returns to the node it left, so
+  both laps cost the same and connect the same: the second one is
+  simply emitted riding the other way round, which is free and always
+  available. Its kerbs are not north and south but the **inside and
+  the outside** of the ring, named from the sign of the enclosed area
+  (anticlockwise where traffic keeps left puts your left hand towards
+  the middle). A ring with no geometry at all has no inside to speak
+  of: the solver warns and leaves `side` empty rather than asserting
+  over data it does not have.
 - **E18 A pinned endpoint that is not an odd node.** An open walk
   exists exactly when every node has even degree apart from its two
   ends, so the set the matching must repair is the odd nodes with the
@@ -688,7 +703,8 @@ is the only networked step — keep it thin, and keep everything after
 | 2026-08 | Version history stores the *annotation* (edges with service 1/2/x, ~200 rows) rather than a copy of `edges.csv` (10 850 rows), keyed by a hash of it; unchanged re-solves are not filed | The annotation is the round definition and is two orders of magnitude smaller; hashing it makes "did anything actually change?" exact, so pressing Solve repeatedly cannot bury the real changes |
 | 2026-08 | Island warning rewritten: names service islands vs pinned endpoints separately, reports the bridging kilometres, points at the editor's island view | The old message called the endpoint pair a "service island" (wrong) and gave no sense of scale, so "near-optimal" read as "unquantified doubt" instead of "these 1.1 km are heuristic" |
 | 2026-09 | Both kerbs of a `service=2` street are a guarantee, not a preference: penalised during construction, scored during search, repaired afterwards, asserted at the end | Two passes the same way deliver one side twice and leave the other with nothing, which is not a trade against turn comfort — it is half the street missed. It costs no distance (all Euler tours over the same edges are the same length), and measured on the real round it left four preferences unchanged and made the fifth 1.55 km *shorter* while fixing its 22 one-sided streets |
-| 2026-09 | `route.csv` names the kerb each pass delivers (`side`), by compass point | The guarantee needs to be checkable by the person riding it, not just by an assertion. It also gives the sort plan a side to key on without re-deriving travel direction |
+| 2026-09 | A closed way's second lap is emitted riding the other way round, and its kerbs are named `inner` / `outer` from the sign of the ring's area | `u == v` carries no direction, so both laps of a loop road came out identical — the same defect as an ordinary street ridden twice the same way, but invisible to a check based on endpoints. Both laps of a ring cost the same and end in the same place, so riding one each way is free; naming the sides by compass point would have been fiction |
+| 2026-09 | `route.csv` names the kerb each pass delivers (`side`), by compass point (`inner`/`outer` on a closed way) | The guarantee needs to be checkable by the person riding it, not just by an assertion. It also gives the sort plan a side to key on without re-deriving travel direction |
 | 2026-09 | Open-route endpoints chosen by T-join over `odd Δ {start, end}`, with pinned ends included in the set to repair | The old rule ("ends must already be odd") is only true when both ends are free. A pin in the middle of a street has even degree, so it could never be chosen, and the round quietly finished elsewhere — the one thing a fixed finish exists to prevent |
 | 2026-09 | Controlled nodes are marked before simplification and protected through it | 58 intersections' worth of waiting time was missing from every route ever solved, and nothing downstream could tell: the nodes were simply not there. Roughly 3% more edges is a cheap price for the numbers being real |
 | 2026-09 | `F` and `D` are built from one shared attribute dict | They had drifted: `kmh` reached `D` only, so every lookup through `F` read `None` and the speed-graded turn cost was inert in the tour chooser. The duplication was the bug; removing it is the fix |

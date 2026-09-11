@@ -731,11 +731,33 @@ def turn_kind(bearing_in, bearing_out, traffic_side="left"):
 WINDS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 
 
-def kerb_side(chain, traffic_side="left"):
-    """Which kerb you deliver riding along `chain`, as a compass point.
+def ring_area(chain):
+    """Twice the signed area of a closed chain, in a local east-north
+    frame. Positive means anticlockwise."""
+    k = math.cos(math.radians(chain[0][0]))
+    return sum((x1 * k) * y2 - (x2 * k) * y1
+               for (y1, x1), (y2, x2) in zip(chain, chain[1:]))
+
+
+def kerb_side(chain, traffic_side="left", closed=False):
+    """Which kerb you deliver riding along `chain`.
+
     It is the one on your side of the road, so the answer flips with
-    the direction of travel -- which is what makes it a check that
-    both sides of a street were actually served."""
+    the direction of travel -- which is what makes it a check that both
+    sides of a street were actually served.
+
+    A closed way (a loop road, a cul-de-sac circle) starts and finishes
+    at the same junction, so it has no compass direction and its two
+    kerbs are not north and south but the inside and the outside of the
+    ring. Ride it anticlockwise where traffic keeps left and your left
+    hand is towards the middle."""
+    if closed:
+        area = ring_area(chain) if len(chain) > 2 else 0.0
+        if not area:
+            return ""            # a loop with no shape: nothing to name
+        anticlockwise = area > 0
+        inner = anticlockwise if traffic_side == "left" else not anticlockwise
+        return "inner" if inner else "outer"
     run = bearing_of(chain[0], chain[-1]) if len(chain) > 1 else None
     if run is None:
         return ""
@@ -1057,6 +1079,9 @@ def cover_both_sides(euler, R):
             if j == i + 1:
                 continue
             (au, av, _), (bu, bv, bk) = euler[i], euler[j]
+            if au == av:
+                continue         # a closed way: both laps start here,
+                                 # and which way round is decided later
             if (au, av) != (bu, bv):
                 continue                     # opposite directions
             euler[i + 1:j + 1] = ([(bv, bu, bk)] +
@@ -1129,7 +1154,7 @@ def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None,
     two_way = defaultdict(list)
     for u, v, key in euler:
         base = R[u][v][key].get("base")
-        if base:
+        if base and u != v:      # a closed way is handled when emitted
             two_way[base].append(u)
     assert not [b for b, t in two_way.items() if len(t) == 2
                 and t[0] == t[1]], "a two-sided street is missing a kerb"
@@ -1162,7 +1187,12 @@ def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None,
             edata = F[u][v][base]
             passes_seen[base] += 1
             total = edata["service"]
-            segments.append(dict(kind="service", edge_id=base,
+            # A closed way returns to the node it left, so both laps
+            # cost the same and connect the same -- which means the
+            # second one is free to go round the other way, and has to,
+            # or the inner kerb never gets any mail.
+            segments.append(dict(reverse=u == v and passes_seen[base] == 2,
+                                 kind="service", edge_id=base,
                                  u=u, v=v, name=edata["name"],
                                  length=edata["length"], wkt=edata["wkt"],
                                  pass_label=f"{passes_seen[base]}/{total}",
@@ -1194,10 +1224,18 @@ def annotate_turns(segments, nodes, traffic_side="left", profile=None,
         # naming it by compass point says which physical side of the
         # street got the mail on this pass -- and makes it checkable.
         s["side"] = ("" if s["kind"] != "service"
-                     else kerb_side(chain, traffic_side))
+                     else kerb_side(chain, traffic_side,
+                                    closed=s["u"] == s["v"]))
         if i:
             counts[s["turn"]] += 1
         previous = into if into is not None else previous
+    blind = {s["edge_id"] for s in segments
+             if s["kind"] == "service" and s["pass_label"].endswith("/2")
+             and not s["side"]}
+    if blind:
+        print(f"  warning: {len(blind)} closed way(s) carry no geometry, "
+              f"so which kerb each lap delivers cannot be worked out. "
+              f"Ride one lap each way round.")
     return counts
 
 
@@ -1274,7 +1312,12 @@ def cross_streets(F, node, current_name):
 
 
 def segment_coords(seg, nodes):
-    """[(lat, lon), ...] for drawing, honouring curved geometry."""
+    """[(lat, lon), ...] for drawing, honouring curved geometry.
+    `reverse` rides it against the way it is drawn, which is the only
+    way to tell the two laps of a closed way apart."""
+    if seg.get("reverse"):
+        return list(reversed(segment_coords(dict(seg, reverse=False),
+                                            nodes)))
     if seg["wkt"] and shapely_wkt is not None:
         try:
             line = shapely_wkt.loads(seg["wkt"])
@@ -1294,6 +1337,16 @@ def _closer(p, target, other):
     return d1 < d2
 
 
+def travel_label(seg, nodes):
+    """Compass direction of travel. A closed way ends where it began,
+    so its endpoints say nothing -- the honest answer there is the way
+    you set off, which is also what tells its two laps apart."""
+    if seg["u"] != seg["v"]:
+        return bearing_label(nodes[seg["u"]], nodes[seg["v"]])
+    chain = segment_coords(seg, nodes)
+    return bearing_label(chain[0], chain[1]) if len(chain) > 1 else ""
+
+
 def write_route_csv(segments, F, nodes, out_dir: Path):
     path = out_dir / "route.csv"
     cum = 0.0
@@ -1306,8 +1359,7 @@ def write_route_csv(segments, F, nodes, out_dir: Path):
             cum += s["length"]
             w.writerow([
                 i, s["kind"], s["name"], s["pass_label"],
-                s.get("side", ""),
-                bearing_label(nodes[s["u"]], nodes[s["v"]]),
+                s.get("side", ""), travel_label(s, nodes),
                 cross_streets(F, s["u"], s["name"]),
                 cross_streets(F, s["v"], s["name"]),
                 round(s["length"], 1), round(cum / 1000, 3),

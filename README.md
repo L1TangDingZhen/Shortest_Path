@@ -60,7 +60,8 @@ which kerb that pass delivers, compass direction, the cross streets at
 each end, and cumulative distance.
 
 A street marked `2` is always ridden once each way, so its two passes
-deliver opposite kerbs. That is enforced, not hoped for: the tour
+deliver opposite kerbs — on a loop road, the inner kerb and the outer
+one. That is enforced, not hoped for: the tour
 chooser prices a repeat of the same direction, the search scores it,
 a repair fixes anything left, and the solver asserts it before writing
 anything out.

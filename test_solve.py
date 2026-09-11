@@ -21,6 +21,9 @@ circuit and open modes, and asserts the core invariants:
   * searching over Euler tours never changes the distance
   * a two-sided street is ridden once each way, so both kerbs are
     delivered -- under every preference, not just the lucky ones
+  * a closed way (a loop road: one junction, u == v) is ridden one lap
+    each way round, inner kerb and outer kerb; with no geometry to
+    orient it the solver says so instead of asserting
   * a pinned start really starts there, and a pinned end in the middle
     of a street really finishes there
   * the reverse arc search returns a path that starts where its key says
@@ -114,6 +117,36 @@ def write_simple(data_dir: Path, nodes, edges):
                         u, v, ""])
     return {e[0]: (e[2], e[3]) for e in edges}, \
         {e[0]: e[4] for e in edges}
+
+
+def write_loop_case(data_dir: Path, geometry=True):
+    """A closed way -- one junction, u == v -- on a short feeder.
+    OSM is full of these: loop roads and cul-de-sac circles."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    cx, cy, r = 144.9510, -37.8450, 0.0006
+    ring = [(cx, cy + r)]
+    for i in range(1, 13):
+        a = 2 * math.pi * i / 12
+        ring.append((cx + r * math.sin(a), cy + r * math.cos(a)))
+    wkt = "LINESTRING (" + ", ".join(f"{x} {y}" for x, y in ring) + ")"
+    with open(data_dir / "nodes.csv", "w", newline="",
+              encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["node_id", "lat", "lon", "control", "control_group"])
+        w.writerow(["J", cy + r, cx, "", ""])
+        w.writerow(["K", cy + r + 0.001, cx, "", ""])
+    with open(data_dir / "edges.csv", "w", newline="",
+              encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["edge_id", "name", "highway", "oneway",
+                    "maxspeed_kmh", "length_m", "service", "note",
+                    "u", "v", "geometry_wkt"])
+        w.writerow(["loop", "Ring Close", "residential", "", "", 377, 2,
+                    "", "J", "J", wkt if geometry else ""])
+        w.writerow(["stub", "Feeder Street", "residential", "", "", 111,
+                    1, "", "J", "K", ""])
+    return {"loop": ("J", "J"), "stub": ("J", "K")}, \
+        {"loop": 2, "stub": 1}
 
 
 def write_cost_case(data_dir: Path):
@@ -250,6 +283,9 @@ def check_walk(rows, edges_by_id, service_spec, closed):
         if r["type"] == "service" and service_spec.get(r["edge_id"]) == 2:
             sides[r["edge_id"]].append(r["side"])
     for eid, got in sides.items():
+        u, v = edges_by_id[eid]
+        if u == v and got == ["", ""]:
+            continue        # a closed way with no shape: nothing to name
         assert len(got) == 2 and "" not in got and got[0] != got[1], \
             f"{eid}: both passes deliver the {got[0]} kerb -- " \
             f"the other side of the street gets nothing"
@@ -600,6 +636,31 @@ def main():
         run(tdir, out_t, *extra)
         rows_t = read_route(out_t)
         check_walk(rows_t, tby, tspec, closed=True)
+
+    print("== a closed way is ridden one lap each way round ==")
+    ldir = TMP / "loop"
+    lby, lspec = write_loop_case(ldir)
+    out_l = TMP / "loop_out"
+    run(ldir, out_l)
+    rows_l = read_route(out_l)
+    check_walk(rows_l, lby, lspec, closed=True)
+    laps = [r["side"] for r in rows_l if r["edge_id"] == "loop"
+            and r["type"] == "service"]
+    assert sorted(laps) == ["inner", "outer"], laps
+    ways = [r["direction"] for r in rows_l if r["edge_id"] == "loop"
+            and r["type"] == "service"]
+    assert len(set(ways)) == 2, f"both laps set off {ways[0]}"
+
+    print("== a closed way with no geometry says so, and does not crash ==")
+    bdir = TMP / "loop_bare"
+    bby, bspec = write_loop_case(bdir, geometry=False)
+    out_b = TMP / "loop_bare_out"
+    stdout = run(bdir, out_b)
+    rows_b = read_route(out_b)
+    check_walk(rows_b, bby, bspec, closed=True)
+    assert "closed way" in stdout and "no geometry" in stdout, stdout
+    assert all(r["side"] == "" for r in rows_b
+               if r["edge_id"] == "loop"), "a shapeless ring has no kerbs"
 
     print("== the reverse arc search agrees with its own keys ==")
     sys.path.insert(0, str(BASE))

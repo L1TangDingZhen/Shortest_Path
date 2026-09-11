@@ -158,8 +158,10 @@ def traversal_directions(route, edges, nodes):
     forward = []
     for r in route:
         e = edges[r["edge_id"]]
-        uv = kerb_side(segment_coords({"wkt": e.get("geometry_wkt") or "",
-                                       "u": e["u"], "v": e["v"]}, nodes))
+        seg = {"wkt": e.get("geometry_wkt") or "",
+               "u": e["u"], "v": e["v"]}
+        uv = kerb_side(segment_coords(seg, nodes),
+                       closed=e["u"] == e["v"])
         forward.append(not r.get("side") or r["side"] == uv)
     return forward
 
