@@ -21,6 +21,7 @@ project evolves — especially the decision log.
 | B9: solved-version history (`round_history.py`) | **done, tested** (`test_history.py`) |
 | E15: extraction switched to `--network-type all` (roads actually connected) | **done** |
 | B2 cost profiles (`--profile edv`) + B10.1/B10.2 wrong-way flag and penalty | **done, tested** (in `test_solve.py`) |
+| B10 vehicle presets, explicit CLI precedence and actual penalty reporting | **done, tested** (in `test_solve.py`) |
 | E16: one-way direction preserved through extraction | **done, tested** (`test_extract.py`) |
 | B11: turn-aware Euler tour + rough riding time / turn counts | **done, tested** (in `test_solve.py`) |
 | B12: posted speed limits in the data + `limits` profile + release-numbered history | **done, tested** |
@@ -123,6 +124,14 @@ everywhere**):
   closed way (`u == v`) it is `inner` or `outer` instead, since a ring
   has no compass direction; empty there means the ring carried no
   geometry to orient it)
+- `endpoints.json` may contain `wrong_way_penalty`. For a single solve,
+  explicit `--wrong-way-penalty` wins over explicit `--vehicle`, then the
+  saved factor, then 1.0. `--variants` uses its named presets instead and
+  prints an override notice. All runs report the actual factor and source.
+- Comparison metadata and history summaries include `wrong_way_penalty`
+  and `wrong_way_source`; history also identifies the selected `variant`.
+  These are the settings used for the recorded route, including when a
+  multi-variant solve chooses a top-level result.
 
 `edge_id` is opaque to the solver — never parse meaning out of it.
 Contract changes require: updating this section, a migration note
@@ -131,6 +140,12 @@ CLAUDE.md mirrors these contracts for AI sessions — keep it in sync.)
 
 Migration notes:
 
+- 2026-09: `--vehicle footpath|tricycle|carriageway` selects a soft-cost
+  factor of 1/3/12. No preset is implicit: existing saved factors and the
+  no-configuration default of 1 are preserved. Explicit flags override
+  saved factors. The uncommitted prototype used a default vehicle and
+  accidentally let saved factors override explicit presets; corrected
+  before release. These presets do not change speeds or enforce access.
 - 2026-08: `service` gained the value `x` (excluded — the edge is
   dropped from the graph at load). Files without any `x` behave
   exactly as before; no migration needed.
@@ -267,9 +282,8 @@ Migration notes:
 - **E13 One-way streets ("can I ride against traffic?").** The model
   is deliberately **undirected**: the vehicle works from the footpath,
   and footpaths have no direction — "riding against" a one-way only
-  exists on the carriageway. The OSM `oneway` flag is exported to
-  `edges.csv` as pure information (useful when reviewing a deadhead
-  you might ride on-road), but the solver ignores it and **no
+  exists on the carriageway. The OSM `oneway` flag in `edges.csv`
+  feeds the route flag and optional soft costs (B10/B11), but **no hard
   directional constraint can currently be expressed**. If a real need
   appears (e.g. a laneway with no footpath that must be ridden on the
   carriageway), know the theory before committing: undirected CPP is
@@ -490,7 +504,8 @@ stands, honestly). Option B was not needed.
   line-graph formulation — research task).
 - **B10 One-way awareness (three tiers).** Since the `all` default
   (E15) `oneway` is real data — 2 497 of 12 912 edges on the real
-  round. The solver is still undirected (E13) and ignores it.
+  round. Required work is still undirected (E13); direction can affect
+  cost without removing the reverse arc.
   Measured on the current route: 8.59 km of 29.37 km runs on one-way
   edges, and **4.01 km of that is against the arrow** (47% of the
   one-way mileage; 1.76 km service + 2.25 km deadhead), concentrated
@@ -505,8 +520,9 @@ stands, honestly). Option B was not needed.
   2. **Penalise it.** *Shipped 2026-08* as `--wrong-way-penalty`
      (default 1.0 = off). Every edge becomes two arcs in a directed
      cost graph `D`; the backward arc of a one-way costs x FACTOR.
-     Only steers deadhead -- service passes are mandatory whichever
-     way they are ridden. Measured at x3 on the real round: wrong-way
+     The path cost steers deadhead; the same preference also steers
+     tour direction choices (B11). Service coverage stays mandatory.
+     Measured at x3 on the real round: wrong-way
      4.18 -> 2.29 km (its deadhead part ~2.4 -> 0.48 km) for +0.27 km
      total. Documented approximation: costs become asymmetric while
      the matching needs one number per pair, so `symmetrise()` takes
@@ -515,6 +531,16 @@ stands, honestly). Option B was not needed.
      for *both* directions and the traversal uses the matching one.
      Off by default: riding the footpath is direction-free, and on a
      divided arterial the "correct" chain is across the median.
+     *2026-09:* explicit `--vehicle` presets select x1 (`footpath`),
+     x3 (`tricycle`) or x12 (`carriageway`). They are only cost presets,
+     not vehicle access models or speed profiles. Priority for a single
+     solve is explicit factor > explicit vehicle > saved factor > x1.
+     The factor and its source are printed and recorded; non-finite or
+     invalid factors fail with the source named. `--variants` retains
+     its preset factors and announces any overridden vehicle/factor.
+     Synthetic tests exercise the CLI with and without saved values,
+     a short reverse connector versus a longer detour, a necessary
+     reverse traversal even at x12, and the actual settings in history.
   3. **Forbid it (exact, different solver class).** A true directional
      constraint is the Mixed CPP: NP-hard (E13), needs the ILP /
      branch-and-cut backend of B8. Only worth it with a concrete
@@ -604,6 +630,10 @@ stands, honestly). Option B was not needed.
   30.59 km / 55 min with 20 crossing turns and 0.4 km wrong-way.
   "Shortest" being the slowest option is the whole argument for
   offering the choice.
+  Named variants override `--profile`, `--algorithm`, `--vehicle`,
+  `--wrong-way-penalty` and saved preferences, with an explicit notice.
+  Every variant reports its actual penalty; comparison metadata and
+  the selected route's history retain that value and its source.
 - **B14 Intersection delay.** *Shipped 2026-08.* Waiting is not
   riding, and on a footpath round it is a quarter of the day. Node tags
   were being thrown away (`nodes.csv` held only id/lat/lon) while the
@@ -697,6 +727,7 @@ is the only networked step — keep it thin, and keep everything after
 | 2026-08 | One-way direction is captured from the directed graph before `to_undirected()` and written into the u/v columns; `edge_id` stays keyed on iteration order | The undirected view keeps no direction, so 49% of one-way edges had been exported backwards (E16). Everything built on B10 — the `against_oneway` flag and the wrong-way penalty — was reasoning about a coin flip. Keeping `edge_id` stable meant the fix cost one re-extraction and zero annotation |
 | 2026-08 | Optimisation weight (`cost`) split from reported distance (`length`), on a directed graph `D` where every edge becomes two arcs | A cost profile and a wrong-way penalty both need a weight that is not metres, and one of them is direction-dependent. Keeping `length` untouched means every printed kilometre stays a real kilometre, and `--profile distance` reproduces the old routes exactly (verified: synthetic totals unchanged to the metre) |
 | 2026-08 | Wrong-way penalty ships off by default | On a footpath, direction does not exist; on a divided arterial the "correct" chain is on the far side of the median, so forcing it could send the rider across the road. A real option for carriageway riding, not a default (B10) |
+| 2026-09 | Vehicle presets are opt-in soft costs; explicit numeric factor > explicit vehicle > saved factor > x1 | Keeps the historical default and lets the CLI override editor settings. Factors 1/3/12 are preferences, not measured multipliers of riding time or access permissions. Named variants keep their own settings, announce overrides, and report/store the actual values. |
 | 2026-08 | Default extraction switched from `walk` to `all` | `walk` drops junction carriageways, shattering the road network into 34 components and forcing routes onto pedestrian crossings; `all` keeps both layers, restores "go straight", yields real `oneway` data and a 1.25 km shorter route on the same annotation (E15) |
 | 2026-08 | `prepare_round` gained a geometry fallback: overrides whose `edge_id` vanished are re-found by position (same name/type, all sample points within 6 m, length-bounded), accepting any component of an osmnx-merged `"A; B"` name | Changing the network type changes which junctions exist, so osmnx splits ways differently and 618 of 10 850 ids disappeared. Id-only replay silently lost 7 annotated edges (659 m); with geometry it recovered all of them as 18 new pieces, and mandatory distance came out identical to the metre. B1's promise ("fully reproducible after re-extraction") only holds with this |
 | 2026-08 | `.gitignore`: `data/` → `data*/`, `result/` → `result*/` | A side-by-side `data_all/` extraction of the real round showed up as untracked — the ignore patterns only covered the exact directory names |

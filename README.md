@@ -241,15 +241,39 @@ whichever way the route runs, so stop time is a constant that cancels
 out when two routes are compared — and it changes with the day's mail,
 which would turn the comparison into noise.
 
-One-way streets are reported but never enforced: the model is
-undirected because a vehicle working from the footpath has no
-direction. `route.csv` marks each traversal that runs against a
-one-way in the `against_oneway` column, and the route viewer draws
-those stretches dark red with a total ("N km against a one-way — use
-the footpath"), so you know where not to ride on the carriageway. If
-you do ride on the carriageway, `--wrong-way-penalty 3` makes the
-optimiser avoid them where it can — it only steers deadhead, since
-service passes are mandatory whichever way you ride them.
+One-way streets can carry a soft cost for travelling against the mapped
+direction. Both directions remain available. The penalty affects connector
+paths and tour direction choices; mandatory service coverage is preserved.
+`--vehicle` is a shortcut for choosing that cost, not an access or speed model:
+
+| Explicit preset | Penalty factor |
+|---|---|
+| `--vehicle footpath` | 1 (off) |
+| `--vehicle tricycle` | 3 |
+| `--vehicle carriageway` | 12 |
+
+For a single solve, precedence is **explicit `--wrong-way-penalty` > explicit
+`--vehicle` > `endpoints.json`'s `wrong_way_penalty` > 1 (off)**. With a saved
+factor of 3, `--vehicle footpath` therefore uses 1 and `--vehicle carriageway`
+uses 12. With no flags or saved preference, the historical default remains 1.
+The console prints the effective factor and its source, even when it is off.
+
+`--variants` uses each named preference's own profile, algorithm and penalty.
+It overrides both flags above and saved preferences, prints an override
+notice, and reports the effective factor for each option. Run without
+`--variants` to apply a custom penalty. Comparison metadata and history record
+the settings actually used, not a value superseded by a preset.
+
+These presets do not establish whether a sidewalk exists or where the
+vehicle may travel, and even `carriageway` does not prohibit a direction.
+`route.csv` still marks every traversal against a one-way in
+`against_oneway`, and the viewer draws those stretches dark red. A cost factor
+is an optimisation preference; it does not multiply the reported riding time.
+
+The existing `side` column is a coarse compass label (for example `NW`) based
+on the oriented geometry's endpoints and the traffic side. It handles diagonal
+streets, but does not describe the local kerb along every bend. Closed ways
+use `inner` and `outer`. Vehicle presets do not change this service model.
 
 ## Version history — did that edit actually help?
 

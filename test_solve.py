@@ -28,6 +28,9 @@ circuit and open modes, and asserts the core invariants:
     of a street really finishes there
   * the reverse arc search returns a path that starts where its key says
   * the speed of the road being entered reaches the turn cost
+  * explicit vehicle / numeric preferences override saved penalties,
+    change the connector used, and remain soft costs
+  * variants report their own penalties and record the actual one
 
 Run:  python test_solve.py
 """
@@ -319,6 +322,97 @@ def total_km(rows):
     return float(rows[-1]["cum_km"])
 
 
+def test_vehicle_preferences():
+    data = TMP / "vehicle_data"
+    by_id, spec = write_simple(
+        data, {"A": (-37.845, 144.950), "B": (-37.845, 144.951),
+               "C": (-37.845, 144.952)},
+        [("svc", "Service Street", "A", "B", 1),
+         ("reverse", "One Way", "C", "B", 0),
+         ("detour", "Detour Street", "B", "C", 0)])
+    with open(data / "edges.csv", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        fields, edges = reader.fieldnames, list(reader)
+    for edge in edges:
+        edge["length_m"] = 200 if edge["edge_id"] == "detour" else 100
+        edge["oneway"] = "True" if edge["edge_id"] == "reverse" else "False"
+    with open(data / "edges.csv", "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(edges)
+
+    def solve(name, saved, flags, factor, source, connector):
+        (data / "endpoints.json").write_text(json.dumps(saved),
+                                           encoding="utf-8")
+        out, hist = TMP / name, TMP / (name + "_history")
+        stdout = run(data, out, "--start=-37.845,144.950",
+                     "--end=-37.845,144.952", "--no-tour-search",
+                     "--history", str(hist), *flags)
+        rows = read_route(out)
+        check_walk(rows, by_id, spec, closed=False)
+        assert deadhead_ids(rows) == [connector], (name, rows)
+        assert f"wrong-way penalty x{factor:g} ({source})" in stdout, stdout
+        summary = json.loads(next(hist.glob("*/summary.json"))
+                             .read_text(encoding="utf-8"))
+        assert summary["wrong_way_penalty"] == factor, (name, summary)
+        assert summary["wrong_way_source"] == source, (name, summary)
+        if connector == "reverse":
+            assert wrong_way_m(rows) == 100, rows
+        return stdout
+
+    print("== vehicle preferences override saved values and steer the route ==")
+    solve("vehicle_default", {}, [], 1, "default", "reverse")
+    solve("vehicle_saved", {"wrong_way_penalty": 3}, [], 3,
+          "endpoints.json", "detour")
+    for vehicle, factor in (("footpath", 1), ("tricycle", 3),
+                            ("carriageway", 12)):
+        for saved in ({}, {"wrong_way_penalty": 3},
+                      {"wrong_way_penalty": 7}):
+            name = f"vehicle_{vehicle}_{saved.get('wrong_way_penalty', 'empty')}"
+            solve(name, saved, ["--vehicle", vehicle], factor,
+                  f"--vehicle {vehicle}",
+                  "reverse" if factor == 1 else "detour")
+    solve("vehicle_numeric", {"wrong_way_penalty": 3},
+          ["--wrong-way-penalty", "7"], 7, "--wrong-way-penalty", "detour")
+    solve("vehicle_numeric_wins", {"wrong_way_penalty": 3},
+          ["--vehicle", "carriageway", "--wrong-way-penalty", "1"],
+          1, "--wrong-way-penalty", "reverse")
+
+    print("== variants announce overrides and history uses the actual factor ==")
+    stdout = solve("vehicle_variant", {"wrong_way_penalty": 3},
+                   ["--variants", "fastest", "--vehicle", "carriageway",
+                    "--wrong-way-penalty", "7"],
+                   1, "--variants fastest", "reverse")
+    assert "--variants uses preset" in stdout, stdout
+    assert "overridden: --vehicle, --wrong-way-penalty, " \
+           "endpoints.json wrong_way_penalty" in stdout, stdout
+
+    print("== even a strong preference permits a necessary reverse traversal ==")
+    for edge in edges:
+        if edge["edge_id"] == "detour":
+            edge["service"] = "x"
+    with open(data / "edges.csv", "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(edges)
+    solve("vehicle_required_reverse", {}, ["--vehicle", "carriageway"],
+          12, "--vehicle carriageway", "reverse")
+
+    print("== invalid saved preferences fail with their source ==")
+    for invalid in (0.5, "NaN", "Infinity", "not a number"):
+        (data / "endpoints.json").write_text(
+            json.dumps({"wrong_way_penalty": invalid}), encoding="utf-8")
+        res = subprocess.run(
+            [sys.executable, str(BASE / "solve_route.py"),
+             "--data", str(data), "--out", str(TMP / "vehicle_invalid")],
+            capture_output=True, text=True)
+        assert res.returncode != 0, res.stdout
+        assert "endpoints.json: wrong-way penalty must be a finite number" \
+               in res.stderr, res.stderr
+    solve("vehicle_overrides_invalid_saved", {"wrong_way_penalty": "bad"},
+          ["--vehicle", "footpath"], 1, "--vehicle footpath", "reverse")
+
+
 def main():
     if TMP.exists():
         shutil.rmtree(TMP)
@@ -384,9 +478,12 @@ def main():
 
     print("== --variants lays the preferences side by side ==")
     out_all = TMP / "alts"
+    variants_hist = TMP / "alts_history"
     stdout = run(data, out_all, "--variants",
-                 "shortest,fastest,recommended")
+                 "shortest,fastest,recommended", "--vehicle", "footpath",
+                 "--wrong-way-penalty", "7", "--history", str(variants_hist))
     assert "ROUTE PREFERENCES" in stdout and "Quickest:" in stdout, stdout
+    assert "overridden: --vehicle, --wrong-way-penalty" in stdout, stdout
     for name in ("shortest", "fastest", "recommended"):
         assert (out_all / name / "route.csv").exists(), name
         check_walk(read_route(out_all / name), edges_by_id, spec,
@@ -399,6 +496,14 @@ def main():
     assert {r["variant"] for r in payload["routes"]} == \
         {"shortest", "fastest", "recommended"}
     assert all(r["segs"] for r in payload["routes"])
+    assert {r["variant"]: r["wrong_way_penalty"] for r in payload["routes"]} \
+        == {"shortest": 1, "fastest": 1, "recommended": 3}
+    stored = json.loads(next(variants_hist.glob("*/summary.json"))
+                        .read_text(encoding="utf-8"))
+    selected = next(r for r in payload["routes"]
+                    if r["variant"] == stored["variant"])
+    assert stored["wrong_way_penalty"] == selected["wrong_way_penalty"], stored
+    assert stored["wrong_way_source"] == selected["wrong_way_source"], stored
     # the top-level outputs describe one of the alternatives
     assert (out_all / "route.csv").exists()
     res = subprocess.run(
@@ -588,6 +693,8 @@ def main():
     check_walk(rows_w, cby, cspec, closed=True)
     assert all(r["against_oneway"] == "" for r in rows_w)
 
+    test_vehicle_preferences()
+
     print("== a pinned start really starts there ==")
     chain = {"A": (-37.845, 144.950), "B": (-37.845, 144.951),
              "C": (-37.845, 144.952)}
@@ -693,7 +800,9 @@ def main():
         "turning across a fast road must cost more than across a slow one"
 
     print("== bad profile / penalty are rejected ==")
-    for bad in (["--profile", "nonsense"], ["--wrong-way-penalty", "0.5"]):
+    for bad in (["--profile", "nonsense"], ["--wrong-way-penalty", "0.5"],
+                ["--wrong-way-penalty", "nan"], ["--wrong-way-penalty", "inf"],
+                ["--vehicle", "nonsense"]):
         res = subprocess.run(
             [sys.executable, str(BASE / "solve_route.py"), "--data",
              str(dc), "--out", str(TMP / "reject2"), *bad],

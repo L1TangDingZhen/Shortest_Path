@@ -331,6 +331,34 @@ VARIANT_ORDER = ["recommended", "fastest", "shortest", "gentle",
                  "with_traffic"]
 SCORE_PROFILE = "edv"      # every variant is measured with this one
 
+# Soft-cost presets only: these do not model access, sidewalk availability
+# or vehicle speeds. No preference is applied until one is requested/saved.
+VEHICLE_WRONG_WAY = {
+    "tricycle": 3.0,
+    "footpath": 1.0,
+    "carriageway": 12.0,
+}
+
+
+def resolve_wrong_way_penalty(explicit, vehicle, saved):
+    """Resolve a single run's preference, retaining its source for reporting."""
+    if explicit is not None:
+        value, source = explicit, "--wrong-way-penalty"
+    elif vehicle is not None:
+        value, source = VEHICLE_WRONG_WAY[vehicle], f"--vehicle {vehicle}"
+    elif saved not in (None, ""):
+        value, source = saved, "endpoints.json"
+    else:
+        value, source = 1.0, "default"
+    error = f"{source}: wrong-way penalty must be a finite number >= 1.0"
+    try:
+        factor = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(error) from None
+    if not math.isfinite(factor) or factor < 1.0:
+        raise ValueError(error)
+    return factor, source
+
 
 def arc_bearings(D, nodes):
     """(bearing leaving, bearing arriving) for every arc."""
@@ -1636,6 +1664,8 @@ def summarise_result(res, nodes, args, profile, control=None):
         "algorithm": res["algorithm"],
         "variant": res["variant"]["name"],
         "label": res["variant"]["label"],
+        "wrong_way_penalty": res["variant"]["wrong_way_penalty"],
+        "wrong_way_source": res["variant"]["wrong_way_source"],
         "total_km": round(total / 1000, 3),
         "deadhead_km": round((total - res["service_len"]) / 1000, 3),
         "time_min": round((riding + turning + waiting) / 60, 1),
@@ -1767,7 +1797,8 @@ def write_comparison(rows, results, nodes, out_dir: Path):
                 for s in res["segments"]]
         routes.append({k: row[k] for k in
                        ("variant", "label", "total_km", "time_min",
-                        "turns_cross", "turns_u", "wrong_way_km")}
+                        "turns_cross", "turns_u", "wrong_way_km",
+                        "wrong_way_penalty", "wrong_way_source")}
                       | {"segs": segs})
     payload = json.dumps({"routes": routes},
                          ensure_ascii=False).replace("</", "<\\/")
@@ -1793,9 +1824,9 @@ def solve_round(variant, nodes, edges, args, profile, profile_name,
     args.wrong_way_penalty = variant["wrong_way_penalty"]
     F, R, D = build_graphs(edges, profile, args.wrong_way_penalty)
     print(f"  speed profile: {profile_name}"
-          + (f", wrong-way penalty x{args.wrong_way_penalty:g}"
-             if args.wrong_way_penalty > 1.0 else "")
           + " -- minimising riding time, reporting real metres")
+    print(f"  wrong-way penalty x{args.wrong_way_penalty:g} "
+          f"({variant['wrong_way_source']}); soft cost only")
     n_service_edges = sum(1 for e in edges if e["service"] > 0)
     if n_service_edges == 0:
         sys.exit("No edges have service 1 or 2 -- nothing to route. "
@@ -1928,16 +1959,23 @@ def main():
                          '{"speeds": {highway: km/h}, "use_maxspeed": '
                          'true, "cap_kmh": 50}. Reported kilometres are '
                          "always real metres.")
+    ap.add_argument("--vehicle", choices=sorted(VEHICLE_WRONG_WAY),
+                    default=None,
+                    help="one-way soft-cost preset: tricycle (x3), "
+                         "footpath (x1), or carriageway (x12). Overrides "
+                         "the saved penalty, but --wrong-way-penalty wins. "
+                         "Without either flag use the saved value or x1. "
+                         "These presets do not enforce access rules or "
+                         "change speeds. Overridden by --variants")
     ap.add_argument("--wrong-way-penalty", type=float, default=None,
                     metavar="FACTOR",
                     help="multiply the cost of riding a one-way street "
-                         "against its direction (1.0 = off, the "
-                         "default; try 3). Only steers deadhead: "
-                         "service passes are mandatory whichever way "
-                         "they are ridden. Needs real oneway data, so "
-                         "extract with --network-type all. Riding the "
-                         "footpath is direction-free, so leave this off "
-                         "unless you ride on the carriageway.")
+                         "against its direction (1.0 = off). This is a "
+                         "soft preference, affecting connector paths and "
+                         "tour direction choices; service coverage remains "
+                         "mandatory. Overrides --vehicle and saved values, "
+                         "but is overridden by --variants. Needs real "
+                         "oneway data, so extract with --network-type all.")
     ap.add_argument("--variants", metavar="NAMES",
                     help="solve several preferences and lay them side "
                          "by side, the way a directions app offers a "
@@ -1945,7 +1983,8 @@ def main():
                          + ", ".join(VARIANT_ORDER) + ". Every option "
                          "covers the same streets; they differ in what "
                          "they treat as expensive. Overrides --profile "
-                         "/ --algorithm / --wrong-way-penalty")
+                         "/ --algorithm / --vehicle / --wrong-way-penalty "
+                         "and saved preferences, with a notice")
     ap.add_argument("--algorithm", default="node",
                     choices=list(ALGORITHMS),
                     help="how paths are found. 'node' (default) is "
@@ -2039,18 +2078,6 @@ def main():
                   f"(set in the editor)")
     if args.profile is None:
         args.profile = ep.get("profile") or DEFAULT_PROFILE
-    if args.wrong_way_penalty is None:
-        try:
-            args.wrong_way_penalty = float(ep.get("wrong_way_penalty") or 1)
-        except (TypeError, ValueError):
-            args.wrong_way_penalty = 1.0
-
-    if args.wrong_way_penalty < 1.0:
-        ap.error("--wrong-way-penalty must be >= 1.0")
-
-    print("Loading network ...")
-    nodes, edges, control = load_data(data_dir)
-    profile_name, profile = load_profile(args.profile)
     if args.variants:
         names = (VARIANT_ORDER if args.variants == "all"
                  else [n.strip() for n in args.variants.split(",")])
@@ -2058,14 +2085,38 @@ def main():
         if unknown:
             ap.error(f"unknown preference(s): {', '.join(unknown)} "
                      f"(have: {', '.join(VARIANT_ORDER)})")
-        chosen_variants = [dict(VARIANTS[n], name=n) for n in names]
+        chosen_variants = [dict(VARIANTS[n], name=n,
+                                wrong_way_source=f"--variants {n}")
+                           for n in names]
+        print("  note: --variants uses preset profiles, algorithms and "
+              "wrong-way penalties; per-run preferences do not override "
+              "presets")
+        overridden = []
+        if args.vehicle is not None:
+            overridden.append("--vehicle")
+        if args.wrong_way_penalty is not None:
+            overridden.append("--wrong-way-penalty")
+        if ep.get("wrong_way_penalty") not in (None, ""):
+            overridden.append("endpoints.json wrong_way_penalty")
+        if overridden:
+            print("  overridden: " + ", ".join(overridden))
     else:
         # no preference asked for: honour the individual flags as given
+        try:
+            args.wrong_way_penalty, penalty_source = resolve_wrong_way_penalty(
+                args.wrong_way_penalty, args.vehicle, ep.get("wrong_way_penalty"))
+        except ValueError as exc:
+            ap.error(str(exc))
+        profile_name, _ = load_profile(args.profile)
         chosen_variants = [{"name": args.algorithm, "label": profile_name,
                             "algorithm": args.algorithm,
                             "profile": args.profile,
                             "wrong_way_penalty": args.wrong_way_penalty,
+                            "wrong_way_source": penalty_source,
                             "turn_weight": 1.0}]
+    print("Loading network ...")
+    nodes, edges, control = load_data(data_dir)
+    profile_name, profile = load_profile(chosen_variants[0]["profile"])
     _, score_profile = load_profile(SCORE_PROFILE)
     results = [solve_round(v, nodes, edges, args, profile, profile_name,
                            control)
@@ -2132,7 +2183,9 @@ def main():
                 "return_to_start": bool(args.return_to_start),
                 "edges_total": len(edges),
                 "profile": profile_name,
-                "wrong_way_penalty": args.wrong_way_penalty,
+                "variant": chosen["variant"]["name"],
+                "wrong_way_penalty": chosen["variant"]["wrong_way_penalty"],
+                "wrong_way_source": chosen["variant"]["wrong_way_source"],
                 "wrong_way_km": round(wrong_km, 3),
                 "time_min": round((riding_s + turning_s + waiting_s) / 60, 1),
                 "waiting_min": round(waiting_s / 60, 1),
