@@ -31,7 +31,7 @@ project evolves — especially the decision log.
 | B15: search over Euler tours (annealing) | **done** — measured at 0.5 min, the lever is exhausted |
 | B6: sort plan (`sort_plan.py`) + printable/phone sheet | **done, tested** (`test_sortplan.py`) — blocked on address data, not code |
 | Street-first construction (`--street-first`) | **done** — off by default, measured slightly worse |
-| E17: both kerbs of a `service=2` street guaranteed (once each way) + `side` column | **done, tested** (in `test_solve.py`) |
+| E17: explicit physical side tasks, independent of travel direction | **done, tested** (`test_delivery.py`, `test_solve.py`) |
 | E18: pinned start / pinned end honoured exactly (T-join parity) | **done, tested** (in `test_solve.py`) |
 | E19: controlled nodes survive OSM simplification | **done, tested** (`test_extract.py`) |
 | E20: reverse arc search keyed its paths by the wrong node | **done, tested** (in `test_solve.py`) |
@@ -46,8 +46,12 @@ A delivery round must traverse a set of streets: some on both sides
 available as shortcuts. Find the shortest closed or open route that
 performs all required traversals.
 
-This is the **Rural Postman Problem** with edge multiplicities. Key
-theory facts that shape the design:
+The base formulation is the **Rural Postman Problem** with edge
+multiplicities. The following exactness results apply to a connected
+undirected graph with symmetric additive costs, not the current full
+directional/turn-aware objective. Physical side tasks enforce coverage;
+they do not turn heuristic optimisation into an exact solver.
+Key theory facts that shape the design:
 
 - It generalises the Chinese Postman Problem (all edges required).
 - RPP is NP-hard **in general**, but when the required edges form one
@@ -67,11 +71,11 @@ Not a TSP: we cover edges, not visit points.
 
 Functional:
 
-- **R1** Cover every service street with its exact multiplicity while
-  minimising total distance; exact optimum whenever required edges are
-  connected.
-- **R2** Territory is defined by an editable per-edge `service` value
-  in {0,1,2,x}, fully independent of administrative boundaries
+- **R1** Cover every required physical side exactly once as service while
+  optimising the configured cost. Directional costs, turn preferences and
+  component bridging are heuristic; coverage is independently validated.
+- **R2** Territory is defined by per-edge `service` in {0,1,2,x} and
+  `delivery` in {none,left,right,both,unspecified}, independent of boundaries
   (`x` = excluded: the edge is dropped from the graph at load and can
   never be routed through, not even as deadhead).
 - **R3** Non-service streets remain usable as deadhead shortcuts.
@@ -112,18 +116,25 @@ Schemas (all CSV utf-8-sig, Excel-friendly; **node ids are strings
 everywhere**):
 
 - `edges.csv`:
-  `edge_id,name,highway,oneway,maxspeed_kmh,length_m,service,note,u,v,geometry_wkt`
+  `edge_id,name,highway,oneway,maxspeed_kmh,length_m,service,note,u,v,geometry_wkt,delivery`
   (`service` ∈ {0,1,2,x}; `oneway` steers nothing by default — the
   model is undirected — but feeds the `against_oneway` flag and the
-  optional `--wrong-way-penalty`, see E13 / B10)
+  optional `--wrong-way-penalty`, see E13 / B10).
+  `delivery=left/right` means one physical side relative to the polyline
+  oriented `u -> v`; use its local tangent, not a north/south split.
+  Closed ways use stored geometry order. `both` requires left and right;
+  `none` is paired with service 0/x; `unspecified` is service 1 awaiting
+  user confirmation. Mismatched service/delivery is an error.
 - `nodes.csv`: `node_id,lat,lon`
 - `route.csv`:
-  `seq,type,street,pass,side,direction,from_cross,to_cross,length_m,cum_km,against_oneway,edge_id`
-  (`side` is the compass point of the kerb that pass delivers — the
-  one on the rider's side of the road — and is empty on deadhead. On a
-  closed way (`u == v`) it is `inner` or `outer` instead, since a ring
-  has no compass direction; empty there means the ring carried no
-  geometry to orient it)
+  `seq,type,street,pass,side,direction,from_cross,to_cross,length_m,cum_km,against_oneway,edge_id,delivery_side,travel_direction,travel_side,counterflow`
+  `delivery_side` is the fixed reference left/right task, never inferred
+  from travel. `travel_direction` is forward/reverse relative to that
+  reference; `travel_side` is the delivered side relative to the rider.
+  These task fields are empty on deadhead. `counterflow=yes` means against
+  the mapped one-way or, for a two-way service task, against the normal
+  traffic flow on that side. It does not imply a legal prohibition.
+  `side` is only a coarse compass display label (`inner`/`outer` on rings).
 - `endpoints.json` may contain `wrong_way_penalty`. For a single solve,
   explicit `--wrong-way-penalty` wins over explicit `--vehicle`, then the
   saved factor, then 1.0. `--variants` uses its named presets instead and
@@ -140,6 +151,23 @@ CLAUDE.md mirrors these contracts for AI sessions — keep it in sync.)
 
 Migration notes:
 
+- 2026-09: Explicit physical side tasks replace the E17 direction repair.
+  Missing `delivery` is inferred as `both` for service 2 and `none` for
+  0/x. Legacy service 1 becomes `unspecified`, **never** zigzag/both.
+  The editor can save pending annotations, but solving requires every
+  one-sided road to be confirmed left or right. Its hover arrow shows
+  the reference, Pending selects unconfirmed roads, and undo/save/export
+  preserve both columns. CSV topology/geometry cannot be changed by Save.
+  Self-loop service without usable geometry is now an input error.
+  `route.csv` appends four fields; regenerate older routes before sorting.
+  Sorting uses local polyline side and along-chain position, then reverses
+  address order when travel reverses. Deadhead and changes of side separate
+  runs. Points exactly on the reference cannot be assigned a side.
+  Export snapshots store oriented geometry and delivery; replay remaps
+  left/right on reference reversal, falling back to unspecified when the
+  reference is ambiguous. Splitting preserves the parent's physical side.
+  History hashes and diffs include delivery, so side-only edits are distinct.
+  Existing real annotations are not automatically rewritten by this change.
 - 2026-09: `--vehicle footpath|tricycle|carriageway` selects a soft-cost
   factor of 1/3/12. No preset is implicit: existing saved factors and the
   no-configuration default of 1 are preserved. Explicit flags override
@@ -163,9 +191,8 @@ Migration notes:
   updated; reading by header name is unaffected.
 - 2026-09: `route.csv` gained `side` (fifth column, after `pass`): the
   compass point of the kerb that pass delivers, empty for deadhead.
-  The two passes of a `service=2` street always carry different values
-  — that is the guarantee, and the column is how it is checked. On a
-  closed way the values are `inner` / `outer`.
+  The authoritative coverage check now uses `delivery_side`, not this
+  display label. On a closed way the display values are `inner` / `outer`.
   Column *index* readers must be updated from `pass` onwards.
 
 ## 4. Edge-case catalogue
@@ -306,33 +333,26 @@ Migration notes:
   are marked on the street line itself. Mixing the two conventions on
   the *same* road double-counts it.
 
-- **E17 Two passes, one kerb.** `service=2` asks for two traversals,
-  and nothing said they had to run in *opposite* directions. An Euler
-  tour is free to leave a street at one end, come back round, and ride
-  it the same way again — which delivers one kerb twice and leaves the
-  other with no mail. It is not rare: on the maintainer's round the
-  `gentle` preference did it to 22 of 95 two-sided streets, precisely
-  because riding the same way again avoids a U-turn. Fixed in three
-  layers: the tour chooser prices it at `SIDE_PENALTY` so the search
-  never spends its budget there, `tour_score` counts it so the local
-  search agrees, and `cover_both_sides()` repairs whatever is left by
-  folding the second pass back on itself. The repair is free — every
-  Euler tour over the same edges is the same length — and it always
-  terminates, because each fold leaves one more street with its passes
-  adjacent and adjacent passes can never run the same way. An
-  assertion at the end of `traverse()` makes it a guarantee rather
-  than a hope. **Closed ways are the exception that proves it.** A loop
-  road or cul-de-sac circle has `u == v`, so "which direction" cannot
-  be read off its endpoints at all — both laps looked identical and the
-  assertion fired. But a closed way returns to the node it left, so
-  both laps cost the same and connect the same: the second one is
-  simply emitted riding the other way round, which is free and always
-  available. Its kerbs are not north and south but the **inside and
-  the outside** of the ring, named from the sign of the enclosed area
-  (anticlockwise where traffic keeps left puts your left hand towards
-  the middle). A ring with no geometry at all has no inside to speak
-  of: the solver warns and leaves `side` empty rather than asserting
-  over data it does not have.
+- **E17 Physical side is not travel direction.** Two traversals alone
+  cannot prove both kerbs were delivered. The former opposite-direction
+  repair also could not represent riding backwards on the same sidewalk.
+  Required graph R now contains a separate `(edge_id, delivery_side)`
+  task for each required physical side, via `delivery.py`. Travel may
+  reverse without changing that task; both sides may be served in the
+  same direction on separate passes. A final multiset check rejects
+  missing, duplicate and unexpected tasks before outputs are written.
+  `service=1` means only the user-selected side and never both.
+  The editor and sorting use the same u->v reference and local polyline
+  tangents. Ring tasks use the stored geometry order and explicit travel
+  direction; shapeless service loops are rejected.
+  `cover_both_sides()` and `SIDE_PENALTY` are removed. The existing factor
+  is a soft counterflow preference for task directions (on two-way roads
+  based on `--traffic-side`, on one-way roads based on mapped flow); it
+  remains one-way-based for deadhead. Default factor and CLI precedence
+  are unchanged. This graph still joins both physical sides at each road
+  node without measured crossing geometry or separate side-switch cost.
+  Explicit sidewalk/crossing states and calibrated costs are future work;
+  no legal vehicle access or globally optimal practical route is claimed.
 - **E18 A pinned endpoint that is not an odd node.** An open walk
   exists exactly when every node has even degree apart from its two
   ends, so the set the matching must repair is the odd nodes with the
@@ -662,9 +682,9 @@ stands, honestly). Option B was not needed.
 - **B6 Per-letterbox sequencing.** *Built 2026-08 as `sort_plan.py`;
   the code works, the Australian data does not.* It attaches every
   address to the nearest edge carrying its street name, splits a
-  two-sided street between its passes by which side the rider is on
-  (left of travel, traffic keeping left), merges consecutive runs on
-  one street, and writes `sort_plan.csv` plus a printable, phone-sized
+  two-sided street between its explicit physical side tasks, orders numbers
+  along the actual travel direction, merges only compatible consecutive
+  runs, and writes `sort_plan.csv` plus a printable, phone-sized
   `sort_plan.html`. **Coverage killed it, not the algorithm**: of 1 923
   OSM addresses in the area only 125 sit on a delivered street, and
   those are its arterials (64, 32 and 14 on the three biggest) — the
@@ -683,7 +703,18 @@ acceptance tests; features merge together with their tests. Extraction
 is the only networked step — keep it thin, and keep everything after
 `edges.csv` testable without internet.
 
+`test_delivery.py` covers side identity under reversed travel and traffic
+handedness, soft direction costs, same-direction passes on different sides,
+diagonal/curved/ring geometry, pending legacy data, immutable editor references,
+split/replay orientation, exact task validation and side-only history changes.
+Browser checks additionally exercise paint, pending selection, bulk edits,
+undo, save/reload and solve/view at desktop and 390/320 px mobile widths.
+
 ## 9. Decision log
+
+Historical decisions below record the model at the time. The final E17 entry
+supersedes the early zigzag interpretation and direction-based coverage check;
+the current contracts above take precedence.
 
 | When | Decision | Why |
 |---|---|---|
@@ -740,3 +771,4 @@ is the only networked step — keep it thin, and keep everything after
 | 2026-09 | Controlled nodes are marked before simplification and protected through it | 58 intersections' worth of waiting time was missing from every route ever solved, and nothing downstream could tell: the nodes were simply not there. Roughly 3% more edges is a cheap price for the numbers being real |
 | 2026-09 | `F` and `D` are built from one shared attribute dict | They had drifted: `kmh` reached `D` only, so every lookup through `F` read `None` and the speed-graded turn cost was inert in the tour chooser. The duplication was the bug; removing it is the fix |
 | 2026-09 | `prepare_round` reports the round's mandatory distance on every apply, and shouts when unmatched edges carry a non-zero default | Re-extracting without `--default-service 0` turns every street the replay cannot match into a delivery street. On the real round that took 18.85 km to 101.53 km with no error and no warning — a five-fold round that looks like a successful replay |
+| 2026-09 | E17 replaced by explicit `delivery` tasks, separate from travel; `service=1` always one side, `2` both | A vehicle may reverse on the same sidewalk. Opposite travel directions do not define physical coverage. The editor requires left/right confirmation for legacy 1s; the solver validates the exact task multiset; sorting, splitting, replay and history preserve that identity. Same-direction passes may serve opposite sides. The opt-in factor now also gives two-way service tasks a soft normal-flow preference. No extra sidewalk crossing geometry, access enforcement or global optimality is claimed. |

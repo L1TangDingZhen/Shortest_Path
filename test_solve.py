@@ -19,11 +19,11 @@ circuit and open modes, and asserts the core invariants:
     turn-aware routing takes 300 m of clear road over 200 m through a
     signal, plain Dijkstra does not
   * searching over Euler tours never changes the distance
-  * a two-sided street is ridden once each way, so both kerbs are
-    delivered -- under every preference, not just the lucky ones
+  * a two-sided street has exactly one service task on each physical
+    side, under every preference, independently of travel direction
   * a closed way (a loop road: one junction, u == v) is ridden one lap
     each way round, inner kerb and outer kerb; with no geometry to
-    orient it the solver says so instead of asserting
+    orient it the solver rejects the input before writing a route
   * a pinned start really starts there, and a pinned end in the middle
     of a street really finishes there
   * the reverse arc search returns a path that starts where its key says
@@ -90,9 +90,10 @@ def write_case(data_dir: Path, disconnect=False):
               encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(["edge_id", "name", "highway", "length_m", "service",
-                    "note", "u", "v", "geometry_wkt"])
+                    "note", "u", "v", "geometry_wkt", "delivery"])
         for eid, nm, u, v, s in edges:
-            w.writerow([eid, nm, "residential", L(u, v), s, "", u, v, ""])
+            w.writerow([eid, nm, "residential", L(u, v), s, "", u, v, "",
+                        {0: "none", 1: "left", 2: "both"}[s]])
     return {eid: s for eid, _, _, _, s in edges}
 
 
@@ -110,14 +111,14 @@ def write_simple(data_dir: Path, nodes, edges):
         w = csv.writer(f)
         w.writerow(["edge_id", "name", "highway", "oneway",
                     "maxspeed_kmh", "length_m", "service", "note",
-                    "u", "v", "geometry_wkt"])
+                    "u", "v", "geometry_wkt", "delivery"])
         for eid, nm, u, v, sv in edges:
             (la, lo), (lb, lo2) = nodes[u], nodes[v]
             m = round((((la - lb) * 111000) ** 2 +
                        ((lo - lo2) * 111000 *
                         math.cos(math.radians(la))) ** 2) ** 0.5, 1)
             w.writerow([eid, nm, "residential", "", "", m, sv, "",
-                        u, v, ""])
+                        u, v, "", {0: "none", 1: "left", 2: "both"}[sv]])
     return {e[0]: (e[2], e[3]) for e in edges}, \
         {e[0]: e[4] for e in edges}
 
@@ -143,11 +144,11 @@ def write_loop_case(data_dir: Path, geometry=True):
         w = csv.writer(f)
         w.writerow(["edge_id", "name", "highway", "oneway",
                     "maxspeed_kmh", "length_m", "service", "note",
-                    "u", "v", "geometry_wkt"])
+                    "u", "v", "geometry_wkt", "delivery"])
         w.writerow(["loop", "Ring Close", "residential", "", "", 377, 2,
-                    "", "J", "J", wkt if geometry else ""])
+                    "", "J", "J", wkt if geometry else "", "both"])
         w.writerow(["stub", "Feeder Street", "residential", "", "", 111,
-                    1, "", "J", "K", ""])
+                    1, "", "J", "K", "", "left"])
     return {"loop": ("J", "J"), "stub": ("J", "K")}, \
         {"loop": 2, "stub": 1}
 
@@ -176,9 +177,10 @@ def write_cost_case(data_dir: Path):
         w = csv.writer(f)
         w.writerow(["edge_id", "name", "highway", "oneway", "maxspeed_kmh",
                     "length_m", "service", "note", "u", "v",
-                    "geometry_wkt"])
+                    "geometry_wkt", "delivery"])
         for eid, nm, hw, ow, ms, ln, sv, u, v in rows:
-            w.writerow([eid, nm, hw, ow, ms, ln, sv, "", u, v, ""])
+            w.writerow([eid, nm, hw, ow, ms, ln, sv, "", u, v, "",
+                        {0: "none", 1: "left", 2: "both"}[sv]])
     return {eid: sv for eid, _, _, _, _, _, sv, _, _ in rows}
 
 
@@ -210,9 +212,10 @@ def write_delay_case(data_dir: Path):
         w = csv.writer(f)
         w.writerow(["edge_id", "name", "highway", "oneway", "maxspeed_kmh",
                     "length_m", "service", "note", "u", "v",
-                    "geometry_wkt"])
+                    "geometry_wkt", "delivery"])
         for eid, nm, hw, ln, sv, u, v in rows:
-            w.writerow([eid, nm, hw, "False", "", ln, sv, "", u, v, ""])
+            w.writerow([eid, nm, hw, "False", "", ln, sv, "", u, v, "",
+                        {0: "none", 1: "left", 2: "both"}[sv]])
     return {eid: sv for eid, _, _, _, sv, _, _ in rows}
 
 
@@ -279,17 +282,13 @@ def check_walk(rows, edges_by_id, service_spec, closed):
     # deadhead may only use existing edges
     for r in rows:
         assert r["edge_id"] in service_spec, f"unknown edge {r['edge_id']}"
-    # 1b. a street delivered on both sides must be ridden once each
-    #     way, or one kerb gets the mail twice and the other never
+    # Each physical side is a distinct task, independent of travel direction.
     sides = defaultdict(list)
     for r in rows:
         if r["type"] == "service" and service_spec.get(r["edge_id"]) == 2:
-            sides[r["edge_id"]].append(r["side"])
+            sides[r["edge_id"]].append(r["delivery_side"])
     for eid, got in sides.items():
-        u, v = edges_by_id[eid]
-        if u == v and got == ["", ""]:
-            continue        # a closed way with no shape: nothing to name
-        assert len(got) == 2 and "" not in got and got[0] != got[1], \
+        assert sorted(got) == ["left", "right"], \
             f"{eid}: both passes deliver the {got[0]} kerb -- " \
             f"the other side of the street gets nothing"
     # 2. continuity: consecutive segments share a node.  route.csv
@@ -758,16 +757,15 @@ def main():
             and r["type"] == "service"]
     assert len(set(ways)) == 2, f"both laps set off {ways[0]}"
 
-    print("== a closed way with no geometry says so, and does not crash ==")
+    print("== a closed way with no geometry requires correction ==")
     bdir = TMP / "loop_bare"
     bby, bspec = write_loop_case(bdir, geometry=False)
     out_b = TMP / "loop_bare_out"
-    stdout = run(bdir, out_b)
-    rows_b = read_route(out_b)
-    check_walk(rows_b, bby, bspec, closed=True)
-    assert "closed way" in stdout and "no geometry" in stdout, stdout
-    assert all(r["side"] == "" for r in rows_b
-               if r["edge_id"] == "loop"), "a shapeless ring has no kerbs"
+    rejected = subprocess.run([sys.executable, str(BASE / "solve_route.py"),
+                               "--data", str(bdir), "--out", str(out_b)],
+                              capture_output=True, text=True)
+    assert rejected.returncode != 0 and "no usable geometry" in rejected.stderr
+    assert not (out_b / "route.csv").exists()
 
     print("== the reverse arc search agrees with its own keys ==")
     sys.path.insert(0, str(BASE))
@@ -775,10 +773,10 @@ def main():
     sn = {"A": (0.0, 0.0), "B": (0.0, 0.001), "C": (0.0, 0.002)}
     se = [dict(edge_id="e1", u="A", v="B", name="Chain Street",
                highway="residential", oneway=False, maxspeed=None,
-               length=100.0, service=1, wkt=""),
+               length=100.0, service=1, delivery="left", wkt=""),
           dict(edge_id="e2", u="B", v="C", name="Chain Street",
                highway="residential", oneway=False, maxspeed=None,
-               length=100.0, service=1, wkt="")]
+               length=100.0, service=1, delivery="left", wkt="")]
     F, R, D = S.build_graphs(se, S.load_profile("distance")[1])
     for kind in ("node", "turn"):
         _, paths = S.route_from(S.make_router(D, sn, kind), ["C"],

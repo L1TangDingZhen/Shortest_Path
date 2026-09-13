@@ -1,9 +1,10 @@
 # Postal Round Route Optimizer
 
-Computes the shortest route that covers every street of a delivery round —
+Optimises a route that covers every required side of a delivery round —
 a real-world instance of the **Rural Postman Problem** (the
 territory-restricted generalisation of the classic Chinese Postman
-Problem), solved exactly, on real OpenStreetMap data.
+Problem), using real OpenStreetMap data. Side coverage is validated;
+the current directional and turn-aware optimisation is heuristic.
 
 Born on a real postal round ridden on an electric delivery vehicle; works
 for any area on Earth that OSM covers — delivery rounds, leaflet drops,
@@ -19,19 +20,25 @@ edges.csv (edited) ──► solve_route.py ──► route.csv      (ordered st
                                           route_map.html  = new sort sequence)
 ```
 
-The single source of truth is the `service` column of `edges.csv`:
+The round is defined by `service` and `delivery` in `edges.csv`:
 
 | value | meaning | traversals |
 |------:|---------|-----------|
-| `2` | I deliver **both sides** of this street (default) | 2 — one per side, guaranteed once each way |
-| `1` | I deliver **one side only**, *or* I zigzag both sides in a single pass | 1 |
+| `2` | I deliver **both sides** of this street (default); `delivery=both` | 2, one task per physical side |
+| `1` | I deliver **one side only**; `delivery=left` or `right` | 1, on that side only |
 | `0` | **Not my street**, but I may ride along it as a shortcut | 0 required (free deadhead) |
 | `x` | **Never use** — steps, unrideable paths, hostile crossings | edge removed from the graph (not even deadhead) |
 
-This one mechanism covers every customisation a real round needs:
-adding/removing streets from your territory, one-side-only boundary
-roads (e.g. divided arterials where you serve a single carriageway), and
-per-street zigzag decisions. Boundaries that cut a street mid-block are
+Left/right follows the fixed **reference arrow from CSV `u` to `v`**,
+using the local polyline direction on curves. It works for diagonal roads
+without using north/south as the definition. Closed ways use their stored
+geometry order. Reversing the vehicle does **not** change the delivery side.
+`1` never means zigzagging across both sides in one pass.
+
+For old files without `delivery`, `2` becomes `both`, `0`/`x` becomes
+`none`, and `1` becomes `unspecified`. Confirm those one-sided roads in the
+editor before solving. No existing one-sided annotation is guessed.
+Boundaries that cut a street mid-block are
 handled by the edge-split utility (see `docs/DEVELOPMENT.md`, SPEC-1).
 
 ## Quick start (demo area)
@@ -43,9 +50,8 @@ pip install -r requirements.txt
 # 1. Extract a demo network (needs internet; ~10 s)
 python extract_network.py --place "Albert Park, Victoria, Australia" --out data
 
-# 2. Open data/preview.html in a browser and data/edges.csv in a
-#    spreadsheet. Edit the service column (sorted by street name, so a
-#    whole street can be set in one block).
+# 2. Edit the territory and confirm physical sides in the browser.
+python make_editor.py --data data --serve
 
 # 3. Solve
 python solve_route.py --data data --out result
@@ -59,12 +65,11 @@ route as an ordered street list — each row gives street, pass number,
 which kerb that pass delivers, compass direction, the cross streets at
 each end, and cumulative distance.
 
-A street marked `2` is always ridden once each way, so its two passes
-deliver opposite kerbs — on a loop road, the inner kerb and the outer
-one. That is enforced, not hoped for: the tour
-chooser prices a repeat of the same direction, the search scores it,
-a repair fixes anything left, and the solver asserts it before writing
-anything out.
+A street marked `2` creates distinct left and right service tasks. Both
+may be ridden in the same direction on different physical sides. Before
+writing a route, the solver checks each required `(edge_id, delivery_side)`
+exactly once and rejects missing, duplicated or unexpected tasks. A service
+loop without usable geometry is rejected because its sides cannot be located.
 
 ## Editing the service column graphically
 
@@ -90,6 +95,13 @@ Type a street name or a road type (`trunk`, `steps`, …) to bulk-set
 all matched segments at once. Live counters show edges per value, mandatory km
 and unsaved changes; undo works across bulk operations.
 
+**Pending** highlights `service=1` roads whose side is not yet known.
+Hover a road to see its reference arrow and Left/Right labels, then choose
+**1 - left of reference arrow** or **1 - right of reference arrow** in
+**click sets** and paint it. Cycling to `1` creates a pending requirement;
+it never silently picks a side. Bulk Left/Right is relative to each edge's
+own arrow, so check orientations before applying it to a whole street.
+
 **Right-click** anywhere on the map to set that point as the round's
 **START** or **END** (or just copy the coordinates). The endpoints are
 stored in `data/endpoints.json`, drawn as markers, and reused on every
@@ -98,18 +110,17 @@ reload; tick *return to start* for a closed tour. Then press
 a new tab. The whole loop stays in the browser; `solve_route.py` picks
 the same endpoints up automatically when run without `--start`/`--end`.
 
-The **cost** dropdown and **wrong-way** factor next to the endpoints
+The **speed** dropdown and **counterflow** factor next to the endpoints
 set the same preferences as `--profile` / `--wrong-way-penalty`; they
 are stored with the endpoints, so the Solve button and a bare
 `solve_route.py` both use them.
 
 **show islands** colours each connected component of your service
-streets separately (with per-island zoom buttons) — one island means
-the solver's optimum is exact; stray extra islands are usually
+streets separately (with per-island zoom buttons); stray extra islands may be
 annotation gaps, easiest to spot and fix right there.
 
 **Save** writes straight back to `data/edges.csv` (all columns
-preserved, only `service` changed; the previous version is kept as
+preserved, only `service` and `delivery` changed; the previous version is kept as
 `edges.csv.bak`) — then just re-run `solve_route.py`. Every page
 reload shows the file as it currently is on disk, so the editor is
 never stale. The server binds localhost only; your round never
@@ -244,6 +255,10 @@ which would turn the comparison into noise.
 One-way streets can carry a soft cost for travelling against the mapped
 direction. Both directions remain available. The penalty affects connector
 paths and tour direction choices; mandatory service coverage is preserved.
+For service on two-way roads the tour also penalises travelling against
+the normal traffic flow on the selected side (`--traffic-side left|right`).
+The factor remains a soft preference, never a ban. It cannot change which
+side a task serves. Connector costs retain the mapped one-way preference.
 `--vehicle` is a shortcut for choosing that cost, not an access or speed model:
 
 | Explicit preset | Penalty factor |
@@ -270,10 +285,19 @@ vehicle may travel, and even `carriageway` does not prohibit a direction.
 `against_oneway`, and the viewer draws those stretches dark red. A cost factor
 is an optimisation preference; it does not multiply the reported riding time.
 
-The existing `side` column is a coarse compass label (for example `NW`) based
-on the oriented geometry's endpoints and the traffic side. It handles diagonal
-streets, but does not describe the local kerb along every bend. Closed ways
-use `inner` and `outer`. Vehicle presets do not change this service model.
+`route.csv` appends four fields: `delivery_side` (fixed reference left/right),
+`travel_direction` (`forward`/`reverse` relative to that reference),
+`travel_side` (delivery side relative to the rider), and `counterflow` (`yes`
+when against the modelled flow). The `side` column remains a coarse compass
+display label (`inner`/`outer` on rings), not the authoritative identity.
+The viewer shows both delivery and travel sides. Regenerate old routes before
+using `sort_plan.py`; it now assigns addresses by local polyline side and
+orders them by travel direction, keeping opposite sides in separate runs.
+
+This is still a road-centreline graph, not a measured sidewalk network:
+switching sides at a junction has no separately modelled crossing geometry,
+and no vehicle access legality is inferred. Explicit sidewalk/crossing states
+and calibrated crossing costs remain future work.
 
 ## Version history — did that edit actually help?
 
@@ -295,6 +319,9 @@ version, with the change in total distance since the previous one.
 `diff` names the streets added to or dropped from the round and the
 resulting distance deltas — so "I marked 19 slivers, did the route get
 shorter?" has an answer instead of a feeling.
+Side-only changes are included in the annotation hash and diff. Export/replay
+also retains the physical side if a new extraction reverses an edge's
+reference; an ambiguous reference is returned to Pending instead of guessed.
 
 Versions live in `round.local/history/<id>/` (gitignored), each with
 `service.csv`, `summary.json`, `route.csv` and a copy of
@@ -319,22 +346,19 @@ traffic or double back. The time deliberately excludes every stop at a
 letterbox — those dominate a real round, so treat it as a way to
 compare two routes, not as a plan for the day.
 
-Among all the routes that cover the same streets the total distance is
-identical, so the solver spends that freedom on comfort: it prefers
-tours with fewer awkward turns and less riding against one-ways
-(`--no-turn-optimisation` turns this off, `--traffic-side` says which
-turn crosses traffic).
+The required service distance stays fixed. The solver explores tours
+with fewer awkward turns and less counterflow, though total distance can
+change when connectors have different paths in each direction
+(`--no-turn-optimisation` turns tour preferences off; `--traffic-side`
+sets traffic handedness, not the physical delivery side).
 
-The mandatory part is the job itself — every service street times its
-multiplicity. The **extra** is the only optimisable quantity, and the
-algorithm guarantees it is minimal **when the service streets form one
-connected piece**. If they do not, the solver bridges the islands with
-a minimum spanning tree, warns, and reports how many kilometres that
-bridging accounts for — that figure is the only part of the answer
-that is not provably minimal. Use the editor's *show islands* view to
-merge stray islands and get back to an exact result; see
-`docs/DEVELOPMENT.md` (E3) for why optimal island connection is a
-harder problem.
+The mandatory distance is the job itself: one traversal per required side.
+Matching gives an exact augmentation only for connected undirected graphs
+with symmetric additive costs. The current directional preferences, turn
+costs and tour search do **not** guarantee a globally shortest or quickest
+route, even with one service island. Disconnected islands add heuristic
+bridging as well. Coverage and walk continuity are checked independently of
+optimisation quality; see `docs/DEVELOPMENT.md` (E3/E17).
 
 `route.csv` doubles as the basis for a new **sort sequence**: mail is
 bundled in row order; a `2/2` pass is the same street's other side.
@@ -343,6 +367,7 @@ bundled in row order; a `2/2` pass is the same street's other side.
 
 ```bash
 python test_solve.py
+python test_delivery.py
 python test_editor.py
 python test_split.py
 python test_prepare.py

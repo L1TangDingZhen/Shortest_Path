@@ -125,9 +125,14 @@ def main():
                  "highway": "residential", "length_m": "50",
                  "service": "0", "u": "n00", "v": "n20",
                  "geometry_wkt": ""}.get(h, "") for h in header})
+    with open(rdir / "service_overrides.csv", newline="",
+              encoding="utf-8-sig") as f:
+        override_header = list(csv.DictReader(f).fieldnames)
     with open(rdir / "service_overrides.csv", "a", newline="",
               encoding="utf-8-sig") as f:
-        csv.writer(f).writerow(["ghost-99", "2", "Ghost Street"])
+        csv.DictWriter(f, fieldnames=override_header).writerow(
+            {"edge_id": "ghost-99", "service": "2", "delivery": "both",
+             "name": "Ghost Street"})
     out = run_prepare(d1, rdir)
     assert "1 edges had no override" in out, out
     assert "could not be placed" in out and "Ghost Street" in out, out

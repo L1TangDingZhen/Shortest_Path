@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a browser-based click-editor for the `service` column.
+"""Generate a browser-based click-editor for service and physical sides.
 
 Reads edges.csv + nodes.csv from --data and writes editor.html next to
 them.  Open it in a browser:
@@ -26,7 +26,7 @@ them.  Open it in a browser:
       shows the route map without touching the command line
     * live counters: edges per service value, mandatory km, unsaved edits
     * Export downloads an updated edges.csv (all columns preserved, only
-      `service` changed) -- replace data/edges.csv with it and re-run
+      `service` and `delivery` changed) -- replace data/edges.csv with it and re-run
       solve_route.py
 
 Two modes:
@@ -58,6 +58,9 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+from delivery import delivery_mode
+from split_edge import oriented_coords
 
 BASE = Path(__file__).parent
 ENDPOINTS = "endpoints.json"
@@ -94,6 +97,8 @@ def load(data_dir: Path):
     with open(data_dir / "edges.csv", newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         header = list(reader.fieldnames)
+        if "delivery" not in header:
+            header.append("delivery")
         for row in reader:
             raw = (row.get("service") or "").strip()
             if raw == "":
@@ -111,14 +116,14 @@ def load(data_dir: Path):
             if service not in (0, 1, 2, "x"):
                 sys.exit(f"edges.csv: service={service} on edge "
                          f"{row['edge_id']} (must be 0, 1, 2 or x)")
-            coords = parse_wkt_linestring(row.get("geometry_wkt") or "")
-            if coords is None:
-                try:
-                    coords = [nodes[row["u"]], nodes[row["v"]]]
-                except KeyError as e:
-                    sys.exit(f"edges.csv: edge {row['edge_id']} has no "
-                             f"geometry and node {e} is not in nodes.csv")
-            edges.append({"row": row, "service": service, "coords": coords})
+            try:
+                mode = delivery_mode(row)
+                coords = oriented_coords(row, nodes)
+            except (ValueError, KeyError) as exc:
+                sys.exit(f"edges.csv: {exc}")
+            row["delivery"] = mode
+            edges.append({"row": row, "service": service, "delivery": mode,
+                          "coords": coords})
     if blank:
         print(f"  note: {blank} edges had a blank service value "
               f"-> shown as 0 (connector only)")
@@ -185,7 +190,9 @@ TEMPLATE = r"""<!DOCTYPE html>
   #panel {
     position: absolute; top: 10px; left: 50px; z-index: 1000;
     background: rgba(255,255,255,.96); border: 1px solid #bbb;
-    border-radius: 6px; padding: 10px 12px; width: 320px;
+    border-radius: 6px; padding: 10px 12px; width: 346px;
+    box-sizing: border-box; max-width: calc(100vw - 60px);
+    max-height: calc(100dvh - 20px); overflow: auto; overflow-wrap: anywhere;
     font: 13px/1.5 system-ui, sans-serif; box-shadow: 0 1px 4px rgba(0,0,0,.2);
   }
   #panel b { font-size: 14px; }
@@ -197,6 +204,10 @@ TEMPLATE = r"""<!DOCTYPE html>
   button:disabled { cursor: default; opacity: .45; }
   #hint { color: #666; margin-top: 6px; }
   #export { font-weight: 600; }
+  select { max-width: 100%; }
+  .ref-label { font: 600 12px/20px system-ui, sans-serif; text-align: center;
+               color: #111; background: rgba(255,255,255,.92); border-radius: 2px; }
+  @media (max-width: 600px) { #panel { max-height: 55dvh; } }
 </style>
 </head>
 <body>
@@ -215,7 +226,8 @@ TEMPLATE = r"""<!DOCTYPE html>
     <select id="paint">
       <option value="cycle">cycle 2&rarr;1&rarr;0</option>
       <option value="2">2 &mdash; both sides</option>
-      <option value="1">1 &mdash; one side</option>
+      <option value="left">1 &mdash; left of reference arrow</option>
+      <option value="right">1 &mdash; right of reference arrow</option>
       <option value="0">0 &mdash; not mine</option>
       <option value="x">x &mdash; never use</option>
     </select>
@@ -225,7 +237,9 @@ TEMPLATE = r"""<!DOCTYPE html>
     <span id="nmatch"></span><br>
     set matched to
     <button id="bulk2">2</button>
-    <button id="bulk1">1</button>
+    <button id="bulk1" title="One side, awaiting left/right confirmation">1 ?</button>
+    <button id="bulkleft">Left</button>
+    <button id="bulkright">Right</button>
     <button id="bulk0">0</button>
     <button id="bulkx">x</button>
   </div>
@@ -233,6 +247,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     <button id="undo">undo</button>
     <button id="export">Export edges.csv</button>
     <span id="dirty"></span> <span id="savemsg"></span>
+    <button id="pending" title="Show one-sided streets awaiting confirmation">Pending <span id="npending">0</span></button>
   </div>
   <div class="row">
     <button id="islands">show islands</button>
@@ -251,8 +266,8 @@ TEMPLATE = r"""<!DOCTYPE html>
       <option value="edv">edv (limit, capped at the vehicle)</option>
       <option value="limits">limits (posted limit as it stands)</option>
     </select>
-    <label title="only useful if you ride on the carriageway">
-      wrong-way &times;<input id="epww" type="number" min="1" step="0.5"
+    <label title="Soft preference against counterflow; both directions remain available">
+      counterflow &times;<input id="epww" type="number" min="1" step="0.5"
         style="width:48px"></label><br>
     <input id="note" placeholder="label this version (optional)"
            style="width:150px">
@@ -300,6 +315,40 @@ L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
    attribution: "&copy; OpenStreetMap contributors &copy; CARTO"}).addTo(map);
 
 const edges = payload.edges;
+const referenceLayer = L.layerGroup().addTo(map);
+function editState(e, value) {
+  if (value && typeof value === "object") return value;
+  if (value === "left" || value === "right") return {service: 1, delivery: value};
+  return {service: value, delivery: value === 2 ? "both" : value === 1
+    ? "unspecified" : "none"};
+}
+function state(e) { return {service: e.service, delivery: e.delivery}; }
+function stateKey(e) { return e.service + ":" + e.delivery; }
+function referenceArrow(e) {
+  referenceLayer.clearLayers();
+  if (!e) return;
+  const pts = e.coords;
+  const j = Math.max(0, Math.floor((pts.length - 1) / 2));
+  const a = map.latLngToLayerPoint(pts[j]), b = map.latLngToLayerPoint(pts[j + 1]);
+  const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy);
+  if (!len) return;
+  const mid = L.point((a.x + b.x) / 2, (a.y + b.y) / 2);
+  const tip = L.point(mid.x + dx / len * 14, mid.y + dy / len * 14);
+  const tail = L.point(mid.x - dx / len * 14, mid.y - dy / len * 14);
+  L.polyline([map.layerPointToLatLng(tail), map.layerPointToLatLng(tip)],
+    {color: "#111", weight: 3, interactive: false}).addTo(referenceLayer);
+  [1, -1].forEach(function (sign) {
+    const wing = L.point(tip.x - dx / len * 8 + sign * dy / len * 6,
+                         tip.y - dy / len * 8 - sign * dx / len * 6);
+    L.polyline([map.layerPointToLatLng(wing), map.layerPointToLatLng(tip)],
+      {color: "#111", weight: 3, interactive: false}).addTo(referenceLayer);
+  });
+  [["Left", dy / len, -dx / len], ["Right", -dy / len, dx / len]].forEach(function (s) {
+    L.marker(map.layerPointToLatLng(L.point(mid.x + s[1] * 32, mid.y + s[2] * 32)),
+      {interactive: false, icon: L.divIcon({className: "ref-label", html: s[0],
+        iconSize: [40, 20], iconAnchor: [20, 10]})}).addTo(referenceLayer);
+  });
+}
 const undoStack = [];
 let matched = new Set();
 let hoverI = -1;
@@ -425,7 +474,7 @@ document.getElementById("islelist").addEventListener("click", function (ev) {
   if (join) {
     const g = gaps[+join.dataset.join];
     const value = streetValue(g);
-    undoStack.push([[g.i, edges[g.i].service, value]]);
+    undoStack.push([[g.i, state(edges[g.i]), value]]);
     apply(g.i, value);
     refresh();
   }
@@ -452,7 +501,7 @@ function styleFor(e, i) {
     return {color: "#b0b7c0", weight: 2 + (hov ? 3 : 0),
             dashArray: "3 6", opacity: 0.45};
   }
-  return {color: hit ? MATCH_COLOR : COLORS[e.service],
+  return {color: hit ? MATCH_COLOR : e.delivery === "unspecified" ? "#c026d3" : COLORS[e.service],
           weight: WEIGHTS[e.service] + (hit ? 2 : 0) + (hov ? 3 : 0),
           dashArray: DASH[e.service],
           opacity: hov ? 1
@@ -461,7 +510,7 @@ function styleFor(e, i) {
 function tip(e) {
   const r = e.row;
   return "<b>" + esc(r.name || "(unnamed)") + "</b> &mdash; service " +
-         e.service + "<br>" + esc(r.highway || "") + " &middot; " +
+         e.service + " / " + esc(e.delivery) + "<br>" + esc(r.highway || "") + " &middot; " +
          esc(r.length_m || "?") + " m &middot; id " + esc(r.edge_id);
 }
 
@@ -470,7 +519,7 @@ function clickEdge(i, domEvent) {
   const paint = document.getElementById("paint").value;
   let next;
   if (paint !== "cycle") {
-    next = paint === "x" ? "x" : +paint;      // painting a fixed value
+    next = ["x", "left", "right"].includes(paint) ? paint : +paint;
   } else if (domEvent.shiftKey) {
     next = e.service === "x" ? 0 : "x";       // toggle "never use"
   } else if (domEvent.ctrlKey || domEvent.metaKey) {
@@ -480,14 +529,14 @@ function clickEdge(i, domEvent) {
   } else {
     next = (e.service + 2) % 3;
   }
-  if (next === e.service) return;
-  undoStack.push([[i, e.service, next]]);
+  if (stateKey(editState(e, next)) === stateKey(e)) return;
+  undoStack.push([[i, state(e), next]]);
   apply(i, next);
   refresh();
 }
 
 edges.forEach(function (e, i) {
-  e.baseline = e.service;
+  e.baseline = stateKey(e);
   e.layer = L.polyline(e.coords,
     Object.assign({interactive: false}, styleFor(e, i))).addTo(map);
 });
@@ -500,7 +549,10 @@ map.fitBounds(L.featureGroup(edges.map(e => e.layer)).getBounds());
 // and captioned, and a click changes exactly that edge.
 const SNAP_PX = 20;
 let screenPts = null;
-map.on("zoomend", function () { screenPts = null; });
+map.on("zoomend", function () {
+  screenPts = null;
+  referenceArrow(hoverI >= 0 ? edges[hoverI] : null);
+});
 function ensurePts() {
   if (screenPts) return;
   screenPts = edges.map(function (e) {
@@ -535,6 +587,7 @@ function setHover(i, latlng) {
   if (i === hoverI) return;
   const prev = hoverI;
   hoverI = i;
+  referenceArrow(i >= 0 ? edges[i] : null);
   if (prev >= 0) edges[prev].layer.setStyle(styleFor(edges[prev], prev));
   if (i >= 0) {
     edges[i].layer.setStyle(styleFor(edges[i], i));
@@ -553,7 +606,10 @@ map.on("mouseout", function () { setHover(-1, null); });
 map.on("click", function (ev) {
   const i = nearestEdge(
     map.containerPointToLayerPoint(ev.containerPoint), SNAP_PX);
-  if (i >= 0) clickEdge(i, ev.originalEvent);
+  if (i >= 0) {
+    setHover(i, ev.latlng);
+    clickEdge(i, ev.originalEvent);
+  }
 });
 
 // right-click anywhere: set the round's start/end, or copy the point
@@ -691,7 +747,7 @@ document.getElementById("solve").onclick = async function () {
           "  make_editor.py --data data --serve");
     return;
   }
-  if (edges.some(e => e.service !== e.baseline)) {
+  if (edges.some(e => stateKey(e) !== e.baseline)) {
     if (!confirm("You have unsaved edits. Solve the SAVED version?")) return;
   }
   const msg = document.getElementById("solvemsg");
@@ -720,7 +776,7 @@ document.getElementById("solve").onclick = async function () {
 
 function apply(i, svc) {
   const e = edges[i];
-  e.service = svc;
+  Object.assign(e, editState(e, svc));
   e.layer.setStyle(styleFor(e, i));
   if (i === hoverI) hoverTip.setContent(tip(e));
 }
@@ -731,7 +787,7 @@ function refresh() {
     n[e.service] += 1;
     km += (parseFloat(e.row.length_m) || 0) *
           (e.service === "x" ? 0 : e.service);
-    if (e.service !== e.baseline) dirty += 1;
+    if (stateKey(e) !== e.baseline) dirty += 1;
   });
   document.getElementById("stats").innerHTML =
     edges.length + " edges &middot; mandatory <b>" +
@@ -747,7 +803,8 @@ function refresh() {
     renderIslandList();
   }
   document.getElementById("undo").disabled = !undoStack.length;
-  ["bulk2", "bulk1", "bulk0", "bulkx"].forEach(function (id) {
+  document.getElementById("npending").textContent = edges.filter(e => e.delivery === "unspecified").length;
+  ["bulk2", "bulk1", "bulkleft", "bulkright", "bulk0", "bulkx"].forEach(function (id) {
     document.getElementById(id).disabled = !matched.size;
   });
 }
@@ -770,7 +827,8 @@ document.getElementById("search").addEventListener("input", function () {
 function bulk(svc) {
   const acts = [];
   matched.forEach(function (i) {
-    if (edges[i].service !== svc) acts.push([i, edges[i].service, svc]);
+    if (stateKey(editState(edges[i], svc)) !== stateKey(edges[i]))
+      acts.push([i, state(edges[i]), svc]);
   });
   if (!acts.length) return;
   undoStack.push(acts);
@@ -779,6 +837,16 @@ function bulk(svc) {
 }
 document.getElementById("bulk2").onclick = function () { bulk(2); };
 document.getElementById("bulk1").onclick = function () { bulk(1); };
+document.getElementById("bulkleft").onclick = function () { bulk("left"); };
+document.getElementById("bulkright").onclick = function () { bulk("right"); };
+document.getElementById("pending").onclick = function () {
+  document.getElementById("search").value = "";
+  matched = new Set(edges.map((e, i) => e.delivery === "unspecified" ? i : -1).filter(i => i >= 0));
+  document.getElementById("nmatch").textContent = matched.size + " pending";
+  edges.forEach((e, i) => e.layer.setStyle(styleFor(e, i)));
+  if (matched.size) map.fitBounds(L.featureGroup([...matched].map(i => edges[i].layer)).getBounds().pad(0.15));
+  refresh();
+};
 document.getElementById("bulk0").onclick = function () { bulk(0); };
 document.getElementById("bulkx").onclick = function () { bulk("x"); };
 
@@ -797,7 +865,7 @@ function buildCsv() {
   const lines = [payload.header.map(quote).join(",")];
   edges.forEach(function (e) {
     lines.push(payload.header.map(function (h) {
-      return quote(h === "service" ? e.service : e.row[h]);
+      return quote(h === "service" ? e.service : h === "delivery" ? e.delivery : e.row[h]);
     }).join(","));
   });
   return "\ufeff" + lines.join("\r\n") + "\r\n";
@@ -832,7 +900,7 @@ async function exportCsv() {
   } else {
     download(text);
   }
-  edges.forEach(function (e) { e.baseline = e.service; });
+  edges.forEach(function (e) { e.baseline = stateKey(e); });
   refresh();
   document.getElementById("savemsg").textContent =
     (SERVE ? "saved " : "exported ") + new Date().toLocaleTimeString();
@@ -847,7 +915,7 @@ function download(text) {
 document.getElementById("export").onclick = exportCsv;
 
 window.addEventListener("beforeunload", function (ev) {
-  if (edges.some(e => e.service !== e.baseline)) ev.preventDefault();
+  if (edges.some(e => stateKey(e) !== e.baseline)) ev.preventDefault();
 });
 
 drawEndpoints();
@@ -878,9 +946,9 @@ def summarise(edges):
 
 def save_csv(data_dir: Path, text: str) -> str:
     """Validate an edited edges.csv posted by the browser and write it
-    back atomically.  Only `service` may change: header, edge_ids and
+    back atomically. Only `service` and `delivery` may change: edge_ids and
     row order must match the file on disk.  Raises ValueError."""
-    reader = csv.DictReader(io.StringIO(text))
+    reader = csv.DictReader(io.StringIO(text.lstrip("\ufeff")))
     new_header = list(reader.fieldnames or [])
     rows = list(reader)
 
@@ -888,23 +956,29 @@ def save_csv(data_dir: Path, text: str) -> str:
               encoding="utf-8-sig") as f:
         cur = csv.DictReader(f)
         cur_header = list(cur.fieldnames)
-        cur_ids = [r["edge_id"] for r in cur]
+        cur_rows = list(cur)
+        cur_ids = [r["edge_id"] for r in cur_rows]
 
-    if new_header != cur_header:
+    upgraded_header = cur_header if "delivery" in cur_header else cur_header + ["delivery"]
+    if new_header not in (cur_header, upgraded_header):
         raise ValueError("header mismatch -- refusing to save")
     if [r["edge_id"] for r in rows] != cur_ids:
         raise ValueError("edge_id list mismatch -- refusing to save "
                          "(edges.csv changed on disk? reload the page)")
-    for r in rows:
+    for r, old in zip(rows, cur_rows):
         if (r.get("service") or "").strip().lower() not in \
                 ("0", "1", "2", "x"):
             raise ValueError(f"bad service value on edge {r['edge_id']}")
+        for key in cur_header:
+            if key not in ("service", "delivery") and r.get(key) != old.get(key):
+                raise ValueError(f"{key} changed on edge {r['edge_id']}; reload the editor")
+        r["delivery"] = delivery_mode(r)
 
     target = data_dir / "edges.csv"
     shutil.copy2(target, data_dir / "edges.csv.bak")
     tmp = data_dir / "edges.csv.tmp"
     with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=cur_header)
+        w = csv.DictWriter(f, fieldnames=upgraded_header)
         w.writeheader()
         w.writerows(rows)
     os.replace(tmp, target)

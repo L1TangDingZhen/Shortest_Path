@@ -98,16 +98,19 @@ def read_annotation(data_dir: Path):
     """The round definition: every edge that is not a plain connector.
     Returns (rows, short hash of the whole annotation)."""
     rows = []
+    from delivery import delivery_mode
     with open(data_dir / "edges.csv", newline="",
               encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             service = (r.get("service") or "").strip().lower()
             if service in ("1", "2", "x"):
                 rows.append({"edge_id": r["edge_id"], "service": service,
+                             "delivery": delivery_mode(r),
                              "name": r.get("name") or "",
                              "length_m": r.get("length_m") or "0"})
     rows.sort(key=lambda r: r["edge_id"])
-    blob = "\n".join(f'{r["edge_id"]}={r["service"]}' for r in rows)
+    blob = json.dumps([(r["edge_id"], r["service"], r["delivery"])
+                       for r in rows], separators=(",", ":"))
     return rows, hashlib.sha1(blob.encode()).hexdigest()[:8]
 
 
@@ -163,7 +166,7 @@ def record(history_dir: Path, data_dir: Path, summary: dict,
 
     with open(version_dir / "service.csv", "w", newline="",
               encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=["edge_id", "service", "name",
+        w = csv.DictWriter(f, fieldnames=["edge_id", "service", "delivery", "name",
                                           "length_m"])
         w.writeheader()
         w.writerows(rows)
@@ -273,7 +276,8 @@ def cmd_diff(history_dir: Path, args):
     added = [e for k, e in new.items() if k not in old]
     removed = [e for k, e in old.items() if k not in new]
     changed = [(old[k], e) for k, e in new.items()
-               if k in old and old[k]["service"] != e["service"]]
+               if k in old and (old[k]["service"], old[k].get("delivery", ""))
+               != (e["service"], e.get("delivery", ""))]
 
     def metres(rows, key=lambda r: r):
         return sum(float(key(r)["length_m"]) for r in rows)
@@ -294,6 +298,7 @@ def cmd_diff(history_dir: Path, args):
                            key=lambda p: -float(p[1]["length_m"]))[:8]:
             print(f"   ~ {b['name'][:30]:32s} "
                   f"{a['service']} -> {b['service']}  "
+                  f"{a.get('delivery', 'unspecified')} -> {b.get('delivery', 'unspecified')}  "
                   f"{float(b['length_m']):.0f} m")
         if len(changed) > 8:
             print(f"     ... and {len(changed) - 8} more")

@@ -20,13 +20,11 @@ How a number is attached to a pass:
     name, within --tolerance metres -- the name is what makes this
     reliable, since a point 15 m away on the next street over would
     otherwise win;
-  * for a street delivered on both sides, the two passes split by side.
-    Traffic keeps left, so a pass serves what lies to the LEFT of the
-    direction it is ridden. That is the footpath you are on;
-  * for a street delivered once, the pass serves everything on it --
-    one pass, both sides, however you choose to zigzag;
-  * consecutive runs on the same street are merged, because the sorter
-    cares about the street, not the segment.
+  * each pass serves its explicit delivery_side, relative to the edge's
+    fixed u->v geometry, even when the rider travels backwards;
+  * service=1 serves only its selected side, never both;
+  * consecutive runs merge only when street, side and travel orientation
+    agree; deadhead always separates runs.
 
 Coverage is whatever OSM has: the plan reports how many numbers it
 found, and a run with none simply shows a dash.
@@ -35,16 +33,15 @@ found, and a run with none simply shows a dash.
 import argparse
 import csv
 import html
-import math
 import re
 import sys
 from collections import defaultdict
 from pathlib import Path
 
-from solve_route import kerb_side, segment_coords
+from delivery import delivery_mode, point_side, validate_coverage
+from split_edge import oriented_coords
 
 TOLERANCE_M = 25.0
-MLAT = 110540.0
 
 
 def load_route(result_dir: Path):
@@ -106,19 +103,6 @@ def describe(numbers):
     return f"{side}{ordered[0]}-{ordered[-1]} ({len(ordered)})"
 
 
-def point_to_segment(p, a, b, mlon):
-    """(distance in metres, which side) of p relative to a->b."""
-    ax, ay = (a[1] - p[1]) * mlon, (a[0] - p[0]) * MLAT
-    bx, by = (b[1] - p[1]) * mlon, (b[0] - p[0]) * MLAT
-    dx, dy = bx - ax, by - ay
-    length2 = dx * dx + dy * dy
-    t = 0.0 if length2 == 0 else max(0.0, min(1.0,
-                                              -(ax * dx + ay * dy) / length2))
-    near = math.hypot(ax + t * dx, ay + t * dy)
-    cross = dx * (-ay) - dy * (-ax)      # >0: p lies left of a->b
-    return near, ("left" if cross > 0 else "right")
-
-
 def attach_addresses(addresses, edges, nodes, tolerance):
     """{edge_id: [(number, side relative to u->v)]}"""
     by_street = defaultdict(list)
@@ -126,43 +110,34 @@ def attach_addresses(addresses, edges, nodes, tolerance):
         by_street[norm_street(e["name"])].append(e)
     if not addresses:
         return {}, 0
-    mlon = 111320.0 * math.cos(math.radians(addresses[0]["lat"]))
+    chains = {e["edge_id"]: oriented_coords(e, nodes)
+              for group in by_street.values() for e in group}
 
     attached, placed = defaultdict(list), 0
     for a in addresses:
         best = None
         for e in by_street.get(norm_street(a["street"]), ()):
-            try:
-                u, v = nodes[e["u"]], nodes[e["v"]]
-            except KeyError:
-                continue
-            distance, side = point_to_segment((a["lat"], a["lon"]), u, v,
-                                              mlon)
+            distance, side, along = point_side(chains[e["edge_id"]],
+                                                (a["lat"], a["lon"]))
             if distance <= tolerance and (best is None or distance < best[0]):
-                best = (distance, e["edge_id"], side)
-        if best:
-            attached[best[1]].append((a["number"], best[2]))
+                best = (distance, e["edge_id"], side, along)
+        # Keep non-service edges in the nearest-edge search: a nearby
+        # delivered segment must not absorb their out-of-round addresses.
+        if (best and best[2] and
+                delivery_mode(edges[best[1]]) in ("both", best[2])):
+            attached[best[1]].append((best[3], a["number"], best[2]))
             placed += 1
-    return attached, placed
+    return {eid: [(number, side) for _, number, side in sorted(items)]
+            for eid, items in attached.items()}, placed
 
 
 def traversal_directions(route, edges, nodes):
-    """True where a row was ridden u->v.
-
-    route.csv names the kerb each pass delivered, and the kerb is what
-    fixes the direction: riding u->v where traffic keeps left serves
-    the side 90 degrees to its left. Reading it per row beats chaining
-    the whole walk, which had to guess the first row's direction and
-    fell back to calling every pass u->v when the chain broke -- which
-    put a whole round's mail on one side of every street."""
+    """Read travel direction without inferring it from the delivered kerb."""
     forward = []
     for r in route:
-        e = edges[r["edge_id"]]
-        seg = {"wkt": e.get("geometry_wkt") or "",
-               "u": e["u"], "v": e["v"]}
-        uv = kerb_side(segment_coords(seg, nodes),
-                       closed=e["u"] == e["v"])
-        forward.append(not r.get("side") or r["side"] == uv)
+        if r["type"] == "service" and r.get("travel_direction") not in ("forward", "reverse"):
+            raise ValueError("route.csv has no explicit travel direction; regenerate the route")
+        forward.append(r.get("travel_direction") == "forward")
     return forward
 
 
@@ -170,17 +145,19 @@ def build_runs(route, edges, nodes, attached):
     """One row per continuous delivery run, with the numbers it serves."""
     runs = []
     forward = traversal_directions(route, edges, nodes)
+    validate_coverage(edges.values(), [dict(row, kind=row["type"]) for row in route])
+    previous = None
     for row, travelled_uv in zip(route, forward):
         if row["type"] != "service":
+            previous = None
             continue
-        edge = edges[row["edge_id"]]
-        passes = int(edge["service"]) if edge["service"].isdigit() else 1
-        # traffic keeps left, so a pass serves the side it is riding on:
-        # left of u->v, which is right of v->u
-        wanted = "left" if travelled_uv else "right"
+        wanted = row["delivery_side"]
         numbers = [n for n, side in attached.get(row["edge_id"], ())
-                   if passes == 1 or side == wanted]
-        if runs and runs[-1]["street"] == row["street"]:
+                   if side == wanted]
+        if not travelled_uv:
+            numbers.reverse()
+        key = (row["street"], wanted, travelled_uv, row["direction"], row.get("side"))
+        if runs and previous == key:
             runs[-1]["numbers"] += numbers
             runs[-1]["metres"] += float(row["length_m"])
             runs[-1]["to_cross"] = row["to_cross"]
@@ -188,10 +165,12 @@ def build_runs(route, edges, nodes, attached):
         else:
             runs.append({"seq": len(runs) + 1, "street": row["street"],
                          "pass": row["pass"], "direction": row["direction"],
+                         "delivery_side": wanted, "side": row.get("side", wanted),
                          "from_cross": row["from_cross"],
                          "to_cross": row["to_cross"],
                          "metres": float(row["length_m"]),
                          "cum_km": row["cum_km"], "numbers": list(numbers)})
+        previous = key
     return runs
 
 
@@ -229,11 +208,12 @@ def write_sheet(runs, path, summary):
         numbers = describe(r["numbers"])
         rows.append(
             "<li><span class='street'>{street}</span> "
-            "<span class='meta'>pass {p} &middot; {d} &middot; "
+            "<span class='meta'>pass {p} &middot; {side} kerb &middot; {d} &middot; "
             "{m:.0f} m &middot; {km} km</span><br>"
             "<span class='{cls}'>{nums}</span> "
             "<span class='meta'>{a} &rarr; {b}</span></li>".format(
                 street=html.escape(r["street"]), p=html.escape(r["pass"]),
+                side=html.escape(r["side"]),
                 d=html.escape(r["direction"]), m=r["metres"],
                 km=r["cum_km"], nums=html.escape(numbers),
                 cls="nums" if r["numbers"] else "none",
@@ -259,24 +239,28 @@ def main():
     addresses = load_addresses(data_dir)
     attached, placed = attach_addresses(addresses, edges, nodes,
                                         args.tolerance)
-    runs = build_runs(route, edges, nodes, attached)
+    try:
+        runs = build_runs(route, edges, nodes, attached)
+    except ValueError as exc:
+        sys.exit(str(exc))
 
     with_numbers = sum(1 for r in runs if r["numbers"])
     total = sum(len(r["numbers"]) for r in runs)
     summary = (f"{len(runs)} delivery runs, {total} house numbers on "
                f"{with_numbers} of them. {placed} of {len(addresses)} "
-               f"addresses in the area sit on a street of this round.")
+               f"addresses in the area have a locatable side on this round.")
 
     csv_path = result_dir / "sort_plan.csv"
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(["seq", "street", "pass", "direction", "from_cross",
-                    "to_cross", "length_m", "cum_km", "houses", "count"])
+                    "to_cross", "length_m", "cum_km", "houses", "count",
+                    "delivery_side", "side"])
         for r in runs:
             w.writerow([r["seq"], r["street"], r["pass"], r["direction"],
                         r["from_cross"], r["to_cross"], round(r["metres"], 1),
                         r["cum_km"], describe(r["numbers"]),
-                        len(r["numbers"])])
+                        len(r["numbers"]), r["delivery_side"], r["side"]])
     sheet = result_dir / "sort_plan.html"
     write_sheet(runs, sheet, summary)
     print(f"{summary}\n  {csv_path}\n  {sheet}")

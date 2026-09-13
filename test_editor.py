@@ -154,6 +154,8 @@ def edit_csv_text(path, edge_id, new_service):
     for r in rows:
         if r["edge_id"] == edge_id:
             r["service"] = str(new_service)
+            if "delivery" in header:
+                r["delivery"] = {"0": "none", "1": "left", "2": "both", "x": "none"}.get(str(new_service), "")
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=header, lineterminator="\r\n")
     w.writeheader()

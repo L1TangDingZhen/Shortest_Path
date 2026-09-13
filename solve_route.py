@@ -5,8 +5,7 @@ Input:  a data directory containing edges.csv and nodes.csv produced by
         extract_network.py, AFTER you have edited the `service` column:
 
             2 = I deliver both sides  -> street must be traversed twice
-            1 = I deliver one side only (or I zigzag both sides in a
-                single pass)          -> street traversed once
+            1 = I deliver one side only, selected by delivery=left/right
             0 = not my street, but I may ride along it (connector)
             x = never use this edge   -> removed from the network
                 entirely (not even as a deadhead shortcut)
@@ -18,12 +17,13 @@ Output: route.csv       ordered traversal list -- the basis for the new
                         highlighted with a direction arrow
         console summary service km vs total km vs extra (deadhead) km
 
-Algorithm (4 phases -- exact optimum, not a heuristic, whenever the
-service streets form one connected piece):
+Algorithm (4 phases; matching is exact for a connected undirected graph
+with symmetric additive costs, but directional/turn preferences and
+auto-bridging make the current full objective heuristic):
 
   Phase 1  Build the full network F (all edges, including service=0)
-           and the required multigraph R (each edge repeated `service`
-           times).  F is the world you can ride through; R is the work
+           and the required multigraph R (one task per required physical
+           delivery side). F is the world you can ride through; R is the work
            you must do.
 
   Phase 2  Parity repair.  A single continuous route can only exist if
@@ -73,10 +73,9 @@ import networkx as nx
 
 from round_history import DEFAULT_HISTORY
 
-try:
-    from shapely import wkt as shapely_wkt
-except ImportError:  # geometry is optional; straight lines still work
-    shapely_wkt = None
+from delivery import (counterflow, delivery_mode, tasks_for, travel_side,
+                      validate_coverage)
+from split_edge import oriented_coords
 
 
 # ----------------------------------------------------------------------
@@ -94,7 +93,7 @@ def load_data(data_dir: Path):
                 control[row["node_id"]] = (
                     kind, (row.get("control_group") or "").strip())
 
-    edges, blank_service, excluded = [], 0, 0
+    edges, blank_service, excluded, pending = [], 0, 0, 0
     with open(data_dir / "edges.csv", newline="", encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
             raw = (row.get("service") or "").strip()
@@ -114,6 +113,17 @@ def load_data(data_dir: Path):
             if service not in (0, 1, 2):
                 sys.exit(f"edges.csv: service={service} on edge "
                          f"{row['edge_id']} (must be 0, 1, 2 or x)")
+            try:
+                mode = delivery_mode(row)
+            except ValueError as exc:
+                sys.exit(f"edges.csv: {exc}")
+            pending += mode == "unspecified"
+            if service and row["u"] == row["v"]:
+                coords = oriented_coords(row, nodes)
+                if len(set(coords)) < 3:
+                    sys.exit("edges.csv: a service loop has no usable geometry; "
+                             "its delivery sides cannot be located. Add its "
+                             "geometry before solving.")
             edges.append({
                 "edge_id": row["edge_id"],
                 "u": row["u"],
@@ -126,6 +136,7 @@ def load_data(data_dir: Path):
                 if (row.get("maxspeed_kmh") or "").strip() else None,
                 "length": float(row["length_m"]),
                 "service": service,
+                "delivery": mode,
                 "wkt": row.get("geometry_wkt") or "",
             })
     if blank_service:
@@ -134,6 +145,10 @@ def load_data(data_dir: Path):
     if excluded:
         print(f"  note: {excluded} edges excluded (service=x) -> the "
               f"route will never use them, not even as shortcuts")
+    if pending:
+        sys.exit(f"{pending} one-sided edge(s) have unspecified delivery. "
+                 "Set delivery=left or right in the editor before solving. "
+                 "service=1 always means one side, never both.")
     return nodes, edges, control
 
 
@@ -259,17 +274,17 @@ def build_graphs(edges, profile=None, wrong_way=1.0):
         # (`kmh` reached D only, and every lookup through F read None).
         common = dict(length=e["length"], name=e["name"], wkt=e["wkt"],
                       highway=e["highway"], oneway=e["oneway"],
-                      maxspeed=e["maxspeed"], kmh=kmh)
+                      maxspeed=e["maxspeed"], kmh=kmh, cu=e["u"], cv=e["v"])
         F.add_edge(e["u"], e["v"], key=e["edge_id"],
-                   service=e["service"], cu=e["u"], cv=e["v"], **common)
+                   service=e["service"], delivery=delivery_mode(e, True), **common)
         D.add_edge(e["u"], e["v"], key=e["edge_id"], cost=cost,
                    against=False, **common)
         D.add_edge(e["v"], e["u"], key=e["edge_id"],
                    cost=cost * wrong_way if e["oneway"] else cost,
                    against=e["oneway"], **common)
-        for p in range(1, e["service"] + 1):
+        for p, side in enumerate(tasks_for(delivery_mode(e, True)), 1):
             R.add_edge(e["u"], e["v"], key=f'{e["edge_id"]}|p{p}',
-                       base=e["edge_id"], length=e["length"])
+                       base=e["edge_id"], length=e["length"], delivery_side=side)
     return F, R, D
 
 
@@ -733,13 +748,6 @@ WRONG_WAY_TOUR_WEIGHT = 0.5   # seconds per metre, per unit of penalty
 # distance, because every Euler tour is the same length.
 PAIR_SECONDS = 30.0
 
-# Riding a two-sided street the same way twice delivers one side twice
-# and leaves the other undelivered, so it is not a matter of taste. The
-# penalty is large enough to outrank any turn, and a repair afterwards
-# makes the guarantee absolute -- this only stops the search wasting
-# its budget on tours the repair would have to undo.
-SIDE_PENALTY = 900.0
-
 
 def turn_kind(bearing_in, bearing_out, traffic_side="left"):
     """straight / easy / cross / u. The `cross` turn is the one that
@@ -767,29 +775,24 @@ def ring_area(chain):
                for (y1, x1), (y2, x2) in zip(chain, chain[1:]))
 
 
-def kerb_side(chain, traffic_side="left", closed=False):
-    """Which kerb you deliver riding along `chain`.
+def kerb_side(chain, reference_side="left", closed=False):
+    """Coarse label for a side of the fixed reference chain, not travel.
 
-    It is the one on your side of the road, so the answer flips with
-    the direction of travel -- which is what makes it a check that both
-    sides of a street were actually served.
-
-    A closed way (a loop road, a cul-de-sac circle) starts and finishes
-    at the same junction, so it has no compass direction and its two
-    kerbs are not north and south but the inside and the outside of the
-    ring. Ride it anticlockwise where traffic keeps left and your left
-    hand is towards the middle."""
+    Curves use the endpoint bearing only for this display
+    label; the local polyline tangent defines the physical delivery side.
+    A closed way's left side is inside an anticlockwise ring.
+    """
     if closed:
         area = ring_area(chain) if len(chain) > 2 else 0.0
         if not area:
             return ""            # a loop with no shape: nothing to name
         anticlockwise = area > 0
-        inner = anticlockwise if traffic_side == "left" else not anticlockwise
+        inner = anticlockwise if reference_side == "left" else not anticlockwise
         return "inner" if inner else "outer"
     run = bearing_of(chain[0], chain[-1]) if len(chain) > 1 else None
     if run is None:
         return ""
-    return WINDS[round((run + (-90 if traffic_side == "left" else 90))
+    return WINDS[round((run + (-90 if reference_side == "left" else 90))
                        / 45) % 8]
 
 
@@ -800,13 +803,15 @@ def bearing_of(a, b):
             b[0] - a[0])) % 360)
 
 
-def tour_meta(R, F, D, nodes):
+def tour_meta(R, F, D, nodes, traffic_side="left"):
     """Per required-edge geometry facts the tour chooser needs: the
-    bearing leaving u, the bearing arriving at v, and how many metres
-    of that direction run against a one-way."""
+    bearing leaving u, the bearing arriving at v, and direction costs.
+    Service costs follow the task's physical side, independently of travel.
+    """
     meta = {}
     blank = {"out": None, "in": None, "against_m": 0.0}
     for u, v, key, data in R.edges(keys=True, data=True):
+        loop_reverse = False
         if "base" not in data and "paths" not in data:
             meta[key] = {u: blank, v: blank}   # the virtual end->start
             continue
@@ -819,17 +824,30 @@ def tour_meta(R, F, D, nodes):
                 against[start] = sum(D[x][y][k]["length"]
                                      for x, y, k in arcs
                                      if D[x][y][k]["against"])
+            direction_cost = against
         else:
             edata = F[u][v][data["base"]]
             chain = segment_coords({"wkt": edata["wkt"], "u": u, "v": v},
                                    nodes)
             chains = {u: chain, v: list(reversed(chain))}
+            if u == v:
+                # A self-loop has no endpoint direction. Keep an explicit
+                # orientation per task, preferring the mapped traffic flow.
+                loop_reverse = (not edata["oneway"] and
+                                data["delivery_side"] != traffic_side)
+                chains = {u: list(reversed(chain)) if loop_reverse else chain}
             wrong = edata["length"] if edata["oneway"] else 0.0
             against = {u: 0.0 if not edata["oneway"] or u == edata["cu"]
                        else wrong,
                        v: 0.0 if not edata["oneway"] or v == edata["cu"]
                        else wrong}
+            direction_cost = {
+                start: edata["length"] if counterflow(
+                    data["delivery_side"], not loop_reverse if u == v
+                    else start == edata["cu"], edata["oneway"], traffic_side)
+                else 0.0 for start in chains}
         info = {"base": data.get("base"),
+                "loop_reverse": loop_reverse,
                 "street": (F[u][v][data["base"]]["name"]
                            if "base" in data else None),
                 "kmh": (F[u][v][data["base"]].get("kmh")
@@ -841,6 +859,7 @@ def tour_meta(R, F, D, nodes):
                 "in": bearing_of(chain[-2], chain[-1]) if len(chain) > 1
                 else None,
                 "against_m": against.get(start, 0.0),
+                "direction_cost_m": direction_cost.get(start, 0.0),
             }
         meta[key] = info
     return meta
@@ -853,29 +872,19 @@ def euler_tour(R, source, meta, traffic_side="left", optimise=True,
     one-way streets backwards, and by finishing a two-sided street
     while you are on it. Returns [(u, v, key), ...].
 
-    The choice never changes the tour's length -- see the note above --
-    so this is pure gain; with optimise=False the first available edge
-    is taken, which is what an unguided Euler tour does."""
+    The service work is fixed, but directional connector paths can differ.
+    With optimise=False the first available edge is taken.
+    """
     adj = defaultdict(list)
     for u, v, key in R.edges(keys=True):
         adj[u].append((v, key))
         if u != v:
             adj[v].append((u, key))
     used = set()
-    ridden_from = {}                 # key -> the node it was left from
-    sibling = {}                     # the other pass of the same street
-    by_base = defaultdict(list)
-    for _, _, key in R.edges(keys=True):
-        base = meta.get(key, {}).get("base")
-        if base:
-            by_base[base].append(key)
-    for keys in by_base.values():
-        if len(keys) == 2:
-            sibling[keys[0]], sibling[keys[1]] = keys[1], keys[0]
     wrong_weight = max(0.0, wrong_way_penalty - 1.0) * WRONG_WAY_TOUR_WEIGHT
 
     def run_against(node, key):
-        """Metres against a one-way committed to by taking `key` from
+        """Counterflow metres committed to by taking `key` from
         `node`: most nodes have degree 2 and offer no further choice,
         so entering a chain the wrong way commits to all of it. Judging
         only the first edge is what made the tour prefer to slide into
@@ -883,7 +892,7 @@ def euler_tour(R, source, meta, traffic_side="left", optimise=True,
         total, seen = 0.0, set()
         while key is not None and key not in seen:
             seen.add(key)
-            total += meta.get(key, {}).get(node, {}).get("against_m", 0.0)
+            total += meta.get(key, {}).get(node, {}).get("direction_cost_m", 0.0)
             nxt = next((n for n, k in adj[node] if k == key), None)
             if nxt is None or len(adj[nxt]) != 2:
                 break
@@ -913,9 +922,6 @@ def euler_tour(R, source, meta, traffic_side="left", optimise=True,
                 street = meta.get(key, {}).get("street")
                 if street and meta.get(prev_key, {}).get("street") == street:
                     score -= STREET_CONTINUE_SECONDS   # finish the street
-            other = sibling.get(key)
-            if other is not None and ridden_from.get(other) == node:
-                score += SIDE_PENALTY    # that would be the same kerb
             if pair_passes and prev_key is not None:
                 base = meta.get(key, {}).get("base")
                 if base and meta.get(prev_key, {}).get("base") == base:
@@ -936,7 +942,6 @@ def euler_tour(R, source, meta, traffic_side="left", optimise=True,
         else:
             _, nbr, key = picked
             used.add(key)
-            ridden_from[key] = node
             stack.append((nbr, key,
                           meta.get(key, {}).get(node, {}).get("in")))
     out.reverse()
@@ -980,7 +985,6 @@ def tour_score(euler, meta, control, traffic_side, names,
     absent on purpose -- it is the same for every tour."""
     turn = delay = wrong = 0.0
     runs = 0
-    tails = defaultdict(list)
     previous_in = previous_node = last_street = None
     for u, v, key in euler:
         info = meta.get(key, {})
@@ -991,10 +995,9 @@ def tour_score(euler, meta, control, traffic_side, names,
                 info.get("kmh"))
         if control and previous_node is not None:
             delay += node_delay(control, previous_node, u)
-        wrong += side.get("against_m", 0.0)
+        wrong += side.get("direction_cost_m", 0.0)
         base = info.get("base")
         if base:
-            tails[base].append(u)
             street = names.get(base)
             if street != last_street:
                 runs += 1
@@ -1002,10 +1005,7 @@ def tour_score(euler, meta, control, traffic_side, names,
         if side.get("in") is not None:
             previous_in = side["in"]
         previous_node = u
-    same_side = sum(1 for t in tails.values()
-                    if len(t) == 2 and t[0] == t[1])
-    return (turn + delay + wrong_weight * wrong + run_weight * runs
-            + SIDE_PENALTY * same_side)
+    return turn + delay + wrong_weight * wrong + run_weight * runs
 
 
 def local_search_tour(euler, meta, control, traffic_side, names,
@@ -1067,60 +1067,6 @@ def local_search_tour(euler, meta, control, traffic_side, names,
     return kept, before, best_score
 
 
-def cover_both_sides(euler, R):
-    """Make every two-sided street be ridden once each way, so that each
-    of its kerbs is actually delivered.
-
-    Two passes in the SAME direction (u->v twice) serve the left-hand
-    kerb twice and never touch the other one. That is not a preference
-    to be traded against turn comfort -- it is half the street missed --
-    so this runs on every tour, whatever the preference.
-
-    The fix is local and always legal: ride the second pass back
-    immediately, then take the walk that used to sit between them in
-    reverse.
-
-        ... E(u->v)  W(v..u)  E(u->v)  S(v..)
-        ... E(u->v)  E(v->u)  W'(u..v) S(v..)
-
-    Same edges, same length, and the walk still chains -- the repair
-    is free, which is why it can be unconditional. Passes that already
-    run opposite ways are left where they are.
-
-    It terminates: every fold leaves one more street with its two
-    passes adjacent, reversing a block preserves the adjacencies inside
-    it, and adjacent passes can never run the same way (the first ends
-    where the second begins), so no street is ever folded twice."""
-    moved = 0
-    changed = True
-    while changed:
-        changed = False
-        at = defaultdict(list)
-        for i, (u, v, key) in enumerate(euler):
-            base = R[u][v][key].get("base")
-            if base:
-                at[base].append(i)
-        for positions in at.values():
-            if len(positions) != 2:
-                continue
-            i, j = positions
-            if j == i + 1:
-                continue
-            (au, av, _), (bu, bv, bk) = euler[i], euler[j]
-            if au == av:
-                continue         # a closed way: both laps start here,
-                                 # and which way round is decided later
-            if (au, av) != (bu, bv):
-                continue                     # opposite directions
-            euler[i + 1:j + 1] = ([(bv, bu, bk)] +
-                                  [(y, x, k) for x, y, k in
-                                   reversed(euler[i + 1:j])])
-            moved += 1
-            changed = True
-            break
-    return moved
-
-
 def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None,
              traffic_side="left", optimise_tour=True,
              wrong_way_penalty=1.0, pair_passes=False, control=None,
@@ -1132,7 +1078,7 @@ def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None,
     The circuit is rotated so the virtual edge would be last, the edge
     is dropped, and the walk is oriented to begin at pin_start -- what
     remains is the open route start -> ... -> end."""
-    meta = tour_meta(R, F, D, nodes)
+    meta = tour_meta(R, F, D, nodes, traffic_side)
     if endpoints:
         source = endpoints[0]
         assert nx.has_eulerian_path(R, source=source), \
@@ -1171,22 +1117,6 @@ def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None,
                   f"{(before - after) / 60:.1f} min of turning, waiting "
                   f"and re-visits removed at no extra distance")
 
-    # Last, so nothing downstream can undo it.
-    head = euler[:1] if pin_start is not None else []
-    body = euler[len(head):]
-    folded = cover_both_sides(body, R)
-    euler = head + body
-    if folded:
-        print(f"  both sides: {folded} street(s) were being ridden the "
-              f"same way twice; the second pass now comes straight back")
-    two_way = defaultdict(list)
-    for u, v, key in euler:
-        base = R[u][v][key].get("base")
-        if base and u != v:      # a closed way is handled when emitted
-            two_way[base].append(u)
-    assert not [b for b, t in two_way.items() if len(t) == 2
-                and t[0] == t[1]], "a two-sided street is missing a kerb"
-
     if pin_start is not None:
         assert euler[0][2] == VIRTUAL_KEY, "virtual edge must be first"
         finish = euler[0][0]           # the virtual edge runs end->start
@@ -1215,19 +1145,25 @@ def traverse(F, R, D, nodes, endpoints, start_node, pin_start=None,
             edata = F[u][v][base]
             passes_seen[base] += 1
             total = edata["service"]
-            # A closed way returns to the node it left, so both laps
-            # cost the same and connect the same -- which means the
-            # second one is free to go round the other way, and has to,
-            # or the inner kerb never gets any mail.
-            segments.append(dict(reverse=u == v and passes_seen[base] == 2,
+            reverse = meta[key]["loop_reverse"] if u == v else False
+            forward = not reverse if u == v else u == edata["cu"]
+            side = data["delivery_side"]
+            reference = segment_coords({"u": edata["cu"], "v": edata["cv"],
+                                        "wkt": edata["wkt"]}, nodes)
+            segments.append(dict(reverse=reverse,
                                  kind="service", edge_id=base,
+                                 delivery_side=side,
+                                 travel_direction="forward" if forward else "reverse",
+                                 travel_side=travel_side(side, forward),
+                                 counterflow=counterflow(side, forward,
+                                                         edata["oneway"], traffic_side),
+                                 side=kerb_side(reference, side, closed=u == v) or side,
                                  u=u, v=v, name=edata["name"],
                                  length=edata["length"], wkt=edata["wkt"],
                                  pass_label=f"{passes_seen[base]}/{total}",
                                  highway=edata["highway"],
                                  maxspeed=edata["maxspeed"],
-                                 against=bool(edata["oneway"])
-                                 and u != edata["cu"]))
+                                 against=bool(edata["oneway"]) and not forward))
     return segments
 
 
@@ -1248,22 +1184,11 @@ def annotate_turns(segments, nodes, traffic_side="left", profile=None,
                                  profile) if profile else None)
         s["wait_s"] = (node_delay(control, s["u"], s["v"])
                        if control else 0.0)
-        # The kerb you deliver is the one on your side of the road, so
-        # naming it by compass point says which physical side of the
-        # street got the mail on this pass -- and makes it checkable.
-        s["side"] = ("" if s["kind"] != "service"
-                     else kerb_side(chain, traffic_side,
-                                    closed=s["u"] == s["v"]))
+        if s["kind"] != "service":
+            s["side"] = ""
         if i:
             counts[s["turn"]] += 1
         previous = into if into is not None else previous
-    blind = {s["edge_id"] for s in segments
-             if s["kind"] == "service" and s["pass_label"].endswith("/2")
-             and not s["side"]}
-    if blind:
-        print(f"  warning: {len(blind)} closed way(s) carry no geometry, "
-              f"so which kerb each lap delivers cannot be worked out. "
-              f"Ride one lap each way round.")
     return counts
 
 
@@ -1280,7 +1205,7 @@ def operational_metrics(segments):
     both = [v for v in at.values() if len(v) == 2]
     paired = sum(1 for v in both if v[1] - v[0] == 1)
     kerbs = sum(1 for v in both
-                if service[v[0]].get("side") != service[v[1]].get("side"))
+                if {service[i].get("delivery_side") for i in v} == {"left", "right"})
 
     runs, streets = 0, set()
     previous = None
@@ -1346,23 +1271,8 @@ def segment_coords(seg, nodes):
     if seg.get("reverse"):
         return list(reversed(segment_coords(dict(seg, reverse=False),
                                             nodes)))
-    if seg["wkt"] and shapely_wkt is not None:
-        try:
-            line = shapely_wkt.loads(seg["wkt"])
-            pts = [(y, x) for x, y in line.coords]
-            # orient to travel direction
-            if nodes[seg["u"]] and _closer(pts[-1], nodes[seg["u"]], pts[0]):
-                pts = list(reversed(pts))
-            return pts
-        except Exception:
-            pass
-    return [nodes[seg["u"]], nodes[seg["v"]]]
-
-
-def _closer(p, target, other):
-    d1 = (p[0] - target[0]) ** 2 + (p[1] - target[1]) ** 2
-    d2 = (other[0] - target[0]) ** 2 + (other[1] - target[1]) ** 2
-    return d1 < d2
+    return oriented_coords({"u": seg["u"], "v": seg["v"],
+                            "geometry_wkt": seg["wkt"]}, nodes)
 
 
 def travel_label(seg, nodes):
@@ -1382,7 +1292,8 @@ def write_route_csv(segments, F, nodes, out_dir: Path):
         w = csv.writer(f)
         w.writerow(["seq", "type", "street", "pass", "side",
                     "direction", "from_cross", "to_cross", "length_m",
-                    "cum_km", "against_oneway", "edge_id"])
+                    "cum_km", "against_oneway", "edge_id", "delivery_side",
+                    "travel_direction", "travel_side", "counterflow"])
         for i, s in enumerate(segments, 1):
             cum += s["length"]
             w.writerow([
@@ -1392,6 +1303,8 @@ def write_route_csv(segments, F, nodes, out_dir: Path):
                 cross_streets(F, s["v"], s["name"]),
                 round(s["length"], 1), round(cum / 1000, 3),
                 "yes" if s.get("against") else "", s["edge_id"],
+                s.get("delivery_side", ""), s.get("travel_direction", ""),
+                s.get("travel_side", ""), "yes" if s.get("counterflow") else "",
             ])
     return path
 
@@ -1410,7 +1323,9 @@ ROUTE_TEMPLATE = r"""<!DOCTYPE html>
   #panel {
     position: absolute; top: 10px; left: 50px; z-index: 1000;
     background: rgba(255,255,255,.96); border: 1px solid #bbb;
-    border-radius: 6px; padding: 10px 12px; width: 340px;
+    border-radius: 6px; padding: 10px 12px; width: 366px;
+    box-sizing: border-box; max-width: calc(100vw - 60px);
+    max-height: calc(100dvh - 20px); overflow: auto; overflow-wrap: anywhere;
     font: 13px/1.5 system-ui, sans-serif; box-shadow: 0 1px 4px rgba(0,0,0,.2);
   }
   #panel b { font-size: 14px; }
@@ -1467,7 +1382,7 @@ function esc(s) {
 
 const UNVISITED = {color: "#b8c2cc", weight: 2, opacity: 0.55};
 function visitedStyle(s) {
-  if (s.w) {  // travelled against a one-way: ride the footpath here
+  if (s.w) {  // against mapped flow; this is not an access ruling
     return {color: "#7b341e", weight: s.k === "s" ? 5 : 4, opacity: 1,
             dashArray: "2 4"};
   }
@@ -1479,7 +1394,7 @@ function visitedStyle(s) {
 const lines = S.map(function (s, i) {
   const pl = L.polyline(s.c, UNVISITED).addTo(map);
   pl.bindTooltip("#" + (i + 1) + " " + esc(s.n) + " &middot; " +
-    (s.k === "s" ? "pass " + esc(s.p) : "deadhead") +
+    (s.k === "s" ? "pass " + esc(s.p) + " &middot; " + serviceSide(s) : "deadhead") +
     " &middot; " + s.l + " m" +
     (s.w ? " &middot; <b>against the one-way</b>" : ""), {sticky: true});
   return pl;
@@ -1518,7 +1433,7 @@ document.getElementById("totals").innerHTML =
    "m</b> (excludes stops) &middot; " + nCross + " crossing turns, " +
    nU + " U-turns" : "") +
   (wrongKm > 0 ? '<br><span style="color:#7b341e">' + wrongKm.toFixed(2) +
-   " km against a one-way (use the footpath)</span>" : "");
+   " km against a mapped one-way</span>" : "");
 
 function arrowAngle(c) {
   const a = c[c.length - 2], b = c[c.length - 1];
@@ -1526,6 +1441,11 @@ function arrowAngle(c) {
   const dx = (b[1] - a[1]) *
     Math.cos((a[0] + b[0]) / 2 * Math.PI / 180);
   return Math.atan2(dx, dy) * 180 / Math.PI;
+}
+
+function serviceSide(s) {
+  return "deliver <b>" + esc(s.ds) + "</b> of reference (" + esc(s.side) +
+    "); <b>" + esc(s.ts) + "</b> while riding " + esc(s.td);
 }
 
 let cur = 1;
@@ -1549,12 +1469,13 @@ function setStep(k) {
   document.getElementById("info").innerHTML =
     "<b>#" + cur + "/" + N + "</b> &middot; " + esc(s.n) + "<br>" +
     (s.k === "s" ? "service pass " + esc(s.p) : "deadhead (connector)") +
+    (s.k === "s" ? "<br>" + serviceSide(s) : "") +
     " &middot; " + s.l + " m &middot; heading " + s.dir +
     " &middot; cum " + s.cum.toFixed(3) + " km" +
     (s.t === "cross" ? " &middot; <b>turn across traffic</b>"
      : s.t === "u" ? " &middot; <b>U-turn</b>" : "") +
-    (s.w ? '<br><span style="color:#7b341e"><b>against the one-way</b>'
-         + " &mdash; ride the footpath here</span>" : "");
+    (s.cf ? "<br><b>counterflow</b>" : "") +
+    (s.w ? '<br><span style="color:#7b341e"><b>against the mapped one-way</b></span>' : "");
   slider.value = cur;
   if (document.getElementById("follow").checked) map.panTo(end);
 }
@@ -1607,9 +1528,14 @@ def write_map(segments, nodes, out_dir: Path, time_min=0.0):
             "n": s["name"],
             "k": "s" if s["kind"] == "service" else "d",
             "p": s["pass_label"],
+            "ds": s.get("delivery_side", ""),
+            "side": s.get("side", ""),
+            "td": s.get("travel_direction", ""),
+            "ts": s.get("travel_side", ""),
+            "cf": bool(s.get("counterflow")),
             "l": round(s["length"], 1),
             "cum": round(cum / 1000, 3),
-            "dir": bearing_label(nodes[s["u"]], nodes[s["v"]]),
+            "dir": travel_label(s, nodes),
             "w": 1 if s.get("against") else 0,
             "t": s.get("turn", "straight"),
             "c": [[round(lat, 6), round(lon, 6)] for lat, lon in coords],
@@ -1915,8 +1841,12 @@ def solve_round(variant, nodes, edges, args, profile, profile_name,
                   f"back to the start")
             kind += " + return to start"
 
+    try:
+        coverage = validate_coverage(edges, segments)
+    except ValueError as exc:
+        sys.exit(str(exc))
     return {
-        "variant": variant, "algorithm": algorithm,
+        "coverage": coverage, "variant": variant, "algorithm": algorithm,
         "segments": segments, "F": F, "kind": kind,
         "profile_name": profile_name, "profile": profile,
         "bridges": bridges, "bridge_len": bridge_len,
@@ -1961,7 +1891,7 @@ def main():
                          "always real metres.")
     ap.add_argument("--vehicle", choices=sorted(VEHICLE_WRONG_WAY),
                     default=None,
-                    help="one-way soft-cost preset: tricycle (x3), "
+                    help="counterflow soft-cost preset: tricycle (x3), "
                          "footpath (x1), or carriageway (x12). Overrides "
                          "the saved penalty, but --wrong-way-penalty wins. "
                          "Without either flag use the saved value or x1. "
@@ -1971,8 +1901,10 @@ def main():
                     metavar="FACTOR",
                     help="multiply the cost of riding a one-way street "
                          "against its direction (1.0 = off). This is a "
-                         "soft preference, affecting connector paths and "
-                         "tour direction choices; service coverage remains "
+                         "soft preference; service tasks also prefer the "
+                         "normal traffic direction on their selected side "
+                         "of two-way streets. Affects connector paths and "
+                         "tour choices; service coverage remains "
                          "mandatory. Overrides --vehicle and saved values, "
                          "but is overridden by --variants. Needs real "
                          "oneway data, so extract with --network-type all.")
@@ -2176,6 +2108,7 @@ def main():
                 "bridge_km": round(bridge_len / 1000, 3),
                 "segments_service": sum(1 for s in segments
                                         if s["kind"] == "service"),
+                "delivery_sides_covered": chosen["coverage"],
                 "segments_deadhead": sum(1 for s in segments
                                          if s["kind"] == "deadhead"),
                 "start": args.start or "",
@@ -2214,7 +2147,7 @@ Turns                    : {turns['cross']} crossing + {turns['u']} U-turn + \
 {turns['easy']} easy + {turns['straight']} straight
 Against a one-way        : {wrong_km:7.2f} km   (ride the footpath there)
 Both kerbs delivered     : {ops['both_sides']}/{ops['two_sided']}   \
-(two-sided streets ridden once each way -- guaranteed)
+(independent left/right service tasks -- verified)
 Both sides back to back  : {ops['paired_pct']:6.1f}%   \
 (when paired, one bundle each in the sort frame)
 Street runs              : {ops['street_runs']:7d}   \

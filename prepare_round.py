@@ -2,15 +2,17 @@
 """Make a round reproducible after re-extraction (B1).
 
 Re-running extract_network.py regenerates edges.csv and silently wipes
-every hand-edited `service` value and every edge split (E8).  This tool
+every hand-edited service/side requirement and every edge split (E8). This tool
 keeps the annotation in two small declarative files inside the
 gitignored round directory and replays them onto a fresh extraction:
 
-    round.local/service_overrides.csv   edge_id,service,name,highway,
+    round.local/service_overrides.csv   edge_id,service,delivery,name,highway,
                                         length_m,geometry_wkt
         -- the complete annotation snapshot.  Annotated rows (service
            1/2/x) also carry road type and geometry, so an edge whose
-           id changed can still be found by where it is on the ground
+           id changed can still be found by where it is on the ground.
+           Geometry is oriented u->v, so left/right survives reference
+           reversal on re-extraction; ambiguous matches become unspecified.
     round.local/splits.csv              at_lat,at_lon,edge_id
         -- every split point, replayed via split_edge.py in order
            (parents before children, so nested splits compose)
@@ -53,7 +55,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from split_edge import parse_wkt_linestring, project_onto_chain
+from split_edge import (oriented_coords, parse_wkt_linestring,
+                        project_onto_chain, to_wkt)
+from delivery import delivery_mode, remap_side
 
 BASE = Path(__file__).parent
 NOTE_RE = re.compile(r"split from (\S+) at (-?[0-9.]+),(-?[0-9.]+)")
@@ -133,10 +137,12 @@ def geometric_fallback(rows, stale, nodes):
                 continue
             if all(project_onto_chain(coords, p)[0] <= GEOM_TOL_M
                    for p in pts):
-                hits.append(row["edge_id"])
+                mode = remap_side(old["delivery"], coords,
+                                  oriented_coords(row, nodes))
+                hits.append((row["edge_id"], mode))
         if hits:
-            for eid in hits:
-                claims.setdefault(eid, set()).add(old["service"])
+            for eid, mode in hits:
+                claims.setdefault(eid, set()).add((old["service"], mode))
         else:
             unplaced.append(old)
 
@@ -144,10 +150,10 @@ def geometric_fallback(rows, stale, nodes):
     for eid, values in claims.items():
         if len(values) > 1:
             print(f"  warning: {eid} lies under several old edges with "
-                  f"different values ({', '.join(sorted(values))}) -- "
+                  f"different service sides ({sorted(values)}) -- "
                   f"left at the extraction default, set it by hand")
             continue
-        by_id[eid]["service"] = values.pop()
+        by_id[eid]["service"], by_id[eid]["delivery"] = values.pop()
         applied += 1
     return applied, unplaced
 
@@ -160,24 +166,21 @@ def export(data_dir: Path, round_dir: Path):
     ov_path = round_dir / "service_overrides.csv"
     with open(ov_path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["edge_id", "service", "name", "highway", "length_m",
+        w.writerow(["edge_id", "service", "delivery", "name", "highway", "length_m",
                     "geometry_wkt"])
         for r in rows:
             service = (r.get("service") or "").strip()
             if service.lower() in ("1", "2", "x"):
                 # annotated: keep enough to re-find it geometrically
-                wkt = r.get("geometry_wkt") or ""
-                if not wkt:
-                    try:
-                        (ay, ax), (by, bx) = nodes[r["u"]], nodes[r["v"]]
-                        wkt = f"LINESTRING ({ax} {ay}, {bx} {by})"
-                    except KeyError:
-                        wkt = ""
+                try:
+                    wkt = to_wkt(oriented_coords(r, nodes))
+                except KeyError:
+                    wkt = ""
                 extra = [r.get("highway") or "", r.get("length_m") or "",
                          wkt]
             else:
                 extra = ["", "", ""]
-            w.writerow([r["edge_id"], service, r.get("name") or "",
+            w.writerow([r["edge_id"], service, delivery_mode(r), r.get("name") or "",
                         *extra])
 
     splits = {}
@@ -246,6 +249,7 @@ def apply(data_dir: Path, round_dir: Path):
             detail[row["edge_id"]] = {
                 "edge_id": row["edge_id"],
                 "service": (row.get("service") or "").strip(),
+                "delivery": delivery_mode(row),
                 "name": row.get("name") or "",
                 "highway": row.get("highway") or "",
                 "length_m": row.get("length_m") or "",
@@ -258,13 +262,22 @@ def apply(data_dir: Path, round_dir: Path):
                    if (r.get("service") or "").strip() in ("1", "2")) / 1000
 
     header, rows = read_edges(data_dir)
+    if "delivery" not in header:
+        header.append("delivery")
+    nodes = read_nodes(data_dir)
     applied = 0
     applied_ids = set()
     for r in rows:
         if r["edge_id"] in overrides:
             r["service"] = overrides.pop(r["edge_id"])
+            old = detail[r["edge_id"]]
+            r["delivery"] = remap_side(
+                old["delivery"], parse_wkt_linestring(old["geometry_wkt"]),
+                oriented_coords(r, nodes))
             applied_ids.add(r["edge_id"])
             applied += 1
+        else:
+            r["delivery"] = delivery_mode(r)
     fresh = len(rows) - applied
 
     # Whatever is left is stale: its id vanished (a different
@@ -274,12 +287,12 @@ def apply(data_dir: Path, round_dir: Path):
                        if detail.get(eid, {}).get("service", "").lower()
                        in ("1", "2", "x")]
     stale_plain = len(overrides) - len(stale_annotated)
-    was = {id(r): r["service"] for r in rows}
+    was = {id(r): (r["service"], r["delivery"]) for r in rows}
     regained, unplaced = geometric_fallback(
         rows, stale_annotated, read_nodes(data_dir))
     # a row the geometry fallback re-annotated is not a new street
     applied_ids |= {r["edge_id"] for r in rows
-                    if r["service"] != was[id(r)]}
+                    if (r["service"], r["delivery"]) != was[id(r)]}
     applied += regained
     with open(data_dir / "edges.csv", "w", newline="",
               encoding="utf-8-sig") as f:
@@ -294,6 +307,9 @@ def apply(data_dir: Path, round_dir: Path):
               f"{data_dir / 'endpoints.json'}")
 
     print(f"\nRound is {mandatory_km(rows):.2f} km of mandatory riding.")
+    pending = sum(r["delivery"] == "unspecified" for r in rows)
+    if pending:
+        print(f"{pending} one-sided edge(s) need left/right confirmation in the editor.")
     print(f"Applied {applied} service overrides"
           + (f", replayed {n_split} split(s)" if n_split else "")
           + (f", {n_split_failed} split(s) FAILED" if n_split_failed

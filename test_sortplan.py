@@ -2,9 +2,8 @@
 """Offline tests for sort_plan.py (no internet, synthetic addresses).
 
 A street delivered on both sides must split its numbers between the two
-passes -- the side you are riding on, which under left-hand traffic is
-the left of the direction travelled. A street delivered once takes them
-all. Addresses belonging to a different street must never be attached
+passes using their explicit physical side. A street delivered once takes
+only its chosen side, regardless of travel direction. Addresses on another street must never be attached
 just because they are close.
 
 Run:  python test_sortplan.py
@@ -57,12 +56,12 @@ def write_route(result_dir: Path):
         w = csv.writer(f)
         w.writerow(["seq", "type", "street", "pass", "side", "direction",
                     "from_cross", "to_cross", "length_m", "cum_km",
-                    "against_oneway", "edge_id"])
+                    "against_oneway", "edge_id", "delivery_side", "travel_direction"])
         # traffic keeps left: heading E you deliver the north kerb
         w.writerow([1, "service", "Main Street", "1/2", "N", "E",
-                    "(dead end)", "(dead end)", 270, 0.27, "", "main"])
+                    "(dead end)", "(dead end)", 270, 0.27, "", "main", "left", "forward"])
         w.writerow([2, "service", "Main Street", "2/2", "S", "W",
-                    "(dead end)", "(dead end)", 270, 0.54, "", "main"])
+                    "(dead end)", "(dead end)", 270, 0.54, "", "main", "right", "reverse"])
 
 
 def main():
@@ -80,15 +79,15 @@ def main():
     with open(result / "sort_plan.csv", newline="",
               encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
-    # consecutive runs on one street merge: the sorter wants the street
-    assert len(rows) == 1, rows
+    # The two kerbs stay separately labelled in the sort sheet.
+    assert len(rows) == 2, rows
     assert rows[0]["street"] == "Main Street"
-    assert int(rows[0]["count"]) == 6, rows[0]
+    assert [int(r["count"]) for r in rows] == [3, 3], rows
 
     print("== the decoy on another street is never attached ==")
     assert "99" not in rows[0]["houses"], rows[0]["houses"]
 
-    print("== each pass takes the side it rides on ==")
+    print("== each pass takes its explicitly required side ==")
     # split the two passes apart to see them individually
     import sort_plan
     edges = sort_plan.load_edges(data)
@@ -102,7 +101,7 @@ def main():
     left = sorted(n for n, side in attached["main"] if side == "left")
     assert left == ["1", "3", "5"], left      # north of W->E is left
 
-    # direction comes from the kerb each pass delivered, row by row:
+    # Direction is explicit, not inferred from the delivered kerb:
     # out along W->E, back along E->W
     route = sort_plan.load_route(result)
     assert [r["side"] for r in route] == ["N", "S"], \
@@ -111,10 +110,10 @@ def main():
         [True, False]
     # so the two passes together cover both sides exactly once
     runs = sort_plan.build_runs(route, edges, nodes, attached)
-    assert sorted(runs[0]["numbers"], key=int) == \
-        ["1", "2", "3", "4", "5", "6"], runs[0]["numbers"]
+    assert runs[0]["numbers"] == ["1", "3", "5"]
+    assert runs[1]["numbers"] == ["6", "4", "2"]
     describe = sort_plan.describe(runs[0]["numbers"])
-    assert describe.startswith("1-6"), describe
+    assert describe.startswith("odd 1-5"), describe
 
     print("== the sheet is written and readable ==")
     sheet = (result / "sort_plan.html").read_text(encoding="utf-8")

@@ -58,6 +58,8 @@ def set_service(data_dir, edge_id, value):
     for r in rows:
         if r["edge_id"] == edge_id:
             r["service"] = str(value)
+            if "delivery" in header:
+                r["delivery"] = {"0": "none", "1": "left", "2": "both", "x": "none"}.get(str(value), "")
     with open(data_dir / "edges.csv", "w", newline="",
               encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=header)

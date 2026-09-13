@@ -4,7 +4,7 @@
 Outputs (into --out directory):
     edges.csv     one row per street segment.  EDIT THE `service` COLUMN:
                       2 = deliver both sides (traverse twice)  [default]
-                      1 = deliver one side only, or zigzag both sides
+                      1 = deliver one side only; confirm delivery=left/right
                           in a single pass (traverse once)
                       0 = not my street, but usable as a shortcut
                       x = never use (excluded from routing entirely)
@@ -299,6 +299,7 @@ def export(G, out_dir: Path, default_service=2):
             "u": u,
             "v": v,
             "geometry_wkt": wkt,
+            "delivery": {0: "none", 1: "unspecified", 2: "both"}[default_service],
         })
     if reoriented:
         print(f"  {reoriented} one-way edges written in their legal "
