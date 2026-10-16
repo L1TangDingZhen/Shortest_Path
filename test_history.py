@@ -22,6 +22,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import round_history
 from test_solve import write_case
 from test_split import set_service
 
@@ -52,6 +53,86 @@ def index_rows(history_dir):
         return list(csv.DictReader(f))
 
 
+def test_legacy_diff():
+    hist = TMP / "legacy"
+    fields = ["edge_id", "service", "name", "length_m"]
+    old = [dict(edge_id="both", service="2", name="Demo Street", length_m="100"),
+           dict(edge_id="single", service="1", name="Side Street", length_m="80"),
+           dict(edge_id="banned", service="x", name="Steps Lane", length_m="20")]
+    versions = []
+    for name, modes in (("old", None), ("blank", ["", "", ""]),
+                        ("equivalent", ["both", "unspecified", "none"]),
+                        ("confirmed", ["both", "left", "none"]),
+                        ("switched", ["both", "right", "none"])):
+        folder = hist / name
+        folder.mkdir(parents=True)
+        with open(folder / "service.csv", "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=fields + (["delivery"] if modes else []))
+            writer.writeheader()
+            writer.writerows([dict(r, delivery=mode) for r, mode in zip(old, modes)]
+                             if modes else old)
+        row = dict(id=name, mode="test", total_km="0.28", mandatory_km="0.28",
+                   deadhead_km="0", bridge_km="0", islands="1", note="")
+        if modes:
+            row.update(service_counterflow_km="0", service_counterflow_segments="0")
+        versions.append(row)
+    round_history.write_index(hist, versions)
+    before = {p: p.read_bytes() for p in hist.rglob("*.csv")}
+
+    for equivalent in ("blank", "equivalent"):
+        res = history(hist, "diff", "old", equivalent)
+        assert res.returncode == 0 and "the round definition is identical" in res.stdout, res.stdout
+    cf_line = next(line for line in res.stdout.splitlines() if "svc-cf" in line)
+    assert cf_line.split()[1:] == ["-", "0.00km", "-"], cf_line
+    res = history(hist, "diff", "old", "confirmed")
+    assert res.returncode == 0 and "changed value: 1 edge(s)" in res.stdout, res.stdout
+    assert "unspecified -> left" in res.stdout
+    assert "Demo Street" not in res.stdout and "Steps Lane" not in res.stdout
+    res = history(hist, "diff", "confirmed", "switched")
+    assert "changed value: 1 edge(s)" in res.stdout and "left -> right" in res.stdout
+    assert before == {p: p.read_bytes() for p in hist.rglob("*.csv")}, "diff rewrote history"
+
+    print("== older index schemas retain unknown rather than inventing zero ==")
+    old_fields = [k for k in round_history.FIELDS if not k.startswith("service_counterflow_")]
+    with open(hist / "index.csv", "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=old_fields)
+        writer.writeheader()
+        writer.writerow(versions[0])
+    res = history(hist, "list")
+    assert res.returncode == 0 and "svc-cf" in res.stdout, res.stdout
+    values = res.stdout.splitlines()[1].split()
+    assert values[7] == "-", values
+
+
+def test_counterflow_history():
+    data, hist = TMP / "direction_data", TMP / "direction_history"
+    write_case(data)
+    base = dict(mode="test", total_km=1.0, mandatory_km=0.5,
+                deadhead_km=0.5, service_edges=1)
+    assert round_history.record(hist, data, base)[1]
+    rows = round_history.read_index(hist)
+    old_archive = hist / rows[0]["id"]
+    archived = {p: p.read_bytes() for p in old_archive.iterdir()}
+    old_fields = [k for k in round_history.FIELDS if not k.startswith("service_counterflow_")]
+    with open(hist / "index.csv", "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=old_fields)
+        writer.writeheader()
+        writer.writerow({key: rows[0][key] for key in old_fields})
+
+    # First measured zero is different from an old, unmeasured value.
+    for km, count in ((0.0, 0), (0.125, 1), (0.125, 2)):
+        summary = dict(base, service_counterflow_km=km,
+                       service_counterflow_segments=count)
+        assert round_history.record(hist, data, summary)[1]
+        assert not round_history.record(hist, data, summary)[1]
+    rows = round_history.read_index(hist)
+    assert len(rows) == 4
+    assert rows[0]["service_counterflow_km"] == ""
+    assert rows[0]["service_counterflow_segments"] == ""
+    assert float(rows[1]["service_counterflow_km"]) == 0
+    assert archived == {p: p.read_bytes() for p in old_archive.iterdir()}
+
+
 def main():
     if TMP.exists():
         shutil.rmtree(TMP)
@@ -72,6 +153,11 @@ def main():
         encoding="utf-8"))
     assert summary["note"] == "baseline"
     assert summary["service_edges"] > 0
+    with open(out / "route.csv", newline="", encoding="utf-8-sig") as f:
+        cf = [r for r in csv.DictReader(f) if r["type"] == "service" and r["counterflow"] == "yes"]
+    assert summary["service_counterflow_segments"] == len(cf)
+    assert summary["service_counterflow_km"] == round(sum(float(r["length_m"]) for r in cf) / 1000, 3)
+    assert float(rows[0]["service_counterflow_km"]) == summary["service_counterflow_km"]
     assert float(rows[0]["total_km"]) >= float(rows[0]["mandatory_km"])
     with open(vdir / "service.csv", newline="",
               encoding="utf-8-sig") as f:
@@ -153,6 +239,11 @@ def main():
     assert round_history.resolve(fake, "20260812-120000") == \
         "20260812-120000", "exact id must not be ambiguous"
     assert round_history.resolve(fake, "-1") == "20260812-120000-2"
+
+    print("== legacy side defaults do not create false history changes ==")
+    test_legacy_diff()
+    print("== new or changed counterflow is recorded even at the same distance ==")
+    test_counterflow_history()
 
     print("\nALL TESTS PASSED")
 

@@ -38,6 +38,8 @@ geometry order. Reversing the vehicle does **not** change the delivery side.
 For old files without `delivery`, `2` becomes `both`, `0`/`x` becomes
 `none`, and `1` becomes `unspecified`. Confirm those one-sided roads in the
 editor before solving. No existing one-sided annotation is guessed.
+A solve rejected for unconfirmed sides does not replace earlier route files;
+an existing result is not evidence that the current annotation solved successfully.
 Boundaries that cut a street mid-block are
 handled by the edge-split utility (see `docs/DEVELOPMENT.md`, SPEC-1).
 
@@ -121,16 +123,25 @@ annotation gaps, easiest to spot and fix right there.
 
 **Save** writes straight back to `data/edges.csv` (all columns
 preserved, only `service` and `delivery` changed; the previous version is kept as
-`edges.csv.bak`) — then just re-run `solve_route.py`. Every page
-reload shows the file as it currently is on disk, so the editor is
-never stale. The server binds localhost only; your round never
-leaves your machine.
+`edges.csv.bak`) — then just re-run `solve_route.py`. Every page reload
+reads the current file. Save checks the revision loaded by that page: if
+another tab or tool has changed the CSV, it refuses to overwrite it and
+keeps your local edits and undo history. **Download local CSV** preserves
+those edits before you reload and reconcile them with the latest file;
+do not replace the latest file with that stale export. Successful saves
+update the page's revision, so you can keep editing without a reload.
+Concurrent editor saves are serialised, including separate server processes.
+Other CSV-writing tools do not share the editor lock: do not run splitting,
+replay or re-extraction simultaneously with Save. This protection covers
+edge annotations, not the separately saved endpoint/preferences file.
+The server binds localhost only; your round never leaves your machine.
 
 Without `--serve`, `make_editor.py` writes a static
 `data/editor.html` snapshot whose **Export** button downloads an
 edges.csv to copy over `data/edges.csv` manually — workable, but you
 must re-run `make_editor.py` after replacing the file, or the page
-keeps showing the old embedded data.
+keeps showing the old embedded data. Manual replacement bypasses the
+server's revision/conflict checks.
 
 ## Running it on your own round (privacy)
 
@@ -294,6 +305,14 @@ The viewer shows both delivery and travel sides. Regenerate old routes before
 using `sort_plan.py`; it now assigns addresses by local polyline side and
 orders them by travel direction, keeping opposite sides in separate runs.
 
+Direction diagnostics remain visible at x1, including `--vehicle footpath`:
+turning off the preference does not change the reference traffic direction.
+They are not access restrictions. Reports distinguish **against mapped
+one-way** (all riding) from **service counterflow** (delivery tasks only).
+These metrics overlap and must not be added together. The console, viewer,
+comparison and newly recorded history versions include the service counterflow
+distance and/or count (`service_counterflow_km`, `service_counterflow_segments`).
+
 This is still a road-centreline graph, not a measured sidewalk network:
 switching sides at a junction has no separately modelled crossing geometry,
 and no vehicle access legality is inferred. Explicit sidewalk/crossing states
@@ -322,6 +341,13 @@ shorter?" has an answer instead of a feeling.
 Side-only changes are included in the annotation hash and diff. Export/replay
 also retains the physical side if a new extraction reverses an edge's
 reference; an ambiguous reference is returned to Pending instead of guessed.
+When comparing old archives without `delivery`, history reads `2` as `both`,
+`0`/`x` as `none`, and `1` as `unspecified`, without rewriting the archives.
+Only confirming or changing a physical side counts as a side edit; merely
+adding the column does not. Missing counterflow statistics in old versions
+are shown as `-` (unknown), not zero.
+A new or changed counterflow measurement is recorded even at the same route
+distance; repeating the same measurement does not create another version.
 
 Versions live in `round.local/history/<id>/` (gitignored), each with
 `service.csv`, `summary.json`, `route.csv` and a copy of
@@ -365,6 +391,9 @@ bundled in row order; a `2/2` pass is the same street's other side.
 
 ## Testing
 
+Use the local virtual environment (`map/bin/python` in this checkout).
+Run suites sequentially: `test_solve.py` resets `_test_tmp/`.
+
 ```bash
 python test_solve.py
 python test_delivery.py
@@ -375,6 +404,32 @@ python test_history.py
 python test_extract.py
 python test_sortplan.py
 ```
+
+The browser suite uses synthetic roads at 1440x1000, 390x844 and 320x740.
+One-time setup needs internet to download public test dependencies only:
+
+```bash
+python -m pip install -r requirements-test.txt
+PLAYWRIGHT_BROWSERS_PATH=cache/playwright python -m playwright install chromium
+python tools/browser_assets.py
+```
+
+Then run offline, after the other suites:
+
+```bash
+python test_browser.py
+```
+
+It exercises Pending, reference arrows, painting, bulk changes, undo,
+save/reload, rejection before confirmation, solving, comparison and route
+playback. It checks panel bounds and nonblank route canvases at all three
+sizes, and saves screenshots and server logs in `_test_tmp/browser/`.
+Leaflet 1.9.4 is served from a checksum-verified local cache; external tiles
+are replaced with a blank tile and other external page requests are blocked.
+The tests cover route rendering, not the external basemap. No real round
+data is read or written. They require permission to launch Chromium and bind
+a localhost port. Optional Linux browser libraries can be installed with
+`python -m playwright install-deps chromium` if Playwright reports them missing.
 
 ## Keeping your round private
 

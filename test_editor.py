@@ -15,6 +15,8 @@ asserts on the JSON payload embedded in the HTML:
   * --serve mode: GET rebuilds the page from disk, POST /save validates
     and writes back atomically (backup kept), bad payloads are rejected
     and leave the file untouched
+  * stale/missing revisions cannot overwrite newer annotations; concurrent
+    saves (threads or processes) have one winner, and conflicts keep backups
   * --serve endpoints + solve: POST /endpoints stores the picked
     start/end (rejecting nonsense), the payload carries them back, and
     POST /solve runs the solver on them and serves /route_map.html
@@ -23,6 +25,7 @@ Run:  python test_editor.py
 """
 
 import csv
+import hashlib
 import io
 import json
 import re
@@ -32,8 +35,12 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
+from unittest.mock import patch
 
+import make_editor
 from test_solve import write_case
 
 BASE = Path(__file__).parent
@@ -68,6 +75,23 @@ def extract_payload(html_path):
                   r"(.*?)</script>", html, re.DOTALL)
     assert m, "JSON island not found in editor.html"
     return json.loads(m.group(1))
+
+
+def revision(data):
+    return hashlib.sha256((data / "edges.csv").read_bytes()).hexdigest()
+
+
+def post_save(base, text, rev=None):
+    headers = {"Content-Type": "text/csv"}
+    if rev is not None:
+        headers["X-Edges-Revision"] = rev
+    req = urllib.request.Request(f"{base}/save", data=text.encode("utf-8"),
+                                 method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
 
 
 def main():
@@ -140,6 +164,8 @@ def main():
 
     print("== serve mode ==")
     test_serve()
+    test_snapshot_revision()
+    test_process_lock()
 
     print("\nALL TESTS PASSED")
 
@@ -161,6 +187,83 @@ def edit_csv_text(path, edge_id, new_service):
     w.writeheader()
     w.writerows(rows)
     return buf.getvalue()
+
+
+def test_snapshot_revision():
+    print("== page revision and displayed rows use the same snapshot ==")
+    data = TMP / "snapshot"
+    write_case(data)
+    old_revision = revision(data)
+    replacement = edit_csv_text(data / "edges.csv", "n01-court-0", 0)
+    original_load = make_editor.load
+
+    def replace_during_load(data_dir, raw_edges):
+        (data_dir / "edges.csv").write_bytes(replacement.encode("utf-8-sig"))
+        return original_load(data_dir, raw_edges)
+
+    with patch.object(make_editor, "load", side_effect=replace_during_load):
+        html, edges = make_editor.build_html(data)
+    payload = json.loads(re.search(
+        r'<script id="edge-data" type="application/json">(.*?)</script>',
+        html, re.DOTALL).group(1))
+    assert payload["edges_revision"] == old_revision != revision(data)
+    assert next(e for e in edges if e["row"]["edge_id"] == "n01-court-0")["service"] == 2
+    try:
+        make_editor.save_csv(data, replacement, old_revision)
+        raise AssertionError("disk changes after page load must conflict")
+    except make_editor.SaveConflict:
+        pass
+    assert not (data / "edges.csv.bak").exists()
+
+
+def test_process_lock():
+    print("== separate editor processes share the save lock ==")
+    data = TMP / "process_lock"
+    write_case(data)
+    before = (data / "edges.csv").read_bytes()
+    rev = revision(data)
+    code = """
+import json, sys
+from pathlib import Path
+from make_editor import save_csv, SaveConflict
+request = json.loads(Path(sys.argv[1]).read_text())
+print('ready', flush=True)
+try:
+    result = save_csv(Path(request['data']), request['csv'], request['revision'])
+    print(json.dumps(dict(status=200, **result)))
+except SaveConflict:
+    print(json.dumps(dict(status=409)))
+"""
+    processes = []
+    try:
+        with make_editor.lock_edges(data):
+            for i, value in enumerate((0, 1)):
+                request = data / f"request-{i}.json"
+                request.write_text(json.dumps(dict(
+                    data=str(data), revision=rev,
+                    csv=edit_csv_text(data / "edges.csv", "n01-court-0", value))))
+                proc = subprocess.Popen([sys.executable, "-B", "-c", code, str(request)],
+                                        cwd=BASE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, text=True)
+                processes.append(proc)
+                assert proc.stdout.readline().strip() == "ready"
+            time.sleep(0.1)
+            assert all(proc.poll() is None for proc in processes), "save bypassed lock"
+            assert (data / "edges.csv").read_bytes() == before
+        replies = []
+        for proc in processes:
+            output, errors = proc.communicate(timeout=10)
+            assert proc.returncode == 0, errors
+            replies.append(json.loads(output))
+        assert sorted(r["status"] for r in replies) == [200, 409], replies
+        assert (data / "edges.csv.bak").read_bytes() == before
+        assert revision(data) == next(r["revision"] for r in replies if r["status"] == 200)
+        assert not (data / "edges.csv.tmp").exists()
+    finally:
+        for proc in processes:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=10)
 
 
 def test_serve():
@@ -190,25 +293,35 @@ def test_serve():
             rb'<script id="edge-data" type="application/json">(.*?)'
             rb"</script>", html, re.DOTALL).group(1))
         assert payload["edges"], "served page has no edges"
+        assert payload["edges_revision"] == revision(data)
+        stale_text = edit_csv_text(data / "edges.csv", "n00-n01-0", "x")
 
         text = edit_csv_text(data / "edges.csv", "n01-court-0", 0)
-        req = urllib.request.Request(
-            f"{base}/save", data=text.encode("utf-8"), method="POST",
-            headers={"Content-Type": "text/csv"})
-        resp = urllib.request.urlopen(req, timeout=10)
-        assert resp.status == 200, resp.status
+        status, reply = post_save(base, text, payload["edges_revision"])
+        assert status == 200, reply
+        assert reply["revision"] == revision(data)
         with open(data / "edges.csv", newline="",
                   encoding="utf-8-sig") as f:
             saved = {r["edge_id"]: r["service"] for r in csv.DictReader(f)}
         assert saved["n01-court-0"] == "0", "save did not stick"
         assert (data / "edges.csv.bak").exists(), "no backup written"
 
-        # x survives a save round-trip
+        print("== serve: stale and unversioned saves rejected ==")
+        before = (data / "edges.csv").read_bytes()
+        backup = (data / "edges.csv.bak").read_bytes()
+        for rev, expected in ((payload["edges_revision"], 409),
+                              (None, 428), ("invalid", 409)):
+            status, msg = post_save(base, stale_text, rev)
+            assert status == expected, (status, msg)
+            assert (data / "edges.csv").read_bytes() == before
+            assert (data / "edges.csv.bak").read_bytes() == backup
+            assert not (data / "edges.csv.tmp").exists()
+
+        # Use the returned revision without reloading: consecutive saves work.
         text = edit_csv_text(data / "edges.csv", "n00-n01-0", "x")
-        req = urllib.request.Request(
-            f"{base}/save", data=text.encode("utf-8"), method="POST",
-            headers={"Content-Type": "text/csv"})
-        assert urllib.request.urlopen(req, timeout=10).status == 200
+        status, reply = post_save(base, text, reply["revision"])
+        assert status == 200, reply
+        assert reply["revision"] == revision(data)
         with open(data / "edges.csv", newline="",
                   encoding="utf-8-sig") as f:
             saved = {r["edge_id"]: r["service"] for r in csv.DictReader(f)}
@@ -225,16 +338,29 @@ def test_serve():
         # invalid payload -> 400, file untouched
         before = (data / "edges.csv").read_bytes()
         bad = edit_csv_text(data / "edges.csv", "n01-court-0", 9)
-        req = urllib.request.Request(
-            f"{base}/save", data=bad.encode("utf-8"), method="POST",
-            headers={"Content-Type": "text/csv"})
-        try:
-            urllib.request.urlopen(req, timeout=10)
-            raise AssertionError("bad service must be rejected")
-        except urllib.error.HTTPError as e:
-            assert e.code == 400, e.code
+        status, msg = post_save(base, bad, payload2["edges_revision"])
+        assert status == 400, msg
         assert (data / "edges.csv").read_bytes() == before, \
             "rejected save must not modify the file"
+
+        print("== serve: concurrent saves have one winner ==")
+        texts = [edit_csv_text(data / "edges.csv", "n01-court-0", value)
+                 for value in (1, 2)]
+        gate = Barrier(2)
+
+        def concurrent_save(text):
+            gate.wait(timeout=10)
+            return post_save(base, text, payload2["edges_revision"])
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(concurrent_save, texts))
+        assert sorted(status for status, _ in results) == [200, 409], results
+        winner = next(i for i, result in enumerate(results) if result[0] == 200)
+        assert revision(data) == results[winner][1]["revision"]
+        assert (data / "edges.csv.bak").read_bytes() == before
+        with open(data / "edges.csv", encoding="utf-8-sig", newline="") as f:
+            row = next(r for r in csv.DictReader(f) if r["edge_id"] == "n01-court-0")
+        assert row["service"] == str((1, 2)[winner])
 
         print("== serve: endpoints + solve ==")
         # no route yet

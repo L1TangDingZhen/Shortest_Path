@@ -1192,6 +1192,18 @@ def annotate_turns(segments, nodes, traffic_side="left", profile=None,
     return counts
 
 
+def direction_metrics(segments):
+    """Keep one-way riding and service-side counterflow distinct (they overlap)."""
+    service_cf = [s for s in segments
+                  if s["kind"] == "service" and s.get("counterflow")]
+    return {
+        "wrong_way_km": round(sum(s["length"] for s in segments
+                                  if s.get("against")) / 1000, 3),
+        "service_counterflow_km": round(sum(s["length"] for s in service_cf) / 1000, 3),
+        "service_counterflow_segments": len(service_cf),
+    }
+
+
 def operational_metrics(segments):
     """How pleasant the route is to *work*, which distance cannot see.
 
@@ -1421,7 +1433,6 @@ if (closed) {
     fillOpacity: 1}).addTo(map).bindTooltip("END");
 }
 
-const wrongKm = S.reduce((a, s) => a + (s.w ? s.l : 0), 0) / 1000;
 const nCross = S.filter(s => s.t === "cross").length;
 const nU = S.filter(s => s.t === "u").length;
 document.getElementById("totals").innerHTML =
@@ -1432,8 +1443,10 @@ document.getElementById("totals").innerHTML =
    String(Math.round(P.time_min % 60)).padStart(2, "0") +
    "m</b> (excludes stops) &middot; " + nCross + " crossing turns, " +
    nU + " U-turns" : "") +
-  (wrongKm > 0 ? '<br><span style="color:#7b341e">' + wrongKm.toFixed(2) +
-   " km against a mapped one-way</span>" : "");
+  "<br>against mapped one-way <b>" + P.wrong_way_km.toFixed(2) + " km</b>" +
+  '<br><span title="Service against reference traffic flow; not an access restriction">' +
+  "service counterflow <b>" + P.service_counterflow_km.toFixed(2) + " km</b> (" +
+  P.service_counterflow_segments + " segments)</span>";
 
 function arrowAngle(c) {
   const a = c[c.length - 2], b = c[c.length - 1];
@@ -1474,7 +1487,7 @@ function setStep(k) {
     " &middot; cum " + s.cum.toFixed(3) + " km" +
     (s.t === "cross" ? " &middot; <b>turn across traffic</b>"
      : s.t === "u" ? " &middot; <b>U-turn</b>" : "") +
-    (s.cf ? "<br><b>counterflow</b>" : "") +
+    (s.cf ? '<br><span title="Traffic-flow reference, not an access restriction"><b>service counterflow</b></span>' : "") +
     (s.w ? '<br><span style="color:#7b341e"><b>against the mapped one-way</b></span>' : "");
   slider.value = cur;
   if (document.getElementById("follow").checked) map.panTo(end);
@@ -1545,7 +1558,7 @@ def write_map(segments, nodes, out_dir: Path, time_min=0.0):
         {"segs": segs,
          "service_km": round(service / 1000, 2),
          "total_km": round(cum / 1000, 2),
-         "time_min": round(time_min, 1)},
+         "time_min": round(time_min, 1), **direction_metrics(segments)},
         ensure_ascii=False).replace("</", "<\\/")
     path = out_dir / "route_map.html"
     path.write_text(ROUTE_TEMPLATE.replace("__PAYLOAD__", payload),
@@ -1598,8 +1611,7 @@ def summarise_result(res, nodes, args, profile, control=None):
         "turning_min": round(turning / 60, 1),
         "waiting_min": round(waiting / 60, 1),
         "turns_cross": turns["cross"], "turns_u": turns["u"],
-        "wrong_way_km": round(sum(s["length"] for s in segments
-                                  if s.get("against")) / 1000, 3),
+        **direction_metrics(segments),
         "paired_pct": ops["paired_pct"], "street_runs": ops["street_runs"],
         "turns": turns, "ops": ops, "riding_s": riding,
         "turning_s": turning,
@@ -1610,12 +1622,14 @@ def print_comparison(rows):
     print(f"\n============ ROUTE PREFERENCES ============"
           f"   (all measured with the '{SCORE_PROFILE}' profile)")
     print(f"{'preference':<32}{'total':>9}{'dead':>8}{'time':>8}"
-          f"{'X-turn':>8}{'U':>5}{'wrong':>8}")
+          f"{'X-turn':>8}{'U':>5}{'oneway':>8}{'svc-cf':>8}")
     for r in rows:
         print(f"{r['label'][:30]:<32}{r['total_km']:>8.2f}k"
               f"{r['deadhead_km']:>7.2f}k{hhmm(r['time_min'] * 60):>8}"
               f"{r['turns_cross']:>8}{r['turns_u']:>5}"
-              f"{r['wrong_way_km']:>7.2f}k")
+              f"{r['wrong_way_km']:>7.2f}k{r['service_counterflow_km']:>7.2f}k")
+    print("oneway: against mapped one-ways, all riding; "
+          "svc-cf: service against reference traffic flow (overlapping metrics).")
     best = min(rows, key=lambda r: r["time_min"])
     print(f"\nQuickest: {best['label']} ({hhmm(best['time_min'] * 60)}). "
           f"Every option covers the same streets, so what differs is "
@@ -1636,7 +1650,9 @@ COMPARE_TEMPLATE = r"""<!DOCTYPE html>
   #map { height: 100%; }
   #panel { position: absolute; top: 10px; left: 50px; z-index: 1000;
     background: rgba(255,255,255,.97); border: 1px solid #bbb;
-    border-radius: 6px; padding: 10px 12px; width: 330px;
+    border-radius: 6px; padding: 10px 12px; width: 354px;
+    box-sizing: border-box; max-width: calc(100vw - 60px);
+    max-height: calc(100dvh - 20px); overflow: auto; overflow-wrap: anywhere;
     font: 13px/1.5 system-ui, sans-serif;
     box-shadow: 0 1px 4px rgba(0,0,0,.2); }
   .opt { border: 1px solid #ddd; border-radius: 5px; padding: 7px 9px;
@@ -1645,6 +1661,7 @@ COMPARE_TEMPLATE = r"""<!DOCTYPE html>
   .opt b { font-size: 14px; }
   .num { color: #555; }
   .best { color: #2f855a; font-weight: 600; }
+  @media (max-width: 600px) { #panel { max-height: 55dvh; } }
 </style>
 </head>
 <body>
@@ -1699,7 +1716,9 @@ document.getElementById("opts").innerHTML = P.routes.map(function (r, i) {
     String(m).padStart(2, "0") + "m &middot; " + r.total_km.toFixed(2) +
     " km &middot; " + r.turns_cross + " crossing turns, " + r.turns_u +
     " U-turns<br>" + r.wrong_way_km.toFixed(2) +
-    " km against a one-way</span></div>";
+    " km against mapped one-way<br>" + r.service_counterflow_km.toFixed(2) +
+    ' km service counterflow <span title="Traffic-flow reference, not an access restriction">(' +
+    r.service_counterflow_segments + " segments)</span></span></div>";
 }).join("");
 document.getElementById("opts").addEventListener("click", function (ev) {
   const el = ev.target.closest(".opt");
@@ -1724,7 +1743,8 @@ def write_comparison(rows, results, nodes, out_dir: Path):
         routes.append({k: row[k] for k in
                        ("variant", "label", "total_km", "time_min",
                         "turns_cross", "turns_u", "wrong_way_km",
-                        "wrong_way_penalty", "wrong_way_source")}
+                        "wrong_way_penalty", "wrong_way_source",
+                        "service_counterflow_km", "service_counterflow_segments")}
                       | {"segs": segs})
     payload = json.dumps({"routes": routes},
                          ensure_ascii=False).replace("</", "<\\/")
@@ -2083,7 +2103,7 @@ def main():
                            control)
     ops = operational_metrics(segments)
     riding_s, turning_s, waiting_s = estimate_seconds(segments, profile)
-    wrong_km = sum(s["length"] for s in segments if s.get("against")) / 1000
+    directions = direction_metrics(segments)
 
     total = sum(s["length"] for s in segments)
     deadhead = total - service_len
@@ -2119,7 +2139,7 @@ def main():
                 "variant": chosen["variant"]["name"],
                 "wrong_way_penalty": chosen["variant"]["wrong_way_penalty"],
                 "wrong_way_source": chosen["variant"]["wrong_way_source"],
-                "wrong_way_km": round(wrong_km, 3),
+                **directions,
                 "time_min": round((riding_s + turning_s + waiting_s) / 60, 1),
                 "waiting_min": round(waiting_s / 60, 1),
                 "paired_pct": ops["paired_pct"],
@@ -2145,7 +2165,8 @@ Riding time (rough)      : {hhmm(riding_s + turning_s + waiting_s):>9}   \
 {hhmm(waiting_s)} waiting at crossings; excludes delivery stops)
 Turns                    : {turns['cross']} crossing + {turns['u']} U-turn + \
 {turns['easy']} easy + {turns['straight']} straight
-Against a one-way        : {wrong_km:7.2f} km   (ride the footpath there)
+Against mapped one-way   : {directions['wrong_way_km']:7.2f} km   (all riding; direction reference only)
+Service counterflow      : {directions['service_counterflow_km']:7.2f} km   ({directions['service_counterflow_segments']} service segments; overlaps one-way metric)
 Both kerbs delivered     : {ops['both_sides']}/{ops['two_sided']}   \
 (independent left/right service tasks -- verified)
 Both sides back to back  : {ops['paired_pct']:6.1f}%   \

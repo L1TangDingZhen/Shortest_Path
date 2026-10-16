@@ -143,6 +143,12 @@ everywhere**):
   and `wrong_way_source`; history also identifies the selected `variant`.
   These are the settings used for the recorded route, including when a
   multi-variant solve chooses a top-level result.
+- Direction reports use `wrong_way_km` for all riding against mapped one-ways
+  and `service_counterflow_km` / `service_counterflow_segments` for service
+  tasks against reference traffic flow. They overlap; do not sum them.
+  Counterflow remains diagnostic at x1 (including `footpath`), not an access
+  ruling. The console, maps, comparison metadata and new history records share
+  the same metric calculation. Old history without the new fields is unknown.
 
 `edge_id` is opaque to the solver — never parse meaning out of it.
 Contract changes require: updating this section, a migration note
@@ -151,6 +157,16 @@ CLAUDE.md mirrors these contracts for AI sessions — keep it in sync.)
 
 Migration notes:
 
+- 2026-10: History reads legacy `service.csv` side defaults through the same
+  `delivery_mode()` used by the solver/editor. Missing or empty `delivery`
+  means `both` for 2, `none` for 0/x, and `unspecified` for 1; adding equivalent
+  explicit values is not a changed annotation in diff. Confirming a legacy 1
+  and changing left/right remain real edits. Archives are never rewritten.
+  Service counterflow metrics are appended to history indexes and included
+  in new summaries; missing older metrics display as unknown, never zero.
+  A newly measured or changed counterflow value/count creates a version even
+  at unchanged distance. This narrowly extends deduplication for these fields;
+  full experiment/configuration fingerprinting remains separate work.
 - 2026-09: Explicit physical side tasks replace the E17 direction repair.
   Missing `delivery` is inferred as `both` for service 2 and `none` for
   0/x. Legacy service 1 becomes `unspecified`, **never** zigzag/both.
@@ -158,6 +174,18 @@ Migration notes:
   one-sided road to be confirmed left or right. Its hover arrow shows
   the reference, Pending selects unconfirmed roads, and undo/save/export
   preserve both columns. CSV topology/geometry cannot be changed by Save.
+  Save now requires an `X-Edges-Revision` SHA-256 of the exact CSV bytes
+  used to build the page. A missing revision returns HTTP 428; a stale
+  revision returns 409 without modifying the CSV or its backup. Successful
+  saves return JSON with `message` and the new `revision`. Validation,
+  backup and atomic replacement share a stable `edges.csv.lock` sidecar
+  lock across threads/processes; the lock file must not be deleted while
+  editors are running. Conflicts retain local edits/undo and offer a local
+  download, never automatic reload or force overwrite. In-flight edits
+  remain dirty against the submitted snapshot, not the later UI state.
+  This protects editor annotation saves only: endpoint/preferences saving
+  is unchanged, and CLI CSV writers/manual replacements do not acquire
+  this advisory lock and must not run concurrently with editor saves.
   Self-loop service without usable geometry is now an input error.
   `route.csv` appends four fields; regenerate older routes before sorting.
   Sorting uses local polyline side and along-chain position, then reverses
@@ -535,7 +563,7 @@ stands, honestly). Option B was not needed.
   1. **Flag it.** *Shipped 2026-08.* `route.csv` gained
      `against_oneway`; the viewer draws those stretches dark red and
      dashed, names them in the tooltip and the step panel, and totals
-     them ("N km against a one-way -- use the footpath"). Purely
+     them ("N km against a mapped one-way"). Purely
      informational; the model stays undirected.
   2. **Penalise it.** *Shipped 2026-08* as `--wrong-way-penalty`
      (default 1.0 = off). Every edge becomes two arcs in a directed
@@ -707,8 +735,25 @@ is the only networked step — keep it thin, and keep everything after
 handedness, soft direction costs, same-direction passes on different sides,
 diagonal/curved/ring geometry, pending legacy data, immutable editor references,
 split/replay orientation, exact task validation and side-only history changes.
-Browser checks additionally exercise paint, pending selection, bulk edits,
-undo, save/reload and solve/view at desktop and 390/320 px mobile widths.
+`test_history.py` also checks legacy side defaults, genuine confirmations and
+side changes, archive immutability, and old indexes without direction metrics.
+`test_delivery.py` checks service counterflow versus one-way totals at x1/x3,
+the footpath preset, and agreement across CSV, viewer, comparison and history.
+`test_editor.py` checks snapshot/revision consistency, missing/stale revisions,
+unchanged CSV/backup on conflicts, consecutive saves, concurrent HTTP saves
+and separate processes competing for the same sidecar lock.
+
+`test_browser.py` is the reproducible Playwright/Chromium suite at 1440x1000,
+390x844 and 320x740: Pending and rejected solves, reference arrows, paint,
+bulk edits, undo, save/reload, two-tab conflicts with local download/undo,
+in-flight edits and duplicate-save suppression, solve/comparison and viewer
+stepping/playback.
+It checks viewport/panel bounds and nonblank route canvas pixels and saves
+screenshots in `_test_tmp/browser/`. Only synthetic roads and localhost are
+used. After the one-time setup in README, Leaflet is served from a pinned,
+checksum-verified local cache, tiles are replaced by a blank image, and other
+external page requests are blocked. This is not a test of the external basemap.
+Run it after the other suites, since `test_solve.py` resets `_test_tmp/`.
 
 ## 9. Decision log
 

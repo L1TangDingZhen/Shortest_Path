@@ -32,7 +32,8 @@ them.  Open it in a browser:
 Two modes:
 
   --serve (recommended)   run a local server; the page is rebuilt from
-      the CSVs on every reload (never stale) and the Save button writes
+      the CSVs on every reload and the Save button checks their revision,
+      rejecting stale edits before writing
       straight back to data/edges.csv (previous version kept as
       edges.csv.bak).  Local only: binds 127.0.0.1.
 
@@ -50,6 +51,7 @@ Usage:
 
 import argparse
 import csv
+import hashlib
 import io
 import json
 import os
@@ -57,6 +59,8 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 from delivery import delivery_mode
@@ -65,6 +69,41 @@ from split_edge import oriented_coords
 BASE = Path(__file__).parent
 ENDPOINTS = "endpoints.json"
 DEFAULT_HISTORY = "round.local/history"
+SAVE_LOCK = threading.Lock()
+
+
+class SaveConflict(ValueError):
+    """The submitted edit was based on an older disk snapshot."""
+
+
+def edges_revision(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+@contextmanager
+def lock_edges(data_dir):
+    # Lock a stable sidecar, not edges.csv: atomic replacement changes its inode.
+    # Keep the sidecar so separate editor processes always lock the same file.
+    with SAVE_LOCK, open(data_dir / "edges.csv.lock", "a+b") as lock:
+        if os.name == "nt":
+            import msvcrt
+            lock.seek(0, os.SEEK_END)
+            if not lock.tell():
+                lock.write(b"\0")
+                lock.flush()
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def parse_wkt_linestring(wkt):
@@ -87,14 +126,16 @@ def parse_wkt_linestring(wkt):
     return pts if len(pts) >= 2 else None
 
 
-def load(data_dir: Path):
+def load(data_dir: Path, raw_edges=None):
     nodes = {}
     with open(data_dir / "nodes.csv", newline="", encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
             nodes[row["node_id"]] = [float(row["lat"]), float(row["lon"])]
 
     edges, blank = [], 0
-    with open(data_dir / "edges.csv", newline="", encoding="utf-8-sig") as f:
+    if raw_edges is None:
+        raw_edges = (data_dir / "edges.csv").read_bytes()
+    with io.StringIO(raw_edges.decode("utf-8-sig"), newline="") as f:
         reader = csv.DictReader(f)
         header = list(reader.fieldnames)
         if "delivery" not in header:
@@ -247,6 +288,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     <button id="undo">undo</button>
     <button id="export">Export edges.csv</button>
     <span id="dirty"></span> <span id="savemsg"></span>
+    <button id="savecopy" hidden title="Download local edits without replacing the saved CSV">Download local CSV</button>
     <button id="pending" title="Show one-sided streets awaiting confirmation">Pending <span id="npending">0</span></button>
   </div>
   <div class="row">
@@ -293,6 +335,8 @@ TEMPLATE = r"""<!DOCTYPE html>
 <script>
 "use strict";
 const payload = JSON.parse(document.getElementById("edge-data").textContent);
+let edgesRevision = payload.edges_revision;
+let saving = false, saveConflict = false;
 const SERVE = location.protocol === "http:" || location.protocol === "https:";
 if (SERVE) {
   document.getElementById("export").textContent = "Save";
@@ -714,7 +758,9 @@ function showRoutes(routes) {
         + String(m).padStart(2, "0") + "m &middot; "
         + r.total_km.toFixed(2) + " km &middot; " + r.turns_cross
         + " crossing turns &middot; " + r.wrong_way_km.toFixed(2)
-        + " km wrong-way</span></div>";
+        + " km against mapped one-way<br>"
+        + r.service_counterflow_km.toFixed(2) + " km service counterflow ("
+        + r.service_counterflow_segments + " segments)</span></div>";
     }).join("");
 }
 
@@ -734,10 +780,13 @@ async function loadHistory() {
         ' <span style="color:' + (t <= prev ? "#2f855a" : "#9b2c2c") +
         '">' + (t - prev >= 0 ? "+" : "") + (t - prev).toFixed(2) + "</span>";
       prev = t;
+      const cf = r.service_counterflow_km;
+      const cfText = cf == null || cf === "" ? "-" : parseFloat(cf).toFixed(2) + " km";
       return '<span style="font-family:monospace">' + r.id.slice(4) +
         "</span> " + parseFloat(r.mandatory_km).toFixed(2) + "+" +
         parseFloat(r.deadhead_km).toFixed(2) + " = <b>" + t.toFixed(2) +
-        " km</b>" + d + (r.note ? " &middot; " + esc(r.note) : "");
+        " km</b>" + d + " &middot; service counterflow " + cfText
+        + (r.note ? " &middot; " + esc(r.note) : "");
     }).join("<br>");
 }
 
@@ -796,7 +845,7 @@ function refresh() {
     " &nbsp; x: " + n.x;
   document.getElementById("dirty").textContent =
     dirty ? dirty + " unsaved" : "";
-  if (dirty) document.getElementById("savemsg").textContent = "";
+  if (dirty && !saveConflict) document.getElementById("savemsg").textContent = "";
   if (islandMode) {
     computeIslands();
     edges.forEach(function (e, i) { e.layer.setStyle(styleFor(e, i)); });
@@ -871,15 +920,33 @@ function buildCsv() {
   return "\ufeff" + lines.join("\r\n") + "\r\n";
 }
 async function exportCsv() {
+  if (saving) return;
+  saving = true;
+  document.getElementById("export").disabled = true;
+  try {
+    await saveOrExport();
+  } finally {
+    saving = false;
+    document.getElementById("export").disabled = false;
+  }
+}
+async function saveOrExport() {
   const text = buildCsv();
+  const submitted = edges.map(e => stateKey(e));
   if (SERVE) {
     try {
       const resp = await fetch("/save", {method: "POST",
-        headers: {"Content-Type": "text/csv"}, body: text});
+        headers: {"Content-Type": "text/csv", "X-Edges-Revision": edgesRevision}, body: text});
       if (!resp.ok) {
+        if (resp.status === 409 || resp.status === 428) {
+          saveConflict = true;
+          document.getElementById("savecopy").hidden = false;
+          document.getElementById("savemsg").textContent = "Save conflict. Local edits kept.";
+        }
         alert("save failed: " + await resp.text());
         return;
       }
+      edgesRevision = (await resp.json()).revision;
     } catch (err) {
       alert("save failed: " + err);
       return;
@@ -900,7 +967,10 @@ async function exportCsv() {
   } else {
     download(text);
   }
-  edges.forEach(function (e) { e.baseline = stateKey(e); });
+  saveConflict = false;
+  document.getElementById("savecopy").hidden = true;
+  // Edits made while the request was in flight have not been saved yet.
+  edges.forEach(function (e, i) { e.baseline = submitted[i]; });
   refresh();
   document.getElementById("savemsg").textContent =
     (SERVE ? "saved " : "exported ") + new Date().toLocaleTimeString();
@@ -913,6 +983,7 @@ function download(text) {
   URL.revokeObjectURL(a.href);
 }
 document.getElementById("export").onclick = exportCsv;
+document.getElementById("savecopy").onclick = function () { download(buildCsv()); };
 
 window.addEventListener("beforeunload", function (ev) {
   if (edges.some(e => stateKey(e) !== e.baseline)) ev.preventDefault();
@@ -929,8 +1000,10 @@ refresh();
 
 def build_html(data_dir: Path):
     """Fresh HTML from the CSVs as they are on disk right now."""
-    header, edges = load(data_dir)
+    raw_edges = (data_dir / "edges.csv").read_bytes()
+    header, edges = load(data_dir, raw_edges)
     payload = json.dumps({"header": header, "edges": edges,
+                          "edges_revision": edges_revision(raw_edges),
                           "endpoints": load_endpoints(data_dir)},
                          ensure_ascii=False).replace("</", "<\\/")
     return TEMPLATE.replace("__PAYLOAD__", payload), edges
@@ -944,7 +1017,20 @@ def summarise(edges):
             f"0: {n[0]}, x: {n['x']}")
 
 
-def save_csv(data_dir: Path, text: str) -> str:
+def save_csv(data_dir: Path, text: str, revision: str) -> dict:
+    """Compare and save under one lock, including across editor processes."""
+    with lock_edges(data_dir):
+        current = (data_dir / "edges.csv").read_bytes()
+        if not revision or revision != edges_revision(current):
+            raise SaveConflict("edges.csv changed or the page has no revision. "
+                               "Your local edits are still in this page. "
+                               "Download local CSV before reloading, then "
+                               "reconcile with the latest annotations; do not "
+                               "replace the latest file with the old export.")
+        return _save_csv(data_dir, text, current)
+
+
+def _save_csv(data_dir: Path, text: str, current: bytes) -> dict:
     """Validate an edited edges.csv posted by the browser and write it
     back atomically. Only `service` and `delivery` may change: edge_ids and
     row order must match the file on disk.  Raises ValueError."""
@@ -952,8 +1038,7 @@ def save_csv(data_dir: Path, text: str) -> str:
     new_header = list(reader.fieldnames or [])
     rows = list(reader)
 
-    with open(data_dir / "edges.csv", newline="",
-              encoding="utf-8-sig") as f:
+    with io.StringIO(current.decode("utf-8-sig"), newline="") as f:
         cur = csv.DictReader(f)
         cur_header = list(cur.fieldnames)
         cur_rows = list(cur)
@@ -986,8 +1071,9 @@ def save_csv(data_dir: Path, text: str) -> str:
     n = {"0": 0, "1": 0, "2": 0, "x": 0}
     for r in rows:
         n[r["service"].strip().lower()] += 1
-    return (f"saved: {len(rows)} edges | "
-            f"2: {n['2']}, 1: {n['1']}, 0: {n['0']}, x: {n['x']}")
+    return {"message": (f"saved: {len(rows)} edges | "
+                        f"2: {n['2']}, 1: {n['1']}, 0: {n['0']}, x: {n['x']}"),
+            "revision": edges_revision(target.read_bytes())}
 
 
 def run_solver(data_dir: Path, out_dir: Path, history_dir: Path,
@@ -1050,13 +1136,21 @@ def serve(data_dir: Path, port: int, out_dir: Path, history_dir: Path):
             if self.path == "/save":
                 length = int(self.headers.get("Content-Length") or 0)
                 text = self.rfile.read(length).decode("utf-8-sig")
+                revision = self.headers.get("X-Edges-Revision")
+                if not revision:
+                    self._reply(428, "This page has no data revision. Export "
+                                "local edits before reloading the editor.")
+                    return
                 try:
-                    msg = save_csv(data_dir, text)
+                    saved = save_csv(data_dir, text, revision)
+                except SaveConflict as e:
+                    self._reply(409, str(e))
                 except ValueError as e:
                     self._reply(400, str(e))
                 else:
-                    print(f"  {msg}", flush=True)
-                    self._reply(200, msg)
+                    print(f"  {saved['message']}", flush=True)
+                    self._reply(200, json.dumps(saved),
+                                "application/json; charset=utf-8")
             elif self.path == "/endpoints":
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length).decode("utf-8")

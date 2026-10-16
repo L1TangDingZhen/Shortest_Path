@@ -4,6 +4,7 @@
 import csv
 import io
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -44,6 +45,54 @@ def rejected(fn):
     except ValueError:
         return
     raise AssertionError("invalid service coverage or configuration was accepted")
+
+
+def test_direction_reporting():
+    print("== one-way totals and service counterflow are distinct overlapping metrics ==")
+    metrics = solver.direction_metrics([
+        dict(kind="service", length=100, counterflow=True, against=False),
+        dict(kind="service", length=20, counterflow=True, against=True),
+        dict(kind="service", length=30, counterflow=False, against=False),
+        dict(kind="deadhead", length=40, counterflow=True, against=True),
+    ])
+    assert metrics == dict(wrong_way_km=0.06, service_counterflow_km=0.12,
+                           service_counterflow_segments=2), metrics
+    assert solver.direction_metrics([]) == dict(wrong_way_km=0.0,
+        service_counterflow_km=0.0, service_counterflow_segments=0)
+
+    data = TMP / "report_data"
+    write_simple(data, NODES, [("single", "Test Street", "A", "B", 1)])
+    for name, flags, start, end, count in (
+            ("default", [], "B", "A", 1),
+            ("footpath", ["--vehicle", "footpath"], "B", "A", 1),
+            ("tricycle", ["--wrong-way-penalty", "3"], "B", "A", 1),
+            ("normal", ["--vehicle", "footpath"], "A", "B", 0),
+            ("variants", ["--variants", "all"], "B", "A", 1)):
+        out, hist = TMP / ("report_" + name), TMP / ("history_" + name)
+        stdout = run(data, out, "--start=" + ",".join(map(str, NODES[start])),
+                     "--end=" + ",".join(map(str, NODES[end])),
+                     "--history", str(hist), *flags)
+        assert "Service counterflow" in stdout and "ride the footpath" not in stdout
+        rows = read_route(out)
+        km = round(sum(float(r["length_m"]) for r in rows if r["counterflow"] == "yes") / 1000, 3)
+        assert sum(r["counterflow"] == "yes" for r in rows) == count
+        index = round_history.read_index(hist)
+        summary = json.loads((hist / index[-1]["id"] / "summary.json").read_text())
+        html = (out / "route_map.html").read_text()
+        payload = json.loads(re.search(r'<script id="route-data" type="application/json">(.*?)</script>', html, re.S)[1])
+        for stored in (summary, payload):
+            assert stored["service_counterflow_km"] == km, stored
+            assert stored["service_counterflow_segments"] == count, stored
+            assert stored["wrong_way_km"] == 0, stored
+        assert "service counterflow" in html and "not an access restriction" in html
+        if name == "variants":
+            alternatives = json.loads((out / "alternatives.json").read_text())["routes"]
+            assert len(alternatives) == len(solver.VARIANTS)
+            for r in alternatives:
+                assert r["service_counterflow_km"] == km
+                assert r["service_counterflow_segments"] == count
+            assert "svc-cf" in stdout
+            assert "service counterflow" in (out / "alternatives.html").read_text()
 
 
 def main():
@@ -178,10 +227,13 @@ def main():
         writer.writerows(items)
         return out.getvalue()
 
-    make_editor.save_csv(data, csv_text(posted))
+    revision = make_editor.edges_revision((data / "edges.csv").read_bytes())
+    make_editor.save_csv(data, csv_text(posted), revision)
     assert read_edges(data)[1][0]["delivery"] == "right"
     before = (data / "edges.csv").read_bytes()
-    rejected(lambda: make_editor.save_csv(data, csv_text([dict(posted[0], u="B", v="A")])))
+    rejected(lambda: make_editor.save_csv(
+        data, csv_text([dict(posted[0], u="B", v="A")]),
+        make_editor.edges_revision(before)))
     assert (data / "edges.csv").read_bytes() == before
     rejected(lambda: delivery.delivery_mode(dict(service=1, delivery="both")))
     rejected(lambda: delivery.delivery_mode(dict(service=1, delivery="zigzag")))
@@ -224,6 +276,8 @@ def main():
     assert len(index) == 2
     saved = round_history.read_service(hist / index[-1]["id"])
     assert saved["replacement"]["delivery"] == "left"
+
+    test_direction_reporting()
 
     print("\nALL TESTS PASSED")
 

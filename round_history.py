@@ -45,6 +45,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from delivery import delivery_mode
+
 DEFAULT_HISTORY = "round.local/history"
 INDEX = "index.csv"
 
@@ -87,7 +89,8 @@ FIELDS = ["id", "version", "timestamp", "note", "mode", "service_edges",
           "mandatory_km", "total_km", "deadhead_km", "islands",
           "bridge_km", "profile", "wrong_way_km", "time_min",
           "turns_cross", "turns_u", "paired_pct", "street_runs",
-          "runs_per_street", "edges_total", "annotation"]
+          "runs_per_street", "edges_total", "annotation",
+          "service_counterflow_km", "service_counterflow_segments"]
 
 
 # ----------------------------------------------------------------------
@@ -98,7 +101,6 @@ def read_annotation(data_dir: Path):
     """The round definition: every edge that is not a plain connector.
     Returns (rows, short hash of the whole annotation)."""
     rows = []
-    from delivery import delivery_mode
     with open(data_dir / "edges.csv", newline="",
               encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
@@ -131,9 +133,11 @@ def write_index(history_dir: Path, rows):
 
 
 def read_service(version_dir: Path):
+    """Normalise legacy side semantics in memory; never rewrite an archive."""
     with open(version_dir / "service.csv", newline="",
               encoding="utf-8-sig") as f:
-        return {r["edge_id"]: r for r in csv.DictReader(f)}
+        return {r["edge_id"]: dict(r, delivery=delivery_mode(r))
+                for r in csv.DictReader(f)}
 
 
 # ----------------------------------------------------------------------
@@ -151,7 +155,11 @@ def record(history_dir: Path, data_dir: Path, summary: dict,
         if (last["annotation"] == digest
                 and last["mode"] == summary.get("mode", "")
                 and abs(float(last["total_km"]) -
-                        summary.get("total_km", 0)) < 5e-4):
+                        summary.get("total_km", 0)) < 5e-4
+                and all(last.get(key) not in (None, "")
+                        and float(last[key]) == float(summary[key])
+                        for key in ("service_counterflow_km", "service_counterflow_segments")
+                        if key in summary)):
             return f"{last.get('version') or '?'} ({last['id']})", False
 
     # second-resolution ids collide when two solves land in the same
@@ -227,7 +235,7 @@ def cmd_list(history_dir: Path, _args):
     if not index:
         sys.exit("no versions recorded yet -- solve with --history first")
     print(f"{'ver':<9}{'date':<12}{'service':>8}{'total':>8}{'dead':>7}"
-          f"{'time':>7}{'wrong':>7}{'X':>4}{'U':>4}{'pair':>6}  note")
+          f"{'time':>7}{'oneway':>7}{'svc-cf':>8}{'X':>4}{'U':>4}{'pair':>6}  note")
     prev = None
     for r in index:
         total = float(r["total_km"])
@@ -241,14 +249,19 @@ def cmd_list(history_dir: Path, _args):
         prev = (total, mins)
         time = f"{int(mins) // 60}h{int(mins) % 60:02d}" if mins else "-"
         note = r["note"] or r["mode"]
+        cf = r.get("service_counterflow_km")
+        cf_text = f"{float(cf):.2f}k" if cf not in (None, "") else "-"
         print(f"{(r.get('version') or '-'):<9}{r['id'][:8]:<12}"
               f"{float(r['mandatory_km']):>7.2f}k"
               f"{total:>7.2f}k{float(r['deadhead_km']):>6.2f}k"
-              f"{time:>7}{float(r.get('wrong_way_km') or 0):>6.2f}k"
+              f"{time:>7}{float(r.get('wrong_way_km') or 0):>6.2f}k{cf_text:>8}"
               f"{(r.get('turns_cross') or '-'):>4}{(r.get('turns_u') or '-'):>4}"
               f"{(r.get('paired_pct') or '-'):>5}%"
               f"  {note[:30]}{delta}")
     print(f"\n{len(index)} version(s) in {history_dir}")
+    print("oneway: against mapped one-ways, all riding; "
+          "svc-cf: service against reference traffic flow. "
+          "These overlap; '-' means not recorded.")
 
 
 def cmd_show(history_dir: Path, args):
@@ -276,8 +289,8 @@ def cmd_diff(history_dir: Path, args):
     added = [e for k, e in new.items() if k not in old]
     removed = [e for k, e in old.items() if k not in new]
     changed = [(old[k], e) for k, e in new.items()
-               if k in old and (old[k]["service"], old[k].get("delivery", ""))
-               != (e["service"], e.get("delivery", ""))]
+               if k in old and (old[k]["service"], old[k]["delivery"])
+               != (e["service"], e["delivery"])]
 
     def metres(rows, key=lambda r: r):
         return sum(float(key(r)["length_m"]) for r in rows)
@@ -298,7 +311,7 @@ def cmd_diff(history_dir: Path, args):
                            key=lambda p: -float(p[1]["length_m"]))[:8]:
             print(f"   ~ {b['name'][:30]:32s} "
                   f"{a['service']} -> {b['service']}  "
-                  f"{a.get('delivery', 'unspecified')} -> {b.get('delivery', 'unspecified')}  "
+                  f"{a['delivery']} -> {b['delivery']}  "
                   f"{float(b['length_m']):.0f} m")
         if len(changed) > 8:
             print(f"     ... and {len(changed) - 8} more")
@@ -315,6 +328,12 @@ def cmd_diff(history_dir: Path, args):
             x, y = float(a[key] or 0), float(b[key] or 0)
             print(f"  {label:10s} {x:8.2f}km{y:9.2f}km{y - x:+9.2f}km")
         print(f"  {'islands':10s} {a['islands']:>8}  {b['islands']:>9}")
+        x, y = a.get("service_counterflow_km"), b.get("service_counterflow_km")
+        before = f"{float(x):.2f}km" if x not in (None, "") else "-"
+        after = f"{float(y):.2f}km" if y not in (None, "") else "-"
+        change = (f"{float(y) - float(x):+.2f}km"
+                  if x not in (None, "") and y not in (None, "") else "-")
+        print(f"  {'svc-cf':10s} {before:>10}{after:>11}{change:>11}")
 
 
 def main():
