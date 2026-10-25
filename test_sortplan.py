@@ -10,13 +10,116 @@ Run:  python test_sortplan.py
 """
 
 import csv
+import json
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from html.parser import HTMLParser
+
+import sort_plan
 
 BASE = Path(__file__).parent
 TMP = BASE / "_test_tmp" / "sortplan"
+
+
+class SequenceReader(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.sequences = []
+        self.active = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "span" and dict(attrs).get("class") in ("nums", "none"):
+            self.active = True
+            self.sequences.append("")
+
+    def handle_data(self, data):
+        if self.active:
+            self.sequences[-1] += data
+
+    def handle_endtag(self, tag):
+        if tag == "span":
+            self.active = False
+
+
+def assert_exports(result, expected):
+    with (result / "sort_plan.csv").open(newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+    assert [json.loads(row["house_sequence"]) for row in rows] == expected, rows
+    assert [int(row["count"]) for row in rows] == [len(ns) for ns in expected]
+    assert [row["houses"] for row in rows] == [sort_plan.describe(ns) for ns in expected]
+    reader = SequenceReader()
+    reader.feed((result / "sort_plan.html").read_text(encoding="utf-8"))
+    assert reader.sequences == [" \u2192 ".join(ns) if ns else "-" for ns in expected]
+    with (result / "sort_addresses.csv").open(newline="", encoding="utf-8-sig") as f:
+        addresses = list(csv.DictReader(f))
+    flattened = [(i, n) for i, ns in enumerate(expected) for n in ns]
+    assert len(addresses) == len(flattened)
+    for seq, (address, (i, number)) in enumerate(zip(addresses, flattened), 1):
+        assert address == dict(delivery_seq=str(seq), run_seq=rows[i]["seq"],
+                               street=rows[i]["street"], housenumber=number,
+                               delivery_side=rows[i]["delivery_side"],
+                               side=rows[i]["side"], direction=rows[i]["direction"])
+
+
+def test_special_numbers(data, result):
+    print("== exports preserve gaps, nonmonotonic numbers, suffixes, units and repeats ==")
+    north = ["20", "2/16", "18A", "18A", "<12&>", 'Unit "A", 8']
+    south = ["4", "10B", "2/8", "2"]
+    nodes = sort_plan.load_nodes(data)
+    lat, west = nodes["W"]
+    _, east = nodes["E"]
+    with (data / "addresses.csv").open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(["lat", "lon", "housenumber", "street"])
+        for offset, numbers in ((0.0001, north), (-0.0001, south)):
+            # Deliberately shuffled input: position, not input/numeric order, wins.
+            for i in reversed(range(len(numbers))):
+                writer.writerow([lat + offset, west + (east - west) * (i + 1) / (len(numbers) + 1),
+                                 numbers[i], "Main Street"])
+    def run():
+        res = subprocess.run([sys.executable, str(BASE / "sort_plan.py"),
+                              "--data", str(data), "--result", str(result)],
+                             capture_output=True, text=True)
+        assert res.returncode == 0, res.stdout + res.stderr
+    run()
+    assert_exports(result, [north, south[::-1]])
+    sheet = (result / "sort_plan.html").read_text(encoding="utf-8")
+    assert "&lt;12&amp;&gt;" in sheet and "<12&>" not in sheet
+
+    print("== empty and single-address runs export without inferred numbers ==")
+    with (data / "addresses.csv").open(newline="", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        header, single = next(reader), next(reader)
+    with (data / "addresses.csv").open("w", newline="", encoding="utf-8-sig") as f:
+        csv.writer(f).writerows([header, single])
+    run()
+    assert_exports(result, [[single[2]], []])
+    with (data / "addresses.csv").open("w", newline="", encoding="utf-8-sig") as f:
+        csv.writer(f).writerow(header)
+    run()
+    assert_exports(result, [[], []])
+
+
+def test_merged_runs(data, result):
+    print("== merged runs retain traversal order; deadhead separates sequences ==")
+    base = sort_plan.load_route(result)[0]
+    template = sort_plan.load_edges(data)["main"]
+    edges = {eid: dict(template, edge_id=eid, service="1", delivery="left")
+             for eid in ("first", "second", "third")}
+    rows = [dict(base, edge_id=eid, **{"pass": "1/1"}) for eid in edges]
+    route = rows[:2] + [dict(base, type="deadhead")] + rows[2:]
+    attached = {"first": [("20", "left"), ("18A", "left")],
+                "second": [("2/16", "left"), ("20", "left")],
+                "third": [("10", "left")]}
+    runs = sort_plan.build_runs(route, edges, sort_plan.load_nodes(data), attached)
+    assert [r["numbers"] for r in runs] == [["20", "18A", "2/16", "20"], ["10"]]
+    sheet = result / "merged.html"
+    sort_plan.write_sheet(runs, sheet, "Synthetic merged runs")
+    reader = SequenceReader()
+    reader.feed(sheet.read_text(encoding="utf-8"))
+    assert reader.sequences == ["20 \u2192 18A \u2192 2/16 \u2192 20", "10"]
 
 
 def write_case(data_dir: Path):
@@ -71,6 +174,10 @@ def main():
     write_case(data)
     write_route(result)
 
+    print("== range summaries count entries, not distinct house numbers ==")
+    assert sort_plan.describe(["3", "7", "3"]) == "odd 3-7 (3)"
+    assert sort_plan.describe(["3", "3"]) == "3"
+
     print("== runs are built with their house numbers ==")
     res = subprocess.run(
         [sys.executable, str(BASE / "sort_plan.py"), "--data", str(data),
@@ -83,13 +190,13 @@ def main():
     assert len(rows) == 2, rows
     assert rows[0]["street"] == "Main Street"
     assert [int(r["count"]) for r in rows] == [3, 3], rows
+    assert_exports(result, [["1", "3", "5"], ["6", "4", "2"]])
 
     print("== the decoy on another street is never attached ==")
     assert "99" not in rows[0]["houses"], rows[0]["houses"]
 
     print("== each pass takes its explicitly required side ==")
     # split the two passes apart to see them individually
-    import sort_plan
     edges = sort_plan.load_edges(data)
     nodes = sort_plan.load_nodes(data)
     addresses = sort_plan.load_addresses(data)
@@ -118,6 +225,9 @@ def main():
     print("== the sheet is written and readable ==")
     sheet = (result / "sort_plan.html").read_text(encoding="utf-8")
     assert "Main Street" in sheet and "sort plan" in sheet.lower()
+
+    test_merged_runs(data, result)
+    test_special_numbers(data, result)
 
     print("== a missing addresses.csv fails with advice ==")
     (data / "addresses.csv").unlink()

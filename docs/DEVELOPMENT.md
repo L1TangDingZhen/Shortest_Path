@@ -11,7 +11,7 @@ project evolves — especially the decision log.
 
 | Milestone | State |
 |---|---|
-| V1 core: extract → edit service → exact solve → route.csv + map | **done, tested** (`test_solve.py`) |
+| V1 core: extract → edit service → coverage-validated solve → route.csv + map | **done, tested** (`test_solve.py`) |
 | Graphical service editor (`make_editor.py`, lean cut of B5) | **done, tested** (`test_editor.py`) |
 | Excluded edges (`service=x`) across solver + editor | **done, tested** |
 | SPEC-1 edge-split utility (`split_edge.py`, mid-block boundaries) | **done, tested** (`test_split.py`) — **V1 complete** |
@@ -47,8 +47,8 @@ available as shortcuts. Find the shortest closed or open route that
 performs all required traversals.
 
 The base formulation is the **Rural Postman Problem** with edge
-multiplicities. The following exactness results apply to a connected
-undirected graph with symmetric additive costs, not the current full
+multiplicities. The following exactness results require connected required
+work in an undirected graph with symmetric additive costs, not the current full
 directional/turn-aware objective. Physical side tasks enforce coverage;
 they do not turn heuristic optimisation into an exact solver.
 Key theory facts that shape the design:
@@ -59,11 +59,13 @@ Key theory facts that shape the design:
   odd-node parity repair via minimum-weight perfect matching, with
   pair distances taken as shortest paths over the *full* network.
 - If every street were multiplicity 2, the required graph would already
-  be Eulerian and any sweep would be optimal. The handful of
+  be Eulerian and any sweep would be optimal in this connected,
+  symmetric additive-cost model (not with turn costs). The handful of
   multiplicity-1 streets is precisely what creates odd-degree nodes and
   makes optimisation non-trivial.
 - The mandatory distance Σ(length × service) is a hard lower bound; the
-  matching cost is the only optimisable quantity. Report both.
+  matching cost is the only optimisable quantity in that restricted model.
+  Directional/turn costs, bridging and return legs need separate treatment.
 
 Not a TSP: we cover edges, not visit points.
 
@@ -101,7 +103,8 @@ Non-functional:
   only. The maintainer's real round (names, polygons, edited CSVs, GPX)
   lives exclusively in gitignored local files. See CLAUDE.md.
 - **NF2 Honest optimality claims.** Exactness is stated only under its
-  true conditions; degraded modes must warn.
+  true conditions. Current full-route results are labelled heuristic in all
+  modes, not just when islands require bridging. Coverage checks are separate.
 - **NF3 Cost abstraction.** *Realised 2026-08.* Optimisation reads
   `cost` (on the directed graph `D`), reporting reads `length` (real
   metres). `--profile distance` makes them equal, so the historic
@@ -149,6 +152,26 @@ everywhere**):
   Counterflow remains diagnostic at x1 (including `footpath`), not an access
   ruling. The console, maps, comparison metadata and new history records share
   the same metric calculation. Old history without the new fields is unknown.
+- History uses schema-versioned SHA-256 `input_fingerprint`, `config_fingerprint`,
+  `route_fingerprint` and aggregate `run_fingerprint` fields in index/summary.
+  `summary.json` also retains the per-file hashes and resolved `configuration`.
+  The aggregate includes the result summary; rounded total distance alone is
+  never evidence of an identical run. A nonempty note or explicit bump forces
+  a version even when the aggregate matches.
+  Deduplication searches the entire index, newest matching archive first, and
+  returns that version without rewriting/reordering version archives. Index/summary
+  fields `selection`, `variant`, `variant_label` and `algorithm` identify the
+  selected result and its selection rule. Lists distinguish single-result
+  Solve from minimum-time Compare; the route's closed/open `mode` is separate.
+  `events.csv` stores `event_seq,event_timestamp,version_id,event_action` for
+  observed transitions. Actions are `created` / `reused`; consecutive identical
+  version references do not append events. The CLI `timeline` and editor display
+  this activity. No-argument `diff` compares its latest two entries, including
+  reuse (A -> B -> A compares B -> A). `list/show`, explicit `diff` references
+  and negative indices remain archive-based; `diff OLD` defaults NEW to the
+  newest archive. Fewer than two timeline entries makes default diff an error.
+  Old archives without creation events appear as `archived` in memory; no
+  unobserved reuse is reconstructed. Event timestamps include the local UTC offset.
 
 `edge_id` is opaque to the solver — never parse meaning out of it.
 Contract changes require: updating this section, a migration note
@@ -157,6 +180,23 @@ CLAUDE.md mirrors these contracts for AI sessions — keep it in sync.)
 
 Migration notes:
 
+- 2026-10: Optimality wording now separates verified coverage from heuristic
+  route quality in CLI help/results, island view and route/comparison maps.
+  Single-island and pinned-endpoint routes have no general global-optimum
+  guarantee. Bridge kilometres are not an optimality-gap bound. Preset ids
+  remain stable; display labels describe priorities, and comparison winners
+  are explicitly limited to estimated time among the generated candidates.
+  Historical decisions below describe earlier simplified models, not proofs
+  for the current directional/turn-aware solver.
+- 2026-10: Multi-source routing orders source nodes for both node and turn
+  algorithms; bridging orders components and compares equal-cost candidates by
+  their arc sequences. Matching pairs are canonically oriented and sorted before
+  connector insertion and cost summation. Identical inputs/runtime/settings now
+  have regression coverage across five `PYTHONHASHSEED` values for both routers.
+  This removes unordered-container variability, not the heuristic nature of the
+  solution; input row order/runtime changes are still distinct experiments.
+  History reuses old archives but now records observed transitions separately.
+  Pre-event archive data remains read-only; past transitions are unknown.
 - 2026-10: History reads legacy `service.csv` side defaults through the same
   `delivery_mode()` used by the solver/editor. Missing or empty `delivery`
   means `both` for 2, `none` for 0/x, and `unspecified` for 1; adding equivalent
@@ -165,8 +205,27 @@ Migration notes:
   Service counterflow metrics are appended to history indexes and included
   in new summaries; missing older metrics display as unknown, never zero.
   A newly measured or changed counterflow value/count creates a version even
-  at unchanged distance. This narrowly extends deduplication for these fields;
-  full experiment/configuration fingerprinting remains separate work.
+  at unchanged distance. Full experiment fingerprints now supersede the
+  initial counterflow-only extension: complete node/edge CSV bytes (including
+  connectors and exclusions), resolved configuration, ordered route CSV and
+  summary metrics must all match for automatic deduplication.
+  Configurations retain actual profile contents, endpoints, algorithm, traffic
+  side, search/tour options, penalty/source and all comparison candidates with
+  their common scoring profile. Solver module hashes and Python/NetworkX
+  versions identify implementation changes; no Git identity or workspace path
+  is needed. Input paths/mtimes are excluded; input formatting changes are
+  conservatively distinct. Route CSV is parsed, preserving order while ignoring
+  BOM/newline differences. Loading and archiving share one input snapshot.
+  Old archives are not rewritten or assigned guessed fingerprints. Index
+  columns are extended on the next write; missing/incompatible fingerprints
+  mean unknown and create a new baseline. Missing effective config or route
+  data also disables deduplication. Notes/forced bumps always create versions.
+  Alternating Solve/Compare now reuses matching non-adjacent versions. Existing
+  duplicates are retained. Older index rows are enriched for display from
+  archived summary/configuration metadata in memory, never by guessing origin
+  from a variant name. Missing evidence remains unknown; archives are untouched.
+  Full network backups and concurrent independent CLI history writers remain
+  outside this change; do not run multiple writers to the same history/output.
 - 2026-09: Explicit physical side tasks replace the E17 direction repair.
   Missing `delivery` is inferred as `both` for service 2 and `none` for
   0/x. Legacy service 1 becomes `unspecified`, **never** zigzag/both.
@@ -191,6 +250,21 @@ Migration notes:
   Sorting uses local polyline side and along-chain position, then reverses
   address order when travel reverses. Deadhead and changes of side separate
   runs. Points exactly on the reference cannot be assigned a side.
+  Sort-plan CSV retains the legacy `houses` range summary and appends
+  `house_sequence`, a JSON array of strings in actual run order. No export
+  sorting or deduplication is applied to that array; `count` is its length.
+  Range-summary parentheses use that same count, including repeats.
+  `sort_addresses.csv` additionally exports one row per address with
+  `delivery_seq,run_seq,street,housenumber,delivery_side,side,direction`.
+  Global sequence numbers start at one; empty runs contribute no rows, and
+  duplicate numbers retain separate positions. Spreadsheet users should import
+  `housenumber` as text rather than relying on automatic numeric/date conversion.
+  HTML renders the same complete sequence, with a secondary labelled range.
+  Empty runs use `[]` / a dash. These are available address-point positions,
+  not verified entrances or an inferred within-building unit order.
+  Export tests cover reverse travel, nonmonotonic numbering, suffixes/units,
+  duplicates, empty runs and merged runs separated by deadhead; browser
+  tests check long sequences at desktop/mobile widths and in print media.
   Export snapshots store oriented geometry and delivery; replay remaps
   left/right on reference reversal, falling back to unspecified when the
   reference is ambiguous. Splitting preserves the parent's physical side.
@@ -239,16 +313,15 @@ Migration notes:
   (the intersection-cutoff case).
 - **E3 Disconnected service islands.** If service streets form several
   components (e.g. a detached pocket), the solver bridges them and
-  drops the exactness claim, warning with the island count and the
-  bridging kilometres — the only part of the answer that is not
-  provably minimal. The bridging grows one component by always
-  attaching the nearest other one, i.e. **Prim's algorithm**, so it is
-  an optimal *minimum spanning tree* over component-to-component
-  shortest paths (verified on real data: identical to an independently
-  computed MST). It is still not the RPP optimum: a Steiner-style
+  reports the island count and bridging kilometres as added riding,
+  not as an optimality-gap estimate. The full route is heuristic even
+  without bridges. Growing the nearest component is Prim-style growth;
+  with symmetric additive path costs it gives an MST on the
+  component-distance graph, not a guarantee for the current complete
+  directional/turn-aware route. Even in that simpler model, a Steiner-style
   branch off an existing bridge can be cheaper, and the parity
-  matching sometimes supplies connectivity for free. Closing that last
-  gap needs a different algorithm class (ILP with connectivity
+  matching sometimes supplies connectivity for free. Proving an optimum
+  needs a different algorithm class (ILP with connectivity
   constraints, branch-and-cut) — deliberately out of scope; see B8.
   The editor lists the gaps themselves, not just the islands: a
   `service=0` sliver whose two ends lie in different islands is exactly
@@ -479,10 +552,13 @@ synthetic grid from `test_solve.py`):
 
 **Reduction.** Add a virtual *required* edge (end → start) with length
 0 to R, solve the ordinary closed circuit, rotate the circuit so the
-virtual edge is last, delete it. What remains is the optimal open route
-A → … → B. The virtual edge flips the parity of both endpoints and the
-existing matching machinery does the rest — no new algorithm, exactness
-preserved.
+virtual edge is last, delete it. What remains is an open route A → … → B.
+The virtual edge flips both endpoint parities. Optimality is preserved only
+if the underlying closed problem is solved optimally under the restricted
+symmetric additive-cost model with connected required work; that is not a
+global-optimum claim for the current directional/turn-aware heuristic.
+Appending a separately routed return leg likewise supplies no whole-tour
+guarantee, including the turn cost at its join with the service route.
 
 **CLI.** `--start=<lat,lon> --end=<lat,lon>`; both snapped to nodes of
 the **full** graph F (the end need not lie on a service street, but
@@ -496,8 +572,9 @@ lies outside the round's natural extraction area. Two options:
 
 - **Option A — extend the extraction** to cover the office and a
   connecting corridor, with all added streets at `service=0`, then pin
-  `--end`. Jointly optimal: the solver chooses which service street to
-  finish on so the ride to the office is cheapest. Open design issue:
+  `--end`. Co-optimised: the solver considers the office leg while
+  choosing where to finish delivery, without guaranteeing a global optimum.
+  Open design issue:
   extraction currently applies one `--default-service` to everything,
   so a corridor would arrive as `2` and need bulk-zeroing. Candidate
   fixes: a second extraction with `--default-service 0` plus a
@@ -507,8 +584,8 @@ lies outside the round's natural extraction area. Two options:
   (circuit, or `--end` pinned to the boundary node nearest the office
   direction), then compute an ordinary shortest path round-end →
   office on a larger throwaway graph and report it as a separate leg.
-  Simpler, decoupled, marginally suboptimal (the round's finishing
-  street is not co-optimised).
+  Simpler and decoupled: the finishing street is not co-optimised,
+  and the resulting loss has no general bound.
 
 Recommendation: B is an acceptable first cut; A is the proper solution
 once merge tooling exists. The depot → round-start leg is the mirror
@@ -527,8 +604,8 @@ it now minimises true network distance over F. The office-outside-the-
 area question was resolved as **Option A enabled by B1**: enlarge the
 polygon, re-extract with `--default-service 0`, replay the annotation
 with `prepare_round.py`, and pin `--start`/`--end`; endpoints off the
-service component are joined by the auto-bridge (near-optimal warning
-stands, honestly). Option B was not needed.
+service component are joined by the auto-bridge with its heuristic warning.
+Option B was not needed.
 
 ## 7. Backlog (V1.1 / V3+)
 
@@ -596,7 +673,8 @@ stands, honestly). Option B was not needed.
 - **B3 Prefer paired passes.** *Shipped 2026-08 as `--pair-passes`,
   off by default, because it measurably does not pay.* The bonus makes
   the tour chooser take the sibling pass of the edge it just rode, and
-  it costs no distance. On the real round it moved pairing from 16.8%
+  has no distance cost only when connector expansions are length-symmetric.
+  On the real round it moved pairing from 16.8%
   to 22.1% while adding 6 crossing turns and 6 U-turns — three minutes
   for five points. Raising the bonus does nothing: 30 s, 90 s and 300 s
   all give exactly 22.1%, which locates the ceiling. **Hierholzer
@@ -608,8 +686,8 @@ stands, honestly). Option B was not needed.
   same node) — a real algorithm, not a weight.
 - **B11 Choosing WHICH Euler tour (turn comfort, wrong-way).**
   *Shipped 2026-08.* Every Euler tour over the same augmented graph
-  covers the same edges, so they all have the same length: the choice
-  is free, and Hierholzer stays correct whichever unused edge comes
+  covers the same edge instances. Length is invariant only when each
+  instance expands equally in both directions. Hierholzer stays correct whichever unused edge comes
   next (unlike Fleury). `euler_tour()` therefore replaces networkx's
   arbitrary tour with a greedy one scoring turn comfort (straight /
   easy / crossing / U-turn, in seconds, sided by `--traffic-side`)
@@ -623,9 +701,10 @@ stands, honestly). Option B was not needed.
     constant: with the penalty off, trading turns for wrong-way is not
     what the rider asked for.
   Caveat on "free": a connector's two directions are separately
-  computed shortest paths, so a wrong-way penalty can make them differ
-  by a few metres. Without a penalty the length is identical to the
-  metre (asserted in `test_solve.py`).
+  computed least-cost paths. Directional penalties, turn costs or equal-cost
+  alternatives can make their physical lengths differ; there is no general
+  few-metres bound. Distance equality on a symmetric test fixture is not a
+  guarantee for arbitrary routes.
 - **B4 GPX comparison.** Import a ride trace of the current route
   (private data — never committed) and report current vs optimised km.
 - **B5 Interactive service editor.** Browser UI: click an edge to
@@ -651,7 +730,8 @@ stands, honestly). Option B was not needed.
   each solve under `round.local/history/<id>/` (service.csv,
   summary.json, route.csv, route_map.html) with an `index.csv` for
   listing; `round_history.py list/show/diff` compares versions.
-  Deduplicates unchanged re-solves by hashing the annotation. Answers
+  Deduplicates matching complete experiment fingerprints (see migration notes).
+  The annotation hash remains for version numbering and side diffs. Answers
   "did that edit help?" with numbers instead of memory.
 - **B13 Turn-aware routing (line graph).** *Shipped 2026-08.* Turn
   cost used to reach only the choice of Euler tour, never the choice of
@@ -667,12 +747,15 @@ stands, honestly). Option B was not needed.
   them. The reversed search builds its line graph for the other side of
   the road, because mirroring the network swaps left and right.
   `--variants` turns this into what a directions app offers: each entry
-  of `VARIANTS` is one objective (shortest distance / fastest /
-  recommended / fewest awkward turns / stay with the traffic), solved
+  of `VARIANTS` is one priority (distance / riding time /
+  recommended / turn avoidance / traffic flow), solved
   separately and then **all measured with the same profile**, so the
   numbers beside the options can honestly be compared. Output:
   `result/<preference>/` plus `alternatives.html`, one map with a
-  switcher; the editor's Solve button runs the whole set. Measured on
+  switcher. The editor now separates **Solve route** (saved preferences,
+  no `--variants`) from **Compare presets** (the whole preset set, under
+  `<out>/comparison/`). Comparison leaves the ordinary solve's top-level
+  route files and the saved endpoint/preferences file unchanged. Measured on
   the real round -- shortest 29.35 km but 1h04 and 41 crossing turns,
   fastest 29.68 km / 55 min but 5.4 km against one-ways, recommended
   30.59 km / 55 min with 20 crossing turns and 0.4 km wrong-way.
@@ -682,6 +765,15 @@ stands, honestly). Option B was not needed.
   `--wrong-way-penalty` and saved preferences, with an explicit notice.
   Every variant reports its actual penalty; comparison metadata and
   the selected route's history retain that value and its source.
+  Editor `POST /solve` never loads old alternatives; `POST /compare` returns
+  only its successful comparison results. Both actions wait for queued
+  settings saves in the browser, refuse to run after a settings save failure,
+  and disable settings/solve controls during a run. One server serialises
+  solve requests (a concurrent request gets HTTP 409). Settings saves are
+  queued in UI order so an older response cannot replace a newer edit.
+  History fingerprinting records all effective comparison settings as well
+  as the selected route, so adding a candidate is a distinct experiment even
+  if the winner and its distance stay the same.
 - **B14 Intersection delay.** *Shipped 2026-08.* Waiting is not
   riding, and on a footpath round it is a quarter of the day. Node tags
   were being thrown away (`nodes.csv` held only id/lat/lon) while the
@@ -695,7 +787,7 @@ stands, honestly). Option B was not needed.
   router could see crossings, total 1h16 -> 1h09 for +2 km. This is the
   last change that moved the route's shape.
 - **B15 Searching over Euler tours.** *Shipped 2026-08, and it is
-  exhausted.* Since every tour is the same length, `local_search_tour`
+  exhausted on that experiment.* `local_search_tour`
   hill-climbs (then anneals) over the two moves that preserve an Euler
   tour: reverse a closed sub-walk, or do it at another visit of the
   same node. Objective: turn seconds + intersection delay + wrong-way
@@ -737,17 +829,29 @@ diagonal/curved/ring geometry, pending legacy data, immutable editor references,
 split/replay orientation, exact task validation and side-only history changes.
 `test_history.py` also checks legacy side defaults, genuine confirmations and
 side changes, archive immutability, and old indexes without direction metrics.
+It exercises same-distance configurations, same-name custom profile edits,
+connector/geometry/control changes, route reordering, explicit notes/bumps,
+legacy fingerprint migration, missing-data handling, snapshots during edits,
+and repeated single/comparison solves without duplicate versions.
+It also checks non-adjacent matches, Solve/Solve/Compare/Compare/Solve producing
+only two versions, forced repeats, and read-only recovery of legacy run labels.
 `test_delivery.py` checks service counterflow versus one-way totals at x1/x3,
 the footpath preset, and agreement across CSV, viewer, comparison and history.
 `test_editor.py` checks snapshot/revision consistency, missing/stale revisions,
 unchanged CSV/backup on conflicts, consecutive saves, concurrent HTTP saves
 and separate processes competing for the same sidecar lock.
+It also checks custom limits/x7 and edv/x11 solves, preset factors, separate
+output directories, unchanged saved settings/current route during comparison,
+and suppression of stale comparison metadata on a normal solve.
+Concurrent solve/compare requests are rejected, and a failed solve releases
+the gate for the next request.
 
 `test_browser.py` is the reproducible Playwright/Chromium suite at 1440x1000,
 390x844 and 320x740: Pending and rejected solves, reference arrows, paint,
 bulk edits, undo, save/reload, two-tab conflicts with local download/undo,
-in-flight edits and duplicate-save suppression, solve/comparison and viewer
-stepping/playback.
+in-flight edits and duplicate-save suppression, settings-save failures,
+queued settings edits and save/solve ordering, current-config solves,
+separate preset comparisons and viewer stepping/playback.
 It checks viewport/panel bounds and nonblank route canvas pixels and saves
 screenshots in `_test_tmp/browser/`. Only synthetic roads and localhost are
 used. After the one-time setup in README, Leaflet is served from a pinned,
@@ -766,11 +870,11 @@ the current contracts above take precedence.
 | 2026-08 | Model as undirected RPP with per-edge multiplicity `service∈{0,1,2}` | One editable column expresses territory, one-sided streets and zigzag choices; delivery vehicles on footpaths are effectively direction-free |
 | 2026-08 | Multiplicity 2 = one traversal per side; zigzag is the user's per-street choice via `1` | Sides map to passes; no global zigzag assumption needed |
 | 2026-08 | Non-service streets stay in the graph as deadhead (`0`), not deleted | Shortcuts through foreign streets are legal and often optimal |
-| 2026-08 | Exactness only claimed for connected required sets; greedy bridge + warning otherwise | Honest optimality (NF2); optimal island connection out of scope |
+| 2026-08 | Original exactness claim required connected work | Qualified in 2026-10: symmetric additive costs and an exact subproblem are also needed; the current full route remains heuristic even with one island |
 | 2026-08 | Open path via best-pair exclusion from the matching | Small odd-node counts make the O(k²) sweep trivial |
 | 2026-08 | Default network `walk` | Closest to a delivery vehicle using footpaths; captures laneway shortcuts; noise handled by the 0 value |
 | 2026-08 | Mid-block boundaries via post-extract CSV mutation (SPEC-1), declarative overlay deferred to B1 | Smallest change that meets R6; reproducibility is a separate concern |
-| 2026-08 | Fixed end via zero-length virtual required edge (SPEC-2) | Standard reduction; reuses the whole pipeline, keeps exactness |
+| 2026-08 | Fixed end via zero-length virtual required edge (SPEC-2) | Standard endpoint reduction; preserves optimality only when the underlying closed problem is solved optimally in the restricted symmetric model |
 | 2026-08 | End point lies outside the round's extraction area → Option A/B recorded, decision deferred to V2 | Needs merge tooling (A) or accepts slight suboptimality (B) |
 | 2026-08 | Public/private split: generic repo + demo area (Albert Park, VIC); all real-round data gitignored | The edited edges.csv is effectively a personal movement map; code has zero need for it |
 | 2026-08 | Weights read only via `length` | Keeps V3 time-costs a drop-in (NF3) |
@@ -783,8 +887,8 @@ the current contracts above take precedence.
 | 2026-08 | `service` gained `x`: the edge is dropped from F at load — never required, never deadhead. Editor: shift-click toggle + bulk-x; steps guidance now `x` (E6) | `0` keeps an edge routable, and a real route deadheaded through a connector the rider considers unusable. A fourth value closes the gap; absence of `x` ≡ old behaviour, so no migration (B7) |
 | 2026-08 | SPEC-1 shipped as `split_edge.py`, using a local equirectangular metre frame + haversine instead of the spec's `shapely.ops.substring` | Projecting in raw lon/lat degrees skews distances by cos(lat); the local frame is exact for the ≤30 m decisions involved, keeps the splitter stdlib-only, and child lengths come from haversine chains as specified. **V1 complete** |
 | 2026-08 | B1 shipped: overrides snapshot every edge (not just deviations); splits.csv is reconstructed from child `note`s and replayed through `split_edge.py` as a subprocess; recommended re-extraction default is `--default-service 0` | A full snapshot restores the round regardless of the extraction default and makes "new streets = whatever the default was" explicit; note-reconstruction means users never maintain splits.csv by hand; subprocess replay keeps the tools decoupled |
-| 2026-08 | SPEC-2 shipped: `--start`+`--end` via the zero-length virtual required edge; `--end` alone via the pinned open path; endpoints snapped to F; depot/office outside the old area handled by Option A (enlarge polygon + `--default-service 0` + B1 replay), Option B dropped | The virtual-edge reduction reuses the entire pipeline and keeps exactness when endpoints touch the service component; off-component endpoints ride the existing auto-bridge with its honest warning. B1 removed Option A's blocker, so the strictly better variant won |
-| 2026-08 | `--return-to-start` (requires `--end`): closed tour start → service → end → start = the SPEC-2 open route plus a shortest-path tail appended as deadhead | The real round is "depot → deliver → handover office → depot": the office is the last stop before home, so the tail is a constant independent of the covering walk — appending it preserves joint optimality with zero new machinery |
+| 2026-08 | SPEC-2 shipped: pinned endpoints on F, virtual-edge reduction, enlarged extraction with B1 replay | Endpoint constraints are preserved. Co-optimising the office leg is not a global optimum proof; directional/turn costs and off-component bridging remain heuristic |
+| 2026-08 | `--return-to-start` appends a separately routed deadhead tail after the pinned end | Under a purely additive model with fixed endpoints the tail can be independent. The current turn-aware full route, including the join to that tail, has no joint-optimality guarantee |
 | 2026-08 | Point picking on the maps: editor right-click copies `lat,lon` / `--start=` / `--end=`; the extraction preview gets folium's LatLngPopup | Coordinates are the CLI primitive (reproducible, scriptable), but hunting them in an external map was needless friction |
 | 2026-08 | Endpoints became data, not just arguments: right-click sets START/END into `data/endpoints.json`, the editor draws them, `solve_route.py` loads the file when `--start`/`--end` are absent, `prepare_round.py` carries it across re-extractions; a Solve button runs the solver server-side and serves the route map | Copy-pasting coordinates into a terminal was still the last manual step. Storing the pins makes the browser flow complete (edit → Save → Solve → view) while the CLI stays authoritative and scriptable |
 | 2026-08 | Editor: Leaflet `boxZoom` disabled; contextmenu `preventDefault`; added a "click sets" mode selector | Two real bugs found in use: shift+click (the x gesture) was eaten by box-zoom, since a 1 px wobble zooms to a box, and the right-click popup was hidden behind the browser's native menu. The mode selector removes the reliance on modifier keys altogether |
@@ -808,8 +912,8 @@ the current contracts above take precedence.
 | 2026-08 | `prepare_round` gained a geometry fallback: overrides whose `edge_id` vanished are re-found by position (same name/type, all sample points within 6 m, length-bounded), accepting any component of an osmnx-merged `"A; B"` name | Changing the network type changes which junctions exist, so osmnx splits ways differently and 618 of 10 850 ids disappeared. Id-only replay silently lost 7 annotated edges (659 m); with geometry it recovered all of them as 18 new pieces, and mandatory distance came out identical to the metre. B1's promise ("fully reproducible after re-extraction") only holds with this |
 | 2026-08 | `.gitignore`: `data/` → `data*/`, `result/` → `result*/` | A side-by-side `data_all/` extraction of the real round showed up as untracked — the ignore patterns only covered the exact directory names |
 | 2026-08 | Version history stores the *annotation* (edges with service 1/2/x, ~200 rows) rather than a copy of `edges.csv` (10 850 rows), keyed by a hash of it; unchanged re-solves are not filed | The annotation is the round definition and is two orders of magnitude smaller; hashing it makes "did anything actually change?" exact, so pressing Solve repeatedly cannot bury the real changes |
-| 2026-08 | Island warning rewritten: names service islands vs pinned endpoints separately, reports the bridging kilometres, points at the editor's island view | The old message called the endpoint pair a "service island" (wrong) and gave no sense of scale, so "near-optimal" read as "unquantified doubt" instead of "these 1.1 km are heuristic" |
-| 2026-09 | Both kerbs of a `service=2` street are a guarantee, not a preference: penalised during construction, scored during search, repaired afterwards, asserted at the end | Two passes the same way deliver one side twice and leave the other with nothing, which is not a trade against turn comfort — it is half the street missed. It costs no distance (all Euler tours over the same edges are the same length), and measured on the real round it left four preferences unchanged and made the fifth 1.55 km *shorter* while fixing its 22 one-sided streets |
+| 2026-08 | Island warning separates service islands from pinned endpoints and reports bridging kilometres | Corrected again in 2026-10: those kilometres are added riding, not a bound on the whole route's optimality gap; no near-optimum claim is made |
+| 2026-09 | Historical E17 attempted side coverage through travel-direction repair | Superseded by explicit physical-side tasks below. Opposite travel directions alone do not prove side coverage, and directional connector expansions mean tour changes need not preserve distance |
 | 2026-09 | A closed way's second lap is emitted riding the other way round, and its kerbs are named `inner` / `outer` from the sign of the ring's area | `u == v` carries no direction, so both laps of a loop road came out identical — the same defect as an ordinary street ridden twice the same way, but invisible to a check based on endpoints. Both laps of a ring cost the same and end in the same place, so riding one each way is free; naming the sides by compass point would have been fiction |
 | 2026-09 | `route.csv` names the kerb each pass delivers (`side`), by compass point (`inner`/`outer` on a closed way) | The guarantee needs to be checkable by the person riding it, not just by an assertion. It also gives the sort plan a side to key on without re-deriving travel direction |
 | 2026-09 | Open-route endpoints chosen by T-join over `odd Δ {start, end}`, with pinned ends included in the set to repair | The old rule ("ends must already be odd") is only true when both ends are free. A pin in the middle of a street has even degree, so it could never be chosen, and the round quietly finished elsewhere — the one thing a fixed finish exists to prevent |

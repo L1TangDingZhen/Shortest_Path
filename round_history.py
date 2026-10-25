@@ -10,12 +10,15 @@ and what that did to the distance.
         round.local/history)
 
     python round_history.py list
+    python round_history.py timeline
     python round_history.py show <id>
     python round_history.py diff <old> <new>
         <id> may be a version number ("1.2.0"), a timestamp id or its
         prefix, or a negative index: -1 is the newest version, -2 the
         one before it.  `diff` with no arguments compares the two
-        newest versions.
+        latest timeline entries, including reuse of an older version.
+        Explicit references remain archive-based; with only <old>,
+        <new> defaults to the newest archive.
 
 Versions are numbered like an app release, so the number tells you how
 big the change was: major = the network was re-extracted or the round
@@ -25,20 +28,22 @@ same round solved with different settings.
 Layout (inside the gitignored round directory):
 
     history/index.csv          one row per version, for quick listing
+    history/events.csv         observed transitions between solved versions
     history/<id>/summary.json  totals, endpoints, mode, counts
     history/<id>/service.csv   the round definition at that moment
                                (every edge with service 1/2/x)
     history/<id>/route.csv     the emitted route
     history/<id>/route_map.html   the map, openable months later
 
-A version is only filed when something actually differs from the newest
-one -- pressing Solve twice on an unchanged round does not pile up
-duplicates.
+Automatic deduplication requires matching input, effective configuration,
+ordered route and result metrics. Old/incomplete records cannot prove a
+match. A nonempty note or explicit --bump always creates a version.
 """
 
 import argparse
 import csv
 import hashlib
+import io
 import json
 import shutil
 import sys
@@ -49,6 +54,9 @@ from delivery import delivery_mode
 
 DEFAULT_HISTORY = "round.local/history"
 INDEX = "index.csv"
+EVENTS = "events.csv"
+EVENT_FIELDS = ["event_seq", "event_timestamp", "version_id", "event_action"]
+FINGERPRINT_VERSION = 1
 
 
 def next_version(previous, summary, digest, bump=None):
@@ -90,19 +98,37 @@ FIELDS = ["id", "version", "timestamp", "note", "mode", "service_edges",
           "bridge_km", "profile", "wrong_way_km", "time_min",
           "turns_cross", "turns_u", "paired_pct", "street_runs",
           "runs_per_street", "edges_total", "annotation",
-          "service_counterflow_km", "service_counterflow_segments"]
+          "service_counterflow_km", "service_counterflow_segments",
+          "fingerprint_version", "input_fingerprint", "config_fingerprint",
+          "route_fingerprint", "run_fingerprint",
+          "selection", "variant", "variant_label", "algorithm"]
 
 
 # ----------------------------------------------------------------------
 # reading / writing
 # ----------------------------------------------------------------------
 
-def read_annotation(data_dir: Path):
+def hash_bytes(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def hash_json(value):
+    return hash_bytes(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                ensure_ascii=False, allow_nan=False).encode("utf-8"))
+
+
+def capture_inputs(data_dir: Path):
+    """Snapshot the source bytes once, for loading and later history recording."""
+    return {name: (data_dir / name).read_bytes() for name in ("nodes.csv", "edges.csv")}
+
+
+def read_annotation(data_dir: Path, raw_edges=None):
     """The round definition: every edge that is not a plain connector.
     Returns (rows, short hash of the whole annotation)."""
     rows = []
-    with open(data_dir / "edges.csv", newline="",
-              encoding="utf-8-sig") as f:
+    if raw_edges is None:
+        raw_edges = (data_dir / "edges.csv").read_bytes()
+    with io.StringIO(raw_edges.decode("utf-8-sig"), newline="") as f:
         for r in csv.DictReader(f):
             service = (r.get("service") or "").strip().lower()
             if service in ("1", "2", "x"):
@@ -132,6 +158,82 @@ def write_index(history_dir: Path, rows):
         w.writerows(rows)
 
 
+def read_events(history_dir: Path):
+    path = history_dir / EVENTS
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8-sig") as f:
+        return list(csv.DictReader(f))
+
+
+def record_event(history_dir: Path, version_id, created):
+    events = read_events(history_dir)
+    if events and events[-1]["version_id"] == version_id:
+        return
+    with (history_dir / EVENTS).open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=EVENT_FIELDS)
+        if f.tell() == 0:
+            writer.writeheader()
+        writer.writerow(dict(event_seq=len(events) + 1,
+                             event_timestamp=datetime.now().astimezone().isoformat(timespec="microseconds"),
+                             version_id=version_id,
+                             event_action="created" if created else "reused"))
+
+
+def read_timeline(history_dir: Path):
+    index = with_run_details(history_dir, read_index(history_dir))
+    events = read_events(history_dir)
+    by_id = {row["id"]: row for row in index}
+    created = {e["version_id"] for e in events if e["event_action"] == "created"}
+    # Pre-event archives prove creation only; never invent earlier reuse events.
+    rows = [dict(row, event_seq="", event_timestamp=row.get("timestamp") or row["id"],
+                 event_action="archived") for row in index if row["id"] not in created]
+    rows.extend(dict(by_id[e["version_id"]], **e) for e in events)
+    return rows
+
+
+def run_details(summary, configuration=None):
+    configuration = configuration if configuration is not None else summary.get("configuration")
+    configuration = configuration if isinstance(configuration, dict) else {}
+    variant = summary.get("variant") or ""
+    variants = configuration.get("variants")
+    variants = variants if isinstance(variants, list) else []
+    selected = next((v for v in variants
+                     if isinstance(v, dict) and v.get("name") == variant), {})
+    return {"selection": summary.get("selection") or configuration.get("selection") or "",
+            "variant": variant,
+            "variant_label": summary.get("variant_label") or selected.get("label") or "",
+            "algorithm": summary.get("algorithm") or selected.get("algorithm") or ""}
+
+
+def with_run_details(history_dir: Path, rows):
+    """Enrich old index rows from archived metadata in memory, without guessing."""
+    result = []
+    keys = ("selection", "variant", "variant_label", "algorithm")
+    for row in rows:
+        full = dict(row)
+        if any(not full.get(key) for key in keys):
+            try:
+                summary = json.loads((history_dir / row["id"] / "summary.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                summary = {}
+            if isinstance(summary, dict):
+                for key, value in run_details(summary).items():
+                    if not full.get(key):
+                        full[key] = value
+        selection = full.get("selection")
+        origin, rule = {"single": ("Solve", "single"),
+                        "minimum_comparison_time": ("Compare", "min time")}.get(
+                            selection, ("Unknown", "unknown selection"))
+        variant = full.get("variant") or ""
+        label = full.get("variant_label") or variant or "-"
+        if variant and label != variant:
+            label += f" [{variant}]"
+        full["run_description"] = f"{origin}: {label} / {full.get('profile') or '-'} / {rule}"
+        result.append(full)
+    return result
+
+
 def read_service(version_dir: Path):
     """Normalise legacy side semantics in memory; never rewrite an archive."""
     with open(version_dir / "service.csv", newline="",
@@ -145,22 +247,37 @@ def read_service(version_dir: Path):
 # ----------------------------------------------------------------------
 
 def record(history_dir: Path, data_dir: Path, summary: dict,
-           out_dir: Path = None, note: str = "", bump: str = None):
+           out_dir: Path = None, note: str = "", bump: str = None,
+           *, inputs=None, configuration=None):
     """File one solved version. Returns (version_id, is_new)."""
-    rows, digest = read_annotation(data_dir)
+    if inputs is None:
+        inputs = capture_inputs(data_dir)
+    rows, digest = read_annotation(data_dir, inputs["edges.csv"])
+    input_files = {name: hash_bytes(raw) for name, raw in inputs.items()}
+    route_bytes = None
+    if out_dir and (out_dir / "route.csv").exists():
+        route_bytes = (out_dir / "route.csv").read_bytes()
+    # Preserve row order, but do not treat BOM/newline changes as a new route.
+    route_rows = (list(csv.reader(io.StringIO(route_bytes.decode("utf-8-sig"), newline="")))
+                  if route_bytes else None)
+    fingerprints = dict(fingerprint_version=FINGERPRINT_VERSION,
+                        input_fingerprint=hash_json(input_files),
+                        config_fingerprint=hash_json(configuration) if configuration else "",
+                        route_fingerprint=hash_json(route_rows) if route_rows else "")
+    complete = (all(name in inputs for name in ("nodes.csv", "edges.csv"))
+                and configuration and route_rows and len(route_rows) > 1)
+    fingerprints["run_fingerprint"] = hash_json(
+        dict(**fingerprints, summary=summary)) if complete else ""
     index = read_index(history_dir)
 
-    if index:
-        last = index[-1]
-        if (last["annotation"] == digest
-                and last["mode"] == summary.get("mode", "")
-                and abs(float(last["total_km"]) -
-                        summary.get("total_km", 0)) < 5e-4
-                and all(last.get(key) not in (None, "")
-                        and float(last[key]) == float(summary[key])
-                        for key in ("service_counterflow_km", "service_counterflow_segments")
-                        if key in summary)):
-            return f"{last.get('version') or '?'} ({last['id']})", False
+    if index and not note.strip() and bump is None:
+        # Prefer the latest matching archive, including explicitly forced repeats.
+        for previous in reversed(index):
+            if (fingerprints["run_fingerprint"]
+                    and previous.get("run_fingerprint") == fingerprints["run_fingerprint"]
+                    and str(previous.get("fingerprint_version")) == str(FINGERPRINT_VERSION)):
+                record_event(history_dir, previous["id"], created=False)
+                return f"{previous.get('version') or '?'} ({previous['id']})", False
 
     # second-resolution ids collide when two solves land in the same
     # second (small rounds solve in well under a second)
@@ -180,6 +297,8 @@ def record(history_dir: Path, data_dir: Path, summary: dict,
         w.writerows(rows)
 
     full = dict(summary)
+    full.update(fingerprints, input_files=input_files, configuration=configuration)
+    full.update(run_details(summary, configuration))
     full.update(id=version_id, note=note, annotation=digest,
                 version=next_version(index[-1] if index else None,
                                      summary, digest, bump),
@@ -188,13 +307,15 @@ def record(history_dir: Path, data_dir: Path, summary: dict,
         json.dumps(full, indent=1, ensure_ascii=False), encoding="utf-8")
 
     if out_dir:
-        for name in ("route.csv", "route_map.html"):
-            src = out_dir / name
-            if src.exists():
-                shutil.copy2(src, version_dir / name)
+        if route_bytes is not None:
+            (version_dir / "route.csv").write_bytes(route_bytes)
+        src = out_dir / "route_map.html"
+        if src.exists():
+            shutil.copy2(src, version_dir / src.name)
 
     index.append({k: full.get(k, "") for k in FIELDS})
     write_index(history_dir, index)
+    record_event(history_dir, version_id, created=True)
     return f"{full['version']} ({version_id})", True
 
 
@@ -235,9 +356,9 @@ def cmd_list(history_dir: Path, _args):
     if not index:
         sys.exit("no versions recorded yet -- solve with --history first")
     print(f"{'ver':<9}{'date':<12}{'service':>8}{'total':>8}{'dead':>7}"
-          f"{'time':>7}{'oneway':>7}{'svc-cf':>8}{'X':>4}{'U':>4}{'pair':>6}  note")
+          f"{'time':>7}{'oneway':>7}{'svc-cf':>8}{'X':>4}{'U':>4}{'pair':>6}  run / selected / profile / selection | note")
     prev = None
-    for r in index:
+    for r in with_run_details(history_dir, index):
         total = float(r["total_km"])
         mins = float(r.get("time_min") or 0)
         delta = ""
@@ -257,7 +378,7 @@ def cmd_list(history_dir: Path, _args):
               f"{time:>7}{float(r.get('wrong_way_km') or 0):>6.2f}k{cf_text:>8}"
               f"{(r.get('turns_cross') or '-'):>4}{(r.get('turns_u') or '-'):>4}"
               f"{(r.get('paired_pct') or '-'):>5}%"
-              f"  {note[:30]}{delta}")
+              f"  {r['run_description']} | {note[:30]}{delta}")
     print(f"\n{len(index)} version(s) in {history_dir}")
     print("oneway: against mapped one-ways, all riding; "
           "svc-cf: service against reference traffic flow. "
@@ -276,12 +397,26 @@ def cmd_show(history_dir: Path, args):
             print(f"  {name:16s} {vdir / name}")
 
 
+def cmd_timeline(history_dir: Path, _args):
+    rows = read_timeline(history_dir)
+    if not rows:
+        sys.exit("no versions recorded yet -- solve with --history first")
+    print("time | action | version (archive id) | run / selected / profile / selection")
+    for row in rows:
+        print(f"{row['event_timestamp']} | {row['event_action']} | "
+              f"{row.get('version') or '?'} ({row['id']}) | {row['run_description']}")
+
+
 def cmd_diff(history_dir: Path, args):
     index = read_index(history_dir)
-    if args.old is None and args.new is None and len(index) < 2:
-        sys.exit("need at least two versions to diff")
-    old_id = resolve(index, args.old if args.old else "-2")
-    new_id = resolve(index, args.new if args.new else "-1")
+    if args.old is None and args.new is None:
+        timeline = read_timeline(history_dir)
+        if len(timeline) < 2:
+            sys.exit("need at least two timeline entries to diff")
+        old_id, new_id = timeline[-2]["id"], timeline[-1]["id"]
+    else:
+        old_id = resolve(index, args.old if args.old else "-2")
+        new_id = resolve(index, args.new if args.new else "-1")
     old, new = read_service(history_dir / old_id), \
         read_service(history_dir / new_id)
     by_id = {r["id"]: r for r in index}
@@ -334,6 +469,16 @@ def cmd_diff(history_dir: Path, args):
         change = (f"{float(y) - float(x):+.2f}km"
                   if x not in (None, "") and y not in (None, "") else "-")
         print(f"  {'svc-cf':10s} {before:>10}{after:>11}{change:>11}")
+        print("\nExperiment fingerprints:")
+        for label, key in (("input files", "input_fingerprint"),
+                           ("configuration", "config_fingerprint"),
+                           ("route order/data", "route_fingerprint")):
+            if (not a.get(key) or not b.get(key)
+                    or a.get("fingerprint_version") != b.get("fingerprint_version")):
+                status = "unknown (missing or incompatible fingerprint)"
+            else:
+                status = "unchanged" if a[key] == b[key] else "changed"
+            print(f"  {label}: {status}")
 
 
 def main():
@@ -342,18 +487,21 @@ def main():
                     help=f"history directory (default {DEFAULT_HISTORY})")
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("list", help="all recorded versions, newest last")
+    sub.add_parser("timeline", help="observed version transitions, including reuse, newest last")
     show = sub.add_parser("show", help="one version in full")
     show.add_argument("version", nargs="?")
-    diff = sub.add_parser("diff", help="what changed between two versions")
-    diff.add_argument("old", nargs="?")
-    diff.add_argument("new", nargs="?")
+    diff = sub.add_parser("diff", help="compare the latest timeline entries or explicit archives",
+                         description="Without references, compare the latest two timeline entries. "
+                         "Explicit references use archives; with only OLD, NEW is the newest archive.")
+    diff.add_argument("old", nargs="?", help="archive version, id/prefix or negative index")
+    diff.add_argument("new", nargs="?", help="archive reference (default with OLD: newest archive)")
     args = ap.parse_args()
 
     history_dir = Path(args.history)
     if not history_dir.exists():
         sys.exit(f"{history_dir} does not exist -- solve with --history "
                  f"first")
-    {"list": cmd_list, "show": cmd_show,
+    {"list": cmd_list, "show": cmd_show, "timeline": cmd_timeline,
      "diff": cmd_diff}.get(args.cmd, cmd_list)(history_dir, args)
 
 

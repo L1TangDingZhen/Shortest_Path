@@ -10,6 +10,7 @@ by Playwright. This tests route rendering and controls, not the external basemap
 
 import base64
 import csv
+import json
 import os
 import re
 import shutil
@@ -129,6 +130,64 @@ def editor_state(page):
     return page.evaluate("Object.fromEntries(edges.map(e => [e.row.edge_id, e.delivery]))")
 
 
+def exercise_sort_sheet(context, folder):
+    from playwright.sync_api import expect
+    from sort_plan import write_sheet
+
+    numbers = ["20", "18A", "2/16", "18A", "<12&>"] + [str(n) for n in range(120, 0, -2)]
+    numbers.append("SyntheticLongUnitNumber" * 5)
+    run = dict(street="Demo Street", **{"pass": "1/1"}, side="N", direction="W",
+               metres=100, cum_km="0.10", from_cross="Demo East", to_cross="Demo West")
+    sheet = folder / "sort_plan.html"
+    write_sheet([dict(run, numbers=numbers), dict(run, numbers=[])], sheet, "Synthetic sort plan")
+    page = context.new_page()
+    try:
+        page.set_content(sheet.read_text(encoding="utf-8"))
+        expect(page.locator(".nums")).to_have_text(" \u2192 ".join(numbers))
+        expect(page.locator(".none")).to_have_text("-")
+        for media in ("screen", "print"):
+            page.emulate_media(media=media)
+            assert page.evaluate("document.documentElement.scrollWidth <= innerWidth + 1")
+            assert page.locator("li").evaluate_all("""items => items.every((el, i) => {
+              const sequence = el.querySelector('.nums, .none').getBoundingClientRect();
+              const range = el.querySelector('div.meta').getBoundingClientRect();
+              return sequence.bottom <= range.top + 1 &&
+                (!i || items[i-1].getBoundingClientRect().bottom <= el.getBoundingClientRect().top);
+            })""")
+            page.screenshot(path=str(folder / f"sort-plan-{media}.png"), full_page=True)
+    finally:
+        page.close()
+
+
+def exercise_island_labels(context, folder):
+    from playwright.sync_api import expect
+    from make_editor import build_html
+
+    data = folder / "island_data"
+    write_simple(data, {"A": (0.0, 0.0), "B": (0.0, 0.001),
+                        "C": (0.001, 0.001), "D": (0.001, 0.002)},
+                 [("ab", "Demo South", "A", "B", 2),
+                  ("bc", "Demo Link", "B", "C", 0),
+                  ("cd", "Demo North", "C", "D", 2)])
+    page = context.new_page()
+    try:
+        page.set_content(build_html(data)[0])
+        page.locator("#islands").click()
+        expect(page.locator("#islelist")).to_contain_text("Disconnected service islands; heuristic bridging adds riding.")
+        expect(page.locator("#islelist")).not_to_contain_text("cost almost nothing")
+        check_surface(page, folder / "multiple-islands.png")
+        page.locator("#search").fill("Demo North")
+        page.locator("#bulk0").click()
+        expect(page.locator("#islelist")).to_contain_text("Single service island; global optimum not guaranteed.")
+        expect(page.locator("#islelist")).not_to_contain_text("solver result is exact")
+        check_surface(page, folder / "single-island.png")
+        page.locator("#search").fill("Demo South")
+        page.locator("#bulk0").click()
+        expect(page.locator("#islelist")).to_contain_text("No service islands.")
+    finally:
+        page.close()
+
+
 def exercise_save_conflicts(context, page, base, data, folder):
     from playwright.sync_api import expect
 
@@ -214,6 +273,70 @@ def exercise_save_conflicts(context, page, base, data, folder):
     assert editor_state(page)["east"] == "left"
 
 
+def exercise_settings(page, data):
+    from playwright.sync_api import expect
+
+    solve_requests = []
+
+    def record(request):
+        if request.method == "POST" and urlparse(request.url).path == "/solve":
+            solve_requests.append(request)
+
+    page.on("request", record)
+    page.route("**/endpoints", lambda route: route.fulfill(status=500, body="Synthetic save failure"))
+    page.locator("#epww").fill("9.25")
+    page.locator("#epww").press("Tab")
+    expect(page.locator("#epstatus")).to_contain_text("Settings save failed")
+    page.locator("#solve").click()
+    expect(page.locator("#solvemsg")).to_contain_text("Settings were not saved")
+    assert not solve_requests, "failed settings must prevent solving with an old value"
+    page.unroute("**/endpoints")
+
+    queued_profiles = []
+
+    def rapid_settings(route):
+        queued_profiles.append(route.request.post_data_json["profile"])
+        response = route.fetch()
+        if len(queued_profiles) == 1:
+            page.evaluate("""() => {
+              document.getElementById('epprofile').value = 'limits';
+              endpoints.profile = 'limits';
+              saveEndpoints();
+            }""")
+        route.fulfill(response=response)
+
+    page.route("**/endpoints", rapid_settings)
+    page.locator("#epprofile").select_option("distance")
+    expect(page.locator("#epstatus")).to_have_text("Settings saved")
+    expect(page.locator("#epprofile")).to_have_value("limits")
+    assert queued_profiles == ["distance", "limits"]
+    assert json.loads((data / "endpoints.json").read_text())["profile"] == "limits"
+    page.unroute("**/endpoints", rapid_settings)
+
+    def delayed_settings(route):
+        response = route.fetch()
+        page.locator("#solve").click()
+        expect(page.locator("#solve")).to_be_disabled()
+        expect(page.locator("#compare")).to_be_disabled()
+        assert not solve_requests, "Solve raced ahead of the settings response"
+        route.fulfill(response=response)
+
+    page.route("**/endpoints", delayed_settings)
+    with page.expect_response("**/solve") as solved:
+        page.locator("#epww").fill("7")
+        page.locator("#epww").press("Tab")
+    assert solved.value.status == 200
+    expect(page.locator("#solvemsg a")).to_have_attribute("href", "/route_map.html")
+    expect(page.locator("#solveout")).to_contain_text("speed profile: limits")
+    expect(page.locator("#solveout")).to_contain_text("wrong-way penalty x7")
+    expect(page.locator("#routes")).to_be_empty()
+    assert len(solve_requests) == 1
+    settings = json.loads((data / "endpoints.json").read_text())
+    assert settings["profile"] == "limits" and settings["wrong_way_penalty"] == 7
+    page.unroute("**/endpoints", delayed_settings)
+    page.remove_listener("request", record)
+
+
 def exercise(browser, assets, width, height):
     from playwright.sync_api import expect
 
@@ -280,16 +403,52 @@ def exercise(browser, assets, width, height):
                 assert {r["edge_id"]: r["delivery"] for r in csv.DictReader(f)} == expected
             exercise_save_conflicts(context, page, base, data, folder)
 
-            page.locator("#solve").click()
-            expect(page.locator("#solvemsg a")).to_be_visible(timeout=30000)
-            expect(page.locator("#routes")).to_contain_text("service counterflow")
+            exercise_settings(page, data)
             expect(page.locator("#history")).to_contain_text("service counterflow")
+            expect(page.locator("#history")).to_contain_text("Solve: limits [node]")
+
+            def history_rows():
+                with open(folder / "history" / "index.csv", newline="", encoding="utf-8-sig") as f:
+                    return list(csv.DictReader(f))
+
+            assert len(history_rows()) == 1
+            with page.expect_response("**/solve") as repeated:
+                page.locator("#solve").click()
+            assert repeated.value.status == 200
+            expect(page.locator("#solveout")).to_contain_text("matches existing version")
+            assert len(history_rows()) == 1
+            page.locator("#compare").scroll_into_view_if_needed()
+            page.screenshot(path=str(folder / "solve-controls.png"))
+            current_route = (out / "route.csv").read_bytes()
+            current_settings = (data / "endpoints.json").read_bytes()
+            page.locator("#compare").click()
+            expect(page.locator("#solvemsg a")).to_have_attribute("href", "/comparison/alternatives.html", timeout=30000)
+            expect(page.locator("#routes")).to_contain_text("service counterflow")
+            expect(page.locator("#routes")).to_contain_text("counterflow \u00d7")
+            expect(page.locator("#routes")).to_contain_text("lowest estimated time shown")
+            expect(page.locator("#history")).to_contain_text("Compare:")
+            expect(page.locator("#history")).to_contain_text("/ min time")
+            assert len(history_rows()) == 2
+            with page.expect_response("**/compare") as repeated:
+                page.locator("#compare").click()
+            assert repeated.value.status == 200
+            expect(page.locator("#solveout")).to_contain_text("matches existing version")
+            expect(page.locator("#routes a").first).to_be_visible()
+            assert len(history_rows()) == 2
+            page.locator("#history").scroll_into_view_if_needed()
+            page.screenshot(path=str(folder / "history-labels.png"))
+            assert (out / "route.csv").read_bytes() == current_route
+            assert (data / "endpoints.json").read_bytes() == current_settings
             check_surface(page, folder / "editor.png")
             with context.expect_page() as opened:
                 page.locator("#solvemsg a").click()
             comparison = opened.value
             comparison.wait_for_load_state()
             expect(comparison.locator(".opt")).to_have_count(5)
+            expect(comparison.locator("#panel")).to_contain_text("global optimum not guaranteed")
+            expect(comparison.locator(".best")).to_have_text("lowest estimated time shown")
+            expect(comparison.locator("#opts")).to_contain_text("distance priority")
+            expect(comparison.locator("#opts")).to_contain_text("riding-time priority")
             comparison.locator(".opt").first.click()
             expect(comparison.locator(".opt.on")).to_have_attribute("data-i", "0")
             comparison.locator(".opt").last.click()
@@ -304,6 +463,7 @@ def exercise(browser, assets, width, height):
             viewer = opened.value
             viewer.wait_for_load_state()
             expect(viewer.locator("#totals")).to_contain_text("service counterflow")
+            expect(viewer.locator("#panel")).to_contain_text("global optimum not guaranteed")
             expect(viewer.locator("#slider")).to_have_value("1")
             viewer.locator("#next").click()
             expect(viewer.locator("#slider")).to_have_value("2")
@@ -313,9 +473,34 @@ def exercise(browser, assets, width, height):
             expect(viewer.locator("#slider")).not_to_have_value("1")
             viewer.locator("#play").click()
             check_surface(viewer, folder / "viewer.png")
+
+            page.locator("#solve").click()
+            expect(page.locator("#solvemsg a")).to_have_attribute("href", "/route_map.html", timeout=30000)
+            expect(page.locator("#routes")).to_be_empty()
+            expect(page.locator("#solveout")).to_contain_text("wrong-way penalty x7")
+            expect(page.locator("#solveout")).to_contain_text("matches existing version")
+            assert len(history_rows()) == 2, "alternating Solve/Compare must not duplicate history"
+            expect(page.locator("#history")).to_contain_text("reused Solve:")
+            activity = page.evaluate("async () => (await fetch('/history')).json()")
+            assert len(activity) == 3
+            assert [r["selection"] for r in activity] == ["single", "minimum_comparison_time", "single"]
+            assert activity[-1]["id"] == activity[0]["id"]
+            assert activity[-1]["event_action"] == "reused"
+            page.locator("#history").scroll_into_view_if_needed()
+            page.screenshot(path=str(folder / "history-reuse.png"))
+            page.route("**/solve", lambda route: route.fulfill(
+                status=400, content_type="application/json",
+                body=json.dumps(dict(ok=False, output="Synthetic solve failure", routes=[]))))
+            page.locator("#solve").click()
+            expect(page.locator("#solvemsg")).to_have_text("failed")
+            expect(page.locator("#solvemsg a")).to_have_count(0)
+            expect(page.locator("#routes")).to_be_empty()
+            page.unroute("**/solve")
+            exercise_sort_sheet(context, folder)
+            exercise_island_labels(context, folder)
             assert not errors, errors
             assert not unexpected, f"Unexpected network requests (blocked): {unexpected}"
-            print(f"PASS browser {width}x{height}: pending, paint, bulk, undo, save conflicts, in-flight edits, solve, compare, viewer")
+            print(f"PASS browser {width}x{height}: editing, save conflicts, settings failures/races, current solve, preset compare, viewer, sort sheet")
         except BaseException:
             for i, page in enumerate(context.pages):
                 page.screenshot(path=str(folder / f"failure-{i}.png"))

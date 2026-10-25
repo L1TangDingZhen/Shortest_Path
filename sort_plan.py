@@ -12,6 +12,7 @@ Reads route.csv, edges.csv, nodes.csv and addresses.csv (fetch those
 with `extract_network.py --addresses`) and writes:
 
     result/sort_plan.csv    one row per delivery run, with its numbers
+    result/sort_addresses.csv  one row per address, in delivery order
     result/sort_plan.html   the same, printable and readable on a phone
 
 How a number is attached to a pass:
@@ -33,6 +34,7 @@ found, and a run with none simply shows a dash.
 import argparse
 import csv
 import html
+import json
 import re
 import sys
 from collections import defaultdict
@@ -92,7 +94,7 @@ def house_parity(number):
 
 
 def describe(numbers):
-    """A run's numbers as a range a person can read off a bundle."""
+    """Legacy numeric range summary, not a delivery sequence."""
     if not numbers:
         return "-"
     ordered = sorted(set(numbers), key=house_sort_key)
@@ -100,7 +102,7 @@ def describe(numbers):
         return ordered[0]
     sides = {house_parity(n) for n in ordered}
     side = ("even " if sides == {0} else "odd " if sides == {1} else "")
-    return f"{side}{ordered[0]}-{ordered[-1]} ({len(ordered)})"
+    return f"{side}{ordered[0]}-{ordered[-1]} ({len(numbers)})"
 
 
 def attach_addresses(addresses, edges, nodes, tolerance):
@@ -185,12 +187,12 @@ SHEET = """<!DOCTYPE html>
  .sub {{ color: #666; font-size: 13px; margin-bottom: 10px; }}
  ol {{ list-style: none; padding: 0; margin: 0; counter-reset: run; }}
  li {{ border-top: 1px solid #ddd; padding: 7px 0 7px 34px;
-       position: relative; }}
+       position: relative; overflow-wrap: anywhere; }}
  li::before {{ counter-increment: run; content: counter(run);
        position: absolute; left: 0; top: 7px; color: #888;
        font-variant-numeric: tabular-nums; }}
  .street {{ font-weight: 600; }}
- .nums {{ color: #1a5e20; font-weight: 600; }}
+ .nums {{ display: block; color: #1a5e20; font-weight: 600; }}
  .none {{ color: #999; }}
  .meta {{ color: #666; font-size: 13px; }}
  @media print {{ li {{ page-break-inside: avoid; }} .sub {{ color: #000; }} }}
@@ -205,17 +207,19 @@ SHEET = """<!DOCTYPE html>
 def write_sheet(runs, path, summary):
     rows = []
     for r in runs:
-        numbers = describe(r["numbers"])
+        numbers = " \u2192 ".join(r["numbers"]) if r["numbers"] else "-"
         rows.append(
             "<li><span class='street'>{street}</span> "
             "<span class='meta'>pass {p} &middot; {side} kerb &middot; {d} &middot; "
             "{m:.0f} m &middot; {km} km</span><br>"
-            "<span class='{cls}'>{nums}</span> "
+            "<span class='{cls}'>{nums}</span>"
+            "<div class='meta'>Range: {range_summary}</div>"
             "<span class='meta'>{a} &rarr; {b}</span></li>".format(
                 street=html.escape(r["street"]), p=html.escape(r["pass"]),
                 side=html.escape(r["side"]),
                 d=html.escape(r["direction"]), m=r["metres"],
                 km=r["cum_km"], nums=html.escape(numbers),
+                range_summary=html.escape(describe(r["numbers"])),
                 cls="nums" if r["numbers"] else "none",
                 a=html.escape(r["from_cross"]),
                 b=html.escape(r["to_cross"])))
@@ -255,15 +259,27 @@ def main():
         w = csv.writer(f)
         w.writerow(["seq", "street", "pass", "direction", "from_cross",
                     "to_cross", "length_m", "cum_km", "houses", "count",
-                    "delivery_side", "side"])
+                    "delivery_side", "side", "house_sequence"])
         for r in runs:
             w.writerow([r["seq"], r["street"], r["pass"], r["direction"],
                         r["from_cross"], r["to_cross"], round(r["metres"], 1),
                         r["cum_km"], describe(r["numbers"]),
-                        len(r["numbers"]), r["delivery_side"], r["side"]])
+                        len(r["numbers"]), r["delivery_side"], r["side"],
+                        json.dumps(r["numbers"], ensure_ascii=False)])
     sheet = result_dir / "sort_plan.html"
     write_sheet(runs, sheet, summary)
-    print(f"{summary}\n  {csv_path}\n  {sheet}")
+    addresses_path = result_dir / "sort_addresses.csv"
+    with open(addresses_path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["delivery_seq", "run_seq", "street", "housenumber",
+                    "delivery_side", "side", "direction"])
+        seq = 0
+        for r in runs:
+            for number in r["numbers"]:
+                seq += 1
+                w.writerow([seq, r["seq"], r["street"], number,
+                            r["delivery_side"], r["side"], r["direction"]])
+    print(f"{summary}\n  {csv_path}\n  {addresses_path}\n  {sheet}")
 
 
 if __name__ == "__main__":

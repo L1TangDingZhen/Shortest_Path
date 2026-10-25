@@ -17,8 +17,8 @@ Output: route.csv       ordered traversal list -- the basis for the new
                         highlighted with a direction arrow
         console summary service km vs total km vs extra (deadhead) km
 
-Algorithm (4 phases; matching is exact for a connected undirected graph
-with symmetric additive costs, but directional/turn preferences and
+Algorithm (4 phases; matching gives exact augmentation for connected
+required work in an undirected graph with symmetric additive costs, but directional/turn preferences and
 auto-bridging make the current full objective heuristic):
 
   Phase 1  Build the full network F (all edges, including service=0)
@@ -32,8 +32,9 @@ auto-bridging make the current full objective heuristic):
            Compute shortest paths between all odd nodes over F, then a
            minimum-weight perfect matching (blossom algorithm, via
            networkx) picks the cheapest set of extra connections.
-           These connections are the ONLY extra distance in the final
-           route -- everything else is mandatory work.
+           Extra riding may also include component bridges and a
+           requested return leg; matching alone does not optimise
+           the full directional/turn-aware route.
 
   Phase 3  R + connectors is now Eulerian: extract an Euler circuit
            (or an open Euler path with --open).
@@ -51,16 +52,18 @@ Usage:
 --start + --end (SPEC-2): a zero-length virtual REQUIRED edge
 end -> start is added, the ordinary closed circuit is solved, then the
 circuit is rotated so the virtual edge is last and dropped -- what
-remains is the jointly optimal open route start -> ... -> end.  The
+remains is an open route start -> ... -> end. This preserves the
+endpoint constraints, not a global optimality guarantee. The
 endpoints are snapped to the full network F, so they may lie on
 non-service streets (e.g. a depot or a parcel-handover office reached
 via service-0 corridor streets); if they sit off the service
-component, the auto-bridge connects them and the near-optimal warning
+component, the auto-bridge connects them and the heuristic-bridging warning
 applies as usual.
 """
 
 import argparse
 import csv
+import io
 import itertools
 import json
 import math
@@ -82,10 +85,15 @@ from split_edge import oriented_coords
 # Input
 # ----------------------------------------------------------------------
 
-def load_data(data_dir: Path):
+def load_data(data_dir: Path, inputs=None):
     """Read nodes.csv and edges.csv. Node ids are kept as strings."""
+    def source(name):
+        if inputs is not None:
+            return io.StringIO(inputs[name].decode("utf-8-sig"), newline="")
+        return open(data_dir / name, newline="", encoding="utf-8-sig")
+
     nodes, control = {}, {}
-    with open(data_dir / "nodes.csv", newline="", encoding="utf-8-sig") as f:
+    with source("nodes.csv") as f:
         for row in csv.DictReader(f):
             nodes[row["node_id"]] = (float(row["lat"]), float(row["lon"]))
             kind = (row.get("control") or "").strip()
@@ -94,7 +102,7 @@ def load_data(data_dir: Path):
                     kind, (row.get("control_group") or "").strip())
 
     edges, blank_service, excluded, pending = [], 0, 0, 0
-    with open(data_dir / "edges.csv", newline="", encoding="utf-8-sig") as f:
+    with source("edges.csv") as f:
         for row in csv.DictReader(f):
             raw = (row.get("service") or "").strip()
             if raw == "":
@@ -158,8 +166,9 @@ def load_data(data_dir: Path):
 #
 # `length` is always real metres: it is what the mandatory distance,
 # route.csv and every printed kilometre are made of.  `cost` is what
-# the optimiser minimises, and it is seconds -- so the route is the
-# quickest one, and the time it reports is the quantity it minimised.
+# the optimiser tries to reduce: modelled riding time plus configured
+# soft preferences. Reported time excludes the artificial penalty factors;
+# the heuristic route is not guaranteed to minimise it globally.
 # A metre of footpath costs more than a metre of road, so the cheapest
 # route can be slightly longer in metres. That is the point.
 #
@@ -326,19 +335,19 @@ ALGORITHMS = {"node": ["node"], "turn": ["turn"]}
 # separately, then all of them measured on the SAME yardstick so the
 # numbers beside them can be compared. Adding one is a dict entry.
 VARIANTS = {
-    "shortest": {"label": "shortest distance", "algorithm": "node",
+    "shortest": {"label": "distance priority", "algorithm": "node",
                  "profile": "distance", "wrong_way_penalty": 1.0,
                  "turn_weight": 0.0},
-    "fastest": {"label": "fastest", "algorithm": "node",
+    "fastest": {"label": "riding-time priority", "algorithm": "node",
                 "profile": "edv", "wrong_way_penalty": 1.0,
                 "turn_weight": 0.0},
     "recommended": {"label": "recommended", "algorithm": "turn",
                     "profile": "edv", "wrong_way_penalty": 3.0,
                     "turn_weight": 1.0},
-    "gentle": {"label": "fewest awkward turns", "algorithm": "turn",
+    "gentle": {"label": "turn avoidance", "algorithm": "turn",
                "profile": "edv", "wrong_way_penalty": 3.0,
                "turn_weight": 4.0},
-    "with_traffic": {"label": "stay with the traffic", "algorithm": "turn",
+    "with_traffic": {"label": "traffic-flow preference", "algorithm": "turn",
                      "profile": "edv", "wrong_way_penalty": 12.0,
                      "turn_weight": 1.0},
 }
@@ -465,11 +474,13 @@ def _dijkstra_arcs(router, sources, reverse):
 def route_from(router, sources, reverse=False):
     """(cost, arc path) to every reachable node, from any of `sources`
     (or into them, with reverse=True)."""
+    # Equal-cost paths must not depend on the process's string hash seed.
+    sources = sorted(set(sources))
     if router["kind"] == "turn":
         return _dijkstra_arcs(router, sources, reverse)
     D = router["D"]
     graph = D.reverse(copy=False) if reverse else D
-    dist, paths = nx.multi_source_dijkstra(graph, sources=set(sources),
+    dist, paths = nx.multi_source_dijkstra(graph, sources=sources,
                                            weight="cost")
     arcs = {}
     for n, p in paths.items():
@@ -498,27 +509,27 @@ def both_ways(router, a, b):
 def ensure_required_connected(R, router, pinned_endpoints=False):
     """If the required work falls into several islands, bridge them with
     the cheapest paths through the full network. Prints a warning, since
-    the result is then near-optimal rather than provably optimal.
+    bridging is heuristic and provides no bound on the optimality gap.
 
     Growing from one component and always attaching the nearest other
-    one is Prim's algorithm, so the bridges form a minimum spanning
-    tree over component-to-component shortest paths -- optimal among
-    tree-shaped connections, though not necessarily the RPP optimum
+    one is Prim-style growth. With symmetric additive path costs this
+    gives an MST on the component-distance graph, not an RPP optimum
     (a Steiner-style branch off a bridge, or connectivity gained for
     free from the parity matching, can beat it)."""
-    comps = list(nx.connected_components(R))
+    comps = sorted(tuple(sorted(c)) for c in nx.connected_components(R))
     bridges = 0
     bridge_len = 0.0
     while len(comps) > 1:
-        base = set(comps[0])
+        base = comps[0]
         others = set().union(*comps[1:])
         best = None
         # cheapest link either way out of the growing component
         for reverse in (False, True):
             dist, paths = route_from(router, base, reverse=reverse)
-            for n, c in dist.items():
-                if n in others and (best is None or c < best[0]):
-                    best = (c, paths[n])
+            for n in sorted(others.intersection(dist)):
+                candidate = (dist[n], tuple(paths[n]))
+                if best is None or candidate < best:
+                    best = candidate
         if best is None:
             sys.exit("Service streets are disconnected and no rideable "
                      "edges link them. Extract a larger area, or check "
@@ -529,18 +540,17 @@ def ensure_required_connected(R, router, pinned_endpoints=False):
                    paths=both_ways(router, a, b))
         bridges += 1
         bridge_len += path_length_m(router["D"], arcs)
-        comps = list(nx.connected_components(R))
+        comps = sorted(tuple(sorted(c)) for c in nx.connected_components(R))
     if bridges:
         islands = bridges + 1 - (1 if pinned_endpoints else 0)
         extra = " + the pinned start/end" if pinned_endpoints else ""
         print(f"  warning: required work formed {bridges + 1} components "
               f"({islands} service island(s){extra}); linked by "
               f"{bridges} bridge(s) totalling {bridge_len / 1000:.2f} km."
-              f"\n           Bridging is a minimum spanning tree over the "
-              f"components, so the route is near-optimal: only that "
-              f"{bridge_len / 1000:.2f} km is not provably minimal."
-              f"\n           Separate delivery areas are fine -- that "
-              f"bridge is riding you would do anyway. Only fix islands "
+              f"\n           Heuristic bridging; the kilometres above are "
+              f"added riding, not an optimality-gap estimate. "
+              f"Global optimum not guaranteed."
+              f"\n           Only fix islands "
               f"caused by annotation gaps (a short service=0 sliver "
               f"inside a street you do deliver); never mark a street "
               f"you do not deliver just to merge islands.")
@@ -561,10 +571,10 @@ def pairwise_shortest(router, targets):
     asymmetric once a wrong-way penalty is in play, so both directions
     are kept."""
     dist, path = {}, {}
-    tset = set(targets)
+    targets = sorted(set(targets))
     for s in targets:
         d, p = route_from(router, [s])
-        for t in tset:
+        for t in targets:
             if t != s:
                 if t not in d:
                     sys.exit("Network is disconnected: some service "
@@ -579,8 +589,9 @@ def pairwise_shortest(router, targets):
 def symmetrise(dist):
     """Matching needs one number per unordered pair, but the traversal
     direction is only decided later by the Euler tour. Take the cheaper
-    direction -- exact without a wrong-way penalty, a lower bound with
-    one (see NF2 / B10 in docs/DEVELOPMENT.md)."""
+    direction. Symmetric path costs are unchanged; asymmetric costs
+    are relaxed to their smaller value. This does not bound the full
+    turn-aware tour objective (see NF2 / B10 in docs/DEVELOPMENT.md)."""
     out = {}
     for (a, b), cost in dist.items():
         out[(a, b)] = out[(b, a)] = min(cost, dist[(b, a)])
@@ -589,15 +600,16 @@ def symmetrise(dist):
 
 def min_matching(nodes_subset, dist):
     """Minimum-weight perfect matching on a complete graph over the odd
-    nodes. This is the step that guarantees optimality."""
+    nodes. This solves the matching subproblem, not the full route
+    objective with directional costs, turns or component bridging."""
     if not nodes_subset:
         return [], 0.0
     K = nx.Graph()
-    for a, b in itertools.combinations(nodes_subset, 2):
+    for a, b in itertools.combinations(sorted(nodes_subset), 2):
         K.add_edge(a, b, weight=dist[(a, b)])
-    M = nx.min_weight_matching(K)
+    M = sorted(tuple(sorted(pair)) for pair in nx.min_weight_matching(K))
     cost = sum(dist[(a, b)] for a, b in M)
-    return list(M), cost
+    return M, cost
 
 
 def parity_repair(R, router, open_route, pin_start=None, pin_end=None):
@@ -683,19 +695,19 @@ def deadhead_segments(D, arc_path):
 # Phase 3 -- choosing WHICH Euler tour
 # ----------------------------------------------------------------------
 #
-# Every Euler tour over the same augmented graph covers exactly the
-# same edges, so they all have exactly the same length.  Which one we
-# take is therefore free: we can spend it on the things distance does
-# not capture -- awkward turns and riding one-way streets backwards.
+# Every Euler tour over the same augmented graph covers the same edge
+# instances. Physical length is invariant only if each instance expands
+# to the same length in either direction. We also prefer fewer awkward
+# turns and less riding against mapped traffic flow.
 # Hierholzer's algorithm stays correct whichever unused edge is picked
 # next (unlike Fleury, which needs bridge avoidance), so a greedy
-# preference costs nothing and risks nothing.
+# preference preserves the Euler coverage, not optimality.
 #
 # One caveat on "same length": a connector's two directions are two
-# separately computed shortest paths, and a wrong-way penalty can make
-# them differ in metres. Without a penalty they are the same path
-# reversed and the tour choice is exactly free; with one, the total can
-# shift by a few metres.
+# separately computed least-cost paths. Directional penalties, turn costs
+# or equal-cost alternatives can give them different physical lengths.
+# Changing a tour can therefore change riding distance as well as turns;
+# there is no general bound that limits this to a few metres.
 #
 # The wrong-way weight is tied to --wrong-way-penalty rather than being
 # a constant: preferring straight continuations pulls the tour INTO the
@@ -744,8 +756,8 @@ U_TURN_DEG = 150       # beyond this, it is a U-turn
 WRONG_WAY_TOUR_WEIGHT = 0.5   # seconds per metre, per unit of penalty
 # B3: doing both sides of a street back to back keeps its mail in one
 # bundle. It means turning at the far end and riding back, so the bonus
-# has to outweigh the U-turn it implies -- and it still costs no
-# distance, because every Euler tour is the same length.
+# has to outweigh the U-turn it implies. Distance is unchanged only
+# when directional connector expansions have equal lengths.
 PAIR_SECONDS = 30.0
 
 
@@ -953,9 +965,9 @@ def euler_tour(R, source, meta, traffic_side="left", optimise=True,
 # Choosing WHICH Euler tour, part two: search instead of guess
 # ----------------------------------------------------------------------
 #
-# The greedy chooser samples one tour. Since every Euler tour over the
-# same edges has the same length, anything better it finds is free, so
-# it is worth searching rather than settling for the first sample.
+# The greedy chooser samples one tour. Searching may improve the chosen
+# objective while preserving edge coverage; distance can also change
+# when connectors expand differently in the two directions.
 #
 # Two moves keep the walk valid, and both act on a CLOSED sub-walk --
 # a stretch that leaves a node and comes back to it:
@@ -1355,6 +1367,7 @@ ROUTE_TEMPLATE = r"""<!DOCTYPE html>
 <div id="panel">
   <b>route viewer</b>
   <div id="totals"></div>
+  <div style="color:#666">Heuristic route; global optimum not guaranteed.</div>
   <div class="row">
     <button id="prev">&#9664;</button>
     <button id="play">play</button>
@@ -1631,7 +1644,8 @@ def print_comparison(rows):
     print("oneway: against mapped one-ways, all riding; "
           "svc-cf: service against reference traffic flow (overlapping metrics).")
     best = min(rows, key=lambda r: r["time_min"])
-    print(f"\nQuickest: {best['label']} ({hhmm(best['time_min'] * 60)}). "
+    print(f"\nLowest estimated time among these candidates: {best['label']} "
+          f"({hhmm(best['time_min'] * 60)}). "
           f"Every option covers the same streets, so what differs is "
           f"only\nthe overhead -- same job, different way of getting "
           f"between the work.")
@@ -1668,6 +1682,7 @@ COMPARE_TEMPLATE = r"""<!DOCTYPE html>
 <div id="map"></div>
 <div id="panel">
   <b>route alternatives</b>
+  <div style="color:#666">Heuristic candidates; global optimum not guaranteed.</div>
   <div style="color:#666">same streets, same work &mdash; only the way
     between them differs</div>
   <div id="opts"></div>
@@ -1711,7 +1726,7 @@ function show(i) {
 document.getElementById("opts").innerHTML = P.routes.map(function (r, i) {
   const h = Math.floor(r.time_min / 60), m = Math.round(r.time_min % 60);
   return '<div class="opt" data-i="' + i + '"><b>' + esc(r.label) +
-    "</b>" + (r === quickest ? ' <span class="best">quickest</span>' : "") +
+    "</b>" + (r === quickest ? ' <span class="best">lowest estimated time shown</span>' : "") +
     '<br><span class="num">' + (h ? h + "h " : "") +
     String(m).padStart(2, "0") + "m &middot; " + r.total_km.toFixed(2) +
     " km &middot; " + r.turns_cross + " crossing turns, " + r.turns_u +
@@ -1875,32 +1890,63 @@ def solve_round(variant, nodes, edges, args, profile, profile_name,
     }
 
 
+def history_configuration(args, results, score_profile):
+    """Actual resolved experiment, including every candidate in a comparison."""
+    from round_history import hash_bytes
+
+    return {
+        "start": [float(v) for v in args.start.split(",")] if args.start else None,
+        "end": [float(v) for v in args.end.split(",")] if args.end else None,
+        "open": args.open, "return_to_start": args.return_to_start,
+        "traffic_side": args.traffic_side,
+        "pair_passes": args.pair_passes, "street_first": args.street_first,
+        "optimise_tour": not args.no_turn_optimisation,
+        "search_iterations": 0 if args.no_tour_search else args.search_iterations,
+        "variants": [{"name": r["variant"]["name"],
+                      "label": r["variant"]["label"],
+                      "algorithm": r["algorithm"],
+                      "profile_name": r["profile_name"], "profile": r["profile"],
+                      "wrong_way_penalty": r["variant"]["wrong_way_penalty"],
+                      "wrong_way_source": r["variant"]["wrong_way_source"],
+                      "turn_weight": r["variant"].get("turn_weight", 1.0)}
+                     for r in results],
+        "comparison_scoring_profile": score_profile if len(results) > 1 else None,
+        "selection": "minimum_comparison_time" if len(results) > 1 else "single",
+        "implementation": {name: hash_bytes((Path(__file__).parent / name).read_bytes())
+                           for name in ("solve_route.py", "delivery.py", "split_edge.py")},
+        "networkx_version": nx.__version__,
+        "python_version": list(sys.version_info[:3]),
+    }
+
+
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
+                                 epilog="Required delivery-side coverage is validated. "
+                                 "Route optimisation is heuristic; a global optimum is not guaranteed.")
     ap.add_argument("--data", default="data",
                     help="directory with edges.csv + nodes.csv")
     ap.add_argument("--out", default="result", help="output directory")
     ap.add_argument("--open", action="store_true",
                     help="allow start != end (open Euler path); the solver "
-                         "picks the endpoint pair that minimises total "
-                         "distance")
+                         "chooses endpoints using its matching-cost model; "
+                         "no global route optimum is guaranteed")
     ap.add_argument("--start", metavar="LAT,LON",
-                    help="preferred start point, snapped to the nearest "
-                         "service-street node. Southern-hemisphere "
+                    help="pin the start point, snapped to the full "
+                         "network (including service-0 streets). Southern-hemisphere "
                          "latitudes are negative, so use the equals "
                          "form: --start=-37.8406,144.9541")
     ap.add_argument("--end", metavar="LAT,LON",
                     help="pin the finish point (e.g. a parcel-handover "
-                         "office). With --start: jointly optimal open "
+                         "office). With --start: open "
                          "route start -> ... -> end, both snapped to "
                          "the full network (they may lie on service-0 "
                          "streets). Without --start: open route whose "
-                         "end is pinned, start chosen optimally. "
+                         "end is pinned, start chosen by the cost model. "
                          "Mutually exclusive with --open. Equals form "
                          "for southern latitudes: --end=-37.84,144.95")
     ap.add_argument("--profile", default=None, metavar="NAME|FILE",
-                    help="how fast each edge is ridden, which is what "
-                         "'shortest' means. 'edv' (default) takes the "
+                    help="speed model for route costs and time estimates. "
+                         "'edv' (default) takes the "
                          f"posted limit capped at {EDV_TOP_SPEED:g} km/h "
                          "-- what the vehicle can actually do; 'limits' "
                          "takes the posted limit as it stands. A "
@@ -1955,7 +2001,7 @@ def main():
                     help="while building the tour, prefer taking the "
                          "second pass of a two-sided street straight "
                          "after the first, so its mail stays in one "
-                         "bundle. Costs no distance, but implies a turn "
+                         "bundle. May change distance and turns; implies a turn "
                          "at the far end and Hierholzer splices "
                          "sub-tours between the passes anyway: measured "
                          "+5 points of pairing for +3 min of turning, so "
@@ -1964,22 +2010,22 @@ def main():
                          "guaranteed either way (E17)")
     ap.add_argument("--street-first", action="store_true",
                     help="prefer finishing a street before moving on, so "
-                         "its mail stays in one bundle. Costs no "
-                         "distance, but measured on a real round it "
+                         "its mail stays in one bundle. May change "
+                         "distance; measured on a real round it "
                          "changed street visits 43 -> 44 and crossing "
                          "turns 24 -> 27, so it is off by default")
     ap.add_argument("--no-tour-search", action="store_true",
-                    help="skip the search over Euler tours. Every tour "
-                         "is the same length, so the search only ever "
-                         "removes turning, waiting and street re-visits")
+                    help="skip the heuristic search over Euler tours "
+                         "for lower route cost and fewer street re-visits; "
+                         "distance and turns may also change")
     ap.add_argument("--search-iterations", type=int, default=4000,
                     metavar="N", help="how hard to search for a better "
                                       "tour (default 4000)")
     ap.add_argument("--no-turn-optimisation", action="store_true",
                     help="take any Euler tour instead of preferring one "
                          "with fewer awkward turns and less wrong-way "
-                         "riding. All Euler tours are the same length, "
-                         "so this only makes the route less pleasant")
+                         "riding. Coverage is still validated; distance "
+                         "and turns may change")
     ap.add_argument("--history", nargs="?", const=DEFAULT_HISTORY,
                     metavar="DIR",
                     help="file this solve away as a version (annotation "
@@ -1994,7 +2040,7 @@ def main():
                     help="label for the recorded version, e.g. "
                          '--note "after fixing the sliver gaps"')
     ap.add_argument("--return-to-start", action="store_true",
-                    help="after the pinned end, ride the shortest path "
+                    help="after the pinned end, append a least-cost path "
                          "back to the start and include it in the "
                          "route -- a closed tour start -> service -> "
                          "end -> start (e.g. depot -> round -> "
@@ -2067,7 +2113,11 @@ def main():
                             "wrong_way_source": penalty_source,
                             "turn_weight": 1.0}]
     print("Loading network ...")
-    nodes, edges, control = load_data(data_dir)
+    inputs = None
+    if args.history:
+        import round_history
+        inputs = round_history.capture_inputs(data_dir)
+    nodes, edges, control = load_data(data_dir, inputs)
     profile_name, profile = load_profile(chosen_variants[0]["profile"])
     _, score_profile = load_profile(SCORE_PROFILE)
     results = [solve_round(v, nodes, edges, args, profile, profile_name,
@@ -2076,6 +2126,7 @@ def main():
     rows = [summarise_result(r, nodes, args,
                              score_profile if len(results) > 1
                              else r["profile"], control) for r in results]
+    configuration = history_configuration(args, results, score_profile) if args.history else None
     if len(results) > 1:
         print_comparison(rows)
         for row, res in zip(rows, results):
@@ -2086,7 +2137,7 @@ def main():
         alt = write_comparison(rows, results, nodes, out_dir)
         print(f"Each preference      : {out_dir}/<preference>/")
         print(f"Side by side         : {alt}")
-        # the quickest one is what the top-level outputs describe
+        # Top-level outputs use the lowest estimated time among these candidates.
         best = min(range(len(rows)), key=lambda i: rows[i]["time_min"])
         results, rows = [results[best]], [rows[best]]
         print(f"Top-level outputs    : {rows[0]['label']}\n")
@@ -2116,6 +2167,7 @@ def main():
         version, is_new = round_history.record(
             Path(args.history), data_dir, out_dir=out_dir,
             note=args.note, bump=args.bump,
+            inputs=inputs, configuration=configuration,
             summary={
                 "mode": kind,
                 "service_edges": sum(1 for e in edges if e["service"] > 0),
@@ -2150,11 +2202,12 @@ def main():
                 "turn_optimised": not args.no_turn_optimisation,
             })
         print("  history: " + (f"recorded version {version}" if is_new
-                               else f"unchanged since version {version}")
+                               else f"matches existing version {version}")
               + f" (in {args.history})")
 
     print(f"""
 ================ RESULT ({kind}) ================
+Route quality            : heuristic; global optimum not guaranteed
 Mandatory service riding : {service_len / 1000:7.2f} km   (theoretical lower bound)
 Route total              : {total / 1000:7.2f} km
 Extra / deadhead         : {deadhead / 1000:7.2f} km   ({100 * deadhead / max(total, 1):.1f}% of route)

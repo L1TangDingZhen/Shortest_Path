@@ -23,7 +23,7 @@ them.  Open it in a browser:
     * right-click anywhere to set that point as the round's START or
       END, or just copy the coordinates
     * with --serve: Solve runs the solver on the saved endpoints and
-      shows the route map without touching the command line
+      preferences; Compare presets runs the preset set separately
     * live counters: edges per service value, mandatory km, unsaved edits
     * Export downloads an updated edges.csv (all columns preserved, only
       `service` and `delivery` changed) -- replace data/edges.csv with it and re-run
@@ -54,6 +54,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -205,12 +206,13 @@ def save_endpoints(data_dir: Path, data):
     if not re.fullmatch(r"[\w.\-/]+", profile):
         raise ValueError(f"profile: {profile!r} is not a name or path")
     out["profile"] = profile
+    raw_penalty = data.get("wrong_way_penalty")
     try:
-        penalty = float(data.get("wrong_way_penalty") or 1)
+        penalty = float(1 if raw_penalty in (None, "") else raw_penalty)
     except (TypeError, ValueError):
         raise ValueError("wrong_way_penalty: expected a number")
-    if penalty < 1:
-        raise ValueError("wrong_way_penalty: must be >= 1")
+    if not math.isfinite(penalty) or penalty < 1:
+        raise ValueError("wrong_way_penalty: must be finite and >= 1")
     out["wrong_way_penalty"] = penalty
     (data_dir / ENDPOINTS).write_text(
         json.dumps(out, indent=1), encoding="utf-8")
@@ -307,13 +309,16 @@ TEMPLATE = r"""<!DOCTYPE html>
     speed <select id="epprofile">
       <option value="edv">edv (limit, capped at the vehicle)</option>
       <option value="limits">limits (posted limit as it stands)</option>
+      <option value="distance">distance priority</option>
     </select>
     <label title="Soft preference against counterflow; both directions remain available">
-      counterflow &times;<input id="epww" type="number" min="1" step="0.5"
+      counterflow &times;<input id="epww" type="number" min="1" step="any" required
         style="width:48px"></label><br>
     <input id="note" placeholder="label this version (optional)"
            style="width:150px">
-    <button id="solve">Solve route</button>
+    <span id="epstatus" role="status"></span><br>
+    <button id="solve" title="Use the saved speed profile and counterflow factor">Solve route</button>
+    <button id="compare" title="Use each preset's own profile and counterflow factor">Compare presets</button>
     <span id="solvemsg"></span>
     <div id="routes" style="margin-top:4px"></div>
     <div id="history" style="margin-top:4px"></div>
@@ -473,9 +478,10 @@ function renderIslandList() {
       isl.km.toFixed(2) + ' km <button data-isl="' + ci + '">go</button>' +
       "</div>";
   }).join("") + (islands.length > 1
-    ? '<div style="color:#666">extra islands are bridged automatically ' +
-      "and cost almost nothing -- do not chase a single island</div>"
-    : '<div style="color:#666">single island: solver result is exact</div>')
+    ? '<div style="color:#666">Disconnected service islands; heuristic bridging adds riding. ' +
+      "Global optimum not guaranteed.</div>"
+    : '<div style="color:#666">' + (islands.length ?
+      'Single service island; global optimum not guaranteed.' : 'No service islands.') + '</div>')
     + (gaps.length
        ? '<div style="margin-top:6px"><b>gaps that would merge them</b>' +
          ' <span style="color:#666">(metres long, inside junctions)' +
@@ -674,6 +680,7 @@ map.on("contextmenu", function (ev) {
 
 let pending = null;
 let endpoints = payload.endpoints || {};
+let endpointSave = Promise.resolve(true), endpointSerial = 0, solving = false;
 const epMarkers = {};
 
 function drawEndpoints() {
@@ -689,24 +696,42 @@ function drawEndpoints() {
     }).addTo(map).bindTooltip(k.toUpperCase() + " of the round");
   });
   document.getElementById("eprts").checked = !!endpoints.return_to_start;
-  document.getElementById("epprofile").value =
-    endpoints.profile || "edv";
+  const profile = endpoints.profile || "edv", select = document.getElementById("epprofile");
+  if (![...select.options].some(o => o.value === profile)) select.add(new Option(profile, profile));
+  select.value = profile;
   document.getElementById("epww").value =
     endpoints.wrong_way_penalty || 1;
 }
 
-async function saveEndpoints() {
+function saveEndpoints() {
   if (!SERVE) {
     alert("Setting endpoints needs the server: run\n" +
           "  make_editor.py --data data --serve");
-    return;
+    return Promise.resolve(false);
   }
-  const resp = await fetch("/endpoints", {method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify(endpoints)});
-  if (!resp.ok) { alert("could not save endpoints: " + await resp.text()); return; }
-  endpoints = await resp.json();
-  drawEndpoints();
+  const serial = ++endpointSerial, body = JSON.stringify(endpoints);
+  const status = document.getElementById("epstatus");
+  const valid = document.getElementById("epww").checkValidity();
+  status.textContent = valid ? "Saving settings..." : "Invalid counterflow factor.";
+  endpointSave = endpointSave.then(async function () {
+    if (!valid) return false;
+    try {
+      const resp = await fetch("/endpoints", {method: "POST",
+        headers: {"Content-Type": "application/json"}, body: body});
+      if (!resp.ok) throw new Error(await resp.text());
+      const saved = await resp.json();
+      if (serial === endpointSerial) {
+        endpoints = saved;
+        drawEndpoints();
+        status.textContent = "Settings saved";
+      }
+      return true;
+    } catch (err) {
+      if (serial === endpointSerial) status.textContent = "Settings save failed: " + err;
+      return false;
+    }
+  });
+  return endpointSave;
 }
 
 document.addEventListener("click", function (ev) {
@@ -718,6 +743,7 @@ document.addEventListener("click", function (ev) {
   }
   const ep = ev.target.closest("button[data-ep]");
   if (ep && pending) {
+    if (solving) return;
     endpoints[ep.dataset.ep] = pending;
     map.closePopup();
     saveEndpoints();
@@ -725,6 +751,7 @@ document.addEventListener("click", function (ev) {
   }
   const clr = ev.target.closest("button[data-clear]");
   if (clr) {
+    if (solving) return;
     delete endpoints[clr.dataset.clear];
     saveEndpoints();
   }
@@ -746,18 +773,18 @@ function showRoutes(routes) {
   const el = document.getElementById("routes");
   if (!routes.length) { el.innerHTML = ""; return; }
   const quickest = routes.reduce((a, b) => b.time_min < a.time_min ? b : a);
-  el.innerHTML = "<b>route preferences</b> (same streets, different "
-    + "way between them)<br>" + routes.map(function (r) {
+  el.innerHTML = "<b>preset comparison</b><br>" + routes.map(function (r) {
       const h = Math.floor(r.time_min / 60), m = Math.round(r.time_min % 60);
       return '<div style="margin-top:3px">'
-        + '<a href="/' + encodeURIComponent(r.variant)
+        + '<a href="/comparison/' + encodeURIComponent(r.variant)
         + '/route_map.html" target="_blank"><b>' + esc(r.label) + "</b></a>"
-        + (r === quickest ? ' <span style="color:#2f855a">quickest</span>'
+        + (r === quickest ? ' <span style="color:#2f855a">lowest estimated time shown</span>'
            : "")
         + '<br><span style="color:#555">' + (h ? h + "h " : "")
         + String(m).padStart(2, "0") + "m &middot; "
         + r.total_km.toFixed(2) + " km &middot; " + r.turns_cross
-        + " crossing turns &middot; " + r.wrong_way_km.toFixed(2)
+        + " crossing turns &middot; counterflow &times;" + r.wrong_way_penalty
+        + "<br>" + r.wrong_way_km.toFixed(2)
         + " km against mapped one-way<br>"
         + r.service_counterflow_km.toFixed(2) + " km service counterflow ("
         + r.service_counterflow_segments + " segments)</span></div>";
@@ -773,7 +800,7 @@ async function loadHistory() {
   const el = document.getElementById("history");
   if (!rows.length) { el.innerHTML = ""; return; }
   let prev = null;
-  el.innerHTML = "<b>versions</b> (newest last)<br>" +
+  el.innerHTML = "<b>history activity</b> (newest last)<br>" +
     rows.map(function (r) {
       const t = parseFloat(r.total_km);
       const d = prev === null ? "" :
@@ -782,15 +809,21 @@ async function loadHistory() {
       prev = t;
       const cf = r.service_counterflow_km;
       const cfText = cf == null || cf === "" ? "-" : parseFloat(cf).toFixed(2) + " km";
-      return '<span style="font-family:monospace">' + r.id.slice(4) +
-        "</span> " + parseFloat(r.mandatory_km).toFixed(2) + "+" +
+      const stamp = r.event_timestamp || r.timestamp || r.id;
+      const date = new Date(stamp);
+      const when = Number.isNaN(date.getTime()) ? stamp : date.toLocaleString(undefined, {hour12:false});
+      return '<span style="font-family:monospace" title="' + esc(stamp) + '">' + esc(when) +
+        "</span><br>" + esc("v" + (r.version || "?") + " " + (r.event_action || "archived")) +
+        " <b>" + esc(r.run_description || "Unknown") + "</b><br>"
+        + parseFloat(r.mandatory_km).toFixed(2) + "+" +
         parseFloat(r.deadhead_km).toFixed(2) + " = <b>" + t.toFixed(2) +
         " km</b>" + d + " &middot; service counterflow " + cfText
         + (r.note ? " &middot; " + esc(r.note) : "");
     }).join("<br>");
 }
 
-document.getElementById("solve").onclick = async function () {
+async function solveRoute(compare) {
+  if (solving) return;
   if (!SERVE) {
     alert("Solving from the page needs the server: run\n" +
           "  make_editor.py --data data --serve");
@@ -801,27 +834,38 @@ document.getElementById("solve").onclick = async function () {
   }
   const msg = document.getElementById("solvemsg");
   const out = document.getElementById("solveout");
-  this.disabled = true;
-  msg.textContent = " solving ...";
+  solving = true;
+  const controls = [...document.querySelectorAll("#epbox button, #epbox input, #epbox select")];
+  controls.forEach(el => el.disabled = true);
+  msg.textContent = " waiting for settings ...";
+  showRoutes([]);
+  out.textContent = "";
   try {
-    const resp = await fetch("/solve", {method: "POST",
+    if (!await endpointSave) throw new Error("Settings were not saved. Correct or retry the setting before solving.");
+    msg.textContent = compare ? " comparing presets ..." : " solving ...";
+    const resp = await fetch(compare ? "/compare" : "/solve", {method: "POST",
       body: document.getElementById("note").value});
     let data;
     try { data = await resp.json(); }
     catch (e) { data = {ok: false, output: "no reply", routes: []}; }
     out.style.display = "block";
     out.textContent = data.output;
-    msg.innerHTML = resp.ok
-      ? ' <a href="/alternatives.html" target="_blank">compare on a map</a>'
+    msg.innerHTML = resp.ok && data.ok
+      ? (compare
+        ? ' <a href="/comparison/alternatives.html" target="_blank">compare on a map</a>'
+        : ' <a href="/route_map.html" target="_blank">view route</a>')
       : " failed";
     showRoutes(data.routes || []);
     if (resp.ok) loadHistory();
   } catch (err) {
     msg.textContent = " failed: " + err;
   } finally {
-    this.disabled = false;
+    solving = false;
+    controls.forEach(el => el.disabled = false);
   }
-};
+}
+document.getElementById("solve").onclick = function () { solveRoute(false); };
+document.getElementById("compare").onclick = function () { solveRoute(true); };
 
 function apply(i, svc) {
   const e = edges[i];
@@ -1077,12 +1121,14 @@ def _save_csv(data_dir: Path, text: str, current: bytes) -> dict:
 
 
 def run_solver(data_dir: Path, out_dir: Path, history_dir: Path,
-               note: str = ""):
-    """Run solve_route.py on the saved endpoints. Returns (ok, output)."""
+               note: str = "", compare: bool = False):
+    """Solve saved settings, or explicitly compare presets in a separate directory."""
     ep = load_endpoints(data_dir)
     cmd = [sys.executable, str(BASE / "solve_route.py"),
            "--data", str(data_dir), "--out", str(out_dir),
-           "--history", str(history_dir), "--variants", "all"]
+           "--history", str(history_dir)]
+    if compare:
+        cmd += ["--variants", "all"]
     if note:
         cmd += ["--note", note]
     if ep.get("start"):
@@ -1091,13 +1137,14 @@ def run_solver(data_dir: Path, out_dir: Path, history_dir: Path,
         cmd.append("--end={},{}".format(*ep["end"]))
         if ep.get("return_to_start"):
             cmd.append("--return-to-start")
-    # profile / penalty are read from endpoints.json by the solver
+    # Solve reads the saved profile/penalty; Compare uses each preset's values.
     res = subprocess.run(cmd, capture_output=True, text=True)
     return res.returncode == 0, (res.stdout + res.stderr).strip()
 
 
 def serve(data_dir: Path, port: int, out_dir: Path, history_dir: Path):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    solve_lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
         def _reply(self, code, body, ctype="text/plain; charset=utf-8"):
@@ -1117,12 +1164,11 @@ def serve(data_dir: Path, port: int, out_dir: Path, history_dir: Path):
                 self._reply(200, html, "text/html; charset=utf-8")
             elif path == "/history":
                 import round_history
-                rows = round_history.read_index(history_dir)
+                rows = round_history.read_timeline(history_dir)
                 self._reply(200, json.dumps(rows[-8:]),
                             "application/json; charset=utf-8")
             elif path.endswith(".html") and ".." not in path:
-                # route_map.html, alternatives.html, or one preference's
-                # own map at /<preference>/route_map.html
+                # Current route, or comparison maps under /comparison/.
                 target = out_dir / path.lstrip("/")
                 if not target.exists():
                     self._reply(404, "No route yet -- press Solve first.")
@@ -1165,25 +1211,35 @@ def serve(data_dir: Path, port: int, out_dir: Path, history_dir: Path):
                           f"return={saved['return_to_start']}", flush=True)
                     self._reply(200, json.dumps(saved),
                                 "application/json; charset=utf-8")
-            elif self.path == "/solve":
+            elif self.path in ("/solve", "/compare"):
                 length = int(self.headers.get("Content-Length") or 0)
                 note = self.rfile.read(length).decode("utf-8").strip()
-                print("  solving ...", flush=True)
-                ok, output = run_solver(data_dir, out_dir, history_dir,
-                                        note)
-                print(f"  solve {'ok' if ok else 'FAILED'}", flush=True)
-                routes = []
-                alt = out_dir / "alternatives.json"
-                if ok and alt.exists():
-                    try:
-                        routes = json.loads(
-                            alt.read_text(encoding="utf-8"))["routes"]
-                    except (ValueError, KeyError):
-                        routes = []
-                self._reply(200 if ok else 400,
-                            json.dumps({"ok": ok, "output": output,
-                                        "routes": routes}),
-                            "application/json; charset=utf-8")
+                if not solve_lock.acquire(blocking=False):
+                    self._reply(409, json.dumps({"ok": False,
+                                "output": "A solve is already running.", "routes": []}),
+                                "application/json; charset=utf-8")
+                    return
+                try:
+                    compare = self.path == "/compare"
+                    target = out_dir / "comparison" if compare else out_dir
+                    print("  comparing presets ..." if compare else "  solving saved settings ...", flush=True)
+                    ok, output = run_solver(data_dir, target, history_dir,
+                                            note, compare=compare)
+                    print(f"  solve {'ok' if ok else 'FAILED'}", flush=True)
+                    routes = []
+                    alt = target / "alternatives.json"
+                    if compare and ok and alt.exists():
+                        try:
+                            routes = json.loads(
+                                alt.read_text(encoding="utf-8"))["routes"]
+                        except (ValueError, KeyError):
+                            routes = []
+                    self._reply(200 if ok else 400,
+                                json.dumps({"ok": ok, "output": output,
+                                            "routes": routes}),
+                                "application/json; charset=utf-8")
+                finally:
+                    solve_lock.release()
             else:
                 self.send_error(404)
 

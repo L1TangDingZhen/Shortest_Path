@@ -18,7 +18,7 @@ circuit and open modes, and asserts the core invariants:
   * waiting at a signalised crossing is priced where the path is chosen:
     turn-aware routing takes 300 m of clear road over 200 m through a
     signal, plain Dijkstra does not
-  * searching over Euler tours never changes the distance
+  * searching over Euler tours preserves distance on the symmetric fixture
   * a two-sided street has exactly one service task on each physical
     side, under every preference, independently of travel direction
   * a closed way (a loop road: one junction, u == v) is ridden one lap
@@ -38,6 +38,7 @@ Run:  python test_solve.py
 import csv
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -270,6 +271,8 @@ def run(data_dir, out_dir, *extra):
         print(res.stdout)
         print(res.stderr)
         raise AssertionError(f"solver failed: {' '.join(extra) or 'circuit'}")
+    assert "Route quality            : heuristic; global optimum not guaranteed" in res.stdout
+    assert "near-optimal" not in res.stdout and "not provably minimal" not in res.stdout
     return res.stdout
 
 
@@ -412,9 +415,59 @@ def test_vehicle_preferences():
           ["--vehicle", "footpath"], 1, "--vehicle footpath", "reverse")
 
 
+def test_hash_seed_reproducibility():
+    print("== equal-cost bridges and matching are stable across process hash seeds ==")
+    import round_history
+
+    data = TMP / "hash_seed_data"
+    write_simple(data, {"A": (0.0, 0.0), "B": (0.0, 0.001),
+                        "C": (0.001, 0.0), "D": (0.001, 0.001)},
+                 [("ab", "Demo South", "A", "B", 1),
+                  ("cd", "Demo North", "C", "D", 1),
+                  ("ac", "Demo West", "A", "C", 0),
+                  ("bd", "Demo East", "B", "D", 0)])
+    with (data / "edges.csv").open(newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        fields, rows = reader.fieldnames, list(reader)
+    with (data / "edges.csv").open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(dict(row, length_m="100") for row in rows)
+    for algorithm in ("node", "turn"):
+        out, hist = TMP / f"hash_seed_{algorithm}", TMP / f"hash_history_{algorithm}"
+        expected = None
+        for seed in ("1", "2", "3", "7", "11"):
+            res = subprocess.run([sys.executable, "-B", str(BASE / "solve_route.py"),
+                                  "--data", str(data), "--out", str(out),
+                                  "--history", str(hist), "--algorithm", algorithm,
+                                  "--profile", "distance"],
+                                 env=dict(os.environ, PYTHONHASHSEED=seed),
+                                 capture_output=True, text=True)
+            assert res.returncode == 0, res.stdout + res.stderr
+            assert "bridge" in res.stdout
+            current = (out / "route.csv").read_bytes()
+            if expected is None:
+                expected = current
+            else:
+                assert current == expected, (algorithm, seed)
+                assert "matches existing version" in res.stdout
+        assert len(round_history.read_index(hist)) == 1
+        assert len(round_history.read_events(hist)) == 1
+
+
 def main():
     if TMP.exists():
         shutil.rmtree(TMP)
+    test_hash_seed_reproducibility()
+    print("== help distinguishes validated coverage from heuristic route quality ==")
+    help_result = subprocess.run([sys.executable, str(BASE / "solve_route.py"), "--help"],
+                                 capture_output=True, text=True)
+    assert help_result.returncode == 0
+    help_text = " ".join(help_result.stdout.split())
+    assert "Required delivery-side coverage is validated" in help_text
+    assert "global optimum is not guaranteed" in help_text
+    assert "jointly optimal" not in help_text and "chosen optimally" not in help_text
+    assert "All Euler tours are the same length" not in help_text
     data = TMP / "data"
     spec = write_case(data)
     edges_by_id = {}
@@ -439,7 +492,7 @@ def main():
     viewer = json.loads(m.group(1))
     assert len(viewer["segs"]) == len(rows1), "viewer payload out of sync"
 
-    print("== turn optimisation is free (same distance, same work) ==")
+    print("== turn optimisation preserves distance on the symmetric fixture ==")
     out_raw = TMP / "circuit_raw"
     run(data, out_raw, "--no-turn-optimisation")
     rows_raw = read_route(out_raw)
@@ -449,7 +502,7 @@ def main():
         f"vs {total_km(rows1)}"
     assert len(rows_raw) == len(rows1), "same number of traversals"
 
-    print("== pass pairing puts both sides back to back, free ==")
+    print("== pass pairing preserves distance on the symmetric fixture ==")
     out_pair = TMP / "paired"
     stdout = run(data, out_pair, "--pair-passes")
     rows_pair = read_route(out_pair)
@@ -481,7 +534,7 @@ def main():
     stdout = run(data, out_all, "--variants",
                  "shortest,fastest,recommended", "--vehicle", "footpath",
                  "--wrong-way-penalty", "7", "--history", str(variants_hist))
-    assert "ROUTE PREFERENCES" in stdout and "Quickest:" in stdout, stdout
+    assert "ROUTE PREFERENCES" in stdout and "Lowest estimated time among these candidates:" in stdout, stdout
     assert "overridden: --vehicle, --wrong-way-penalty" in stdout, stdout
     for name in ("shortest", "fastest", "recommended"):
         assert (out_all / name / "route.csv").exists(), name
@@ -542,7 +595,7 @@ def main():
     assert total_km(rows_td) > total_km(rows_nd), \
         "avoiding the signal is longer -- that is the trade"
 
-    print("== the tour search never breaks or lengthens the tour ==")
+    print("== tour search preserves the walk and distance on the symmetric fixture ==")
     out_ns = TMP / "nosearch"
     run(data, out_ns, "--no-tour-search")
     rows_ns = read_route(out_ns)
@@ -571,6 +624,7 @@ def main():
     out4 = TMP / "disc"
     stdout = run(data2, out4)
     assert "bridge" in stdout, "expected auto-bridge warning"
+    assert "not an optimality-gap estimate" in stdout
     rows4 = read_route(out4)
     check_walk(rows4, edges_by_id, spec2, closed=True)
 

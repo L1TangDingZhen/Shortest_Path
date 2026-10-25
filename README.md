@@ -108,14 +108,24 @@ own arrow, so check orientations before applying it to a whole street.
 **START** or **END** (or just copy the coordinates). The endpoints are
 stored in `data/endpoints.json`, drawn as markers, and reused on every
 reload; tick *return to start* for a closed tour. Then press
-**Solve route** — the solver runs and the finished route map opens in
-a new tab. The whole loop stays in the browser; `solve_route.py` picks
+**Solve route** — the solver runs and provides a link to the finished
+route map in a new tab. The whole loop stays in the browser; `solve_route.py` picks
 the same endpoints up automatically when run without `--start`/`--end`.
 
 The **speed** dropdown and **counterflow** factor next to the endpoints
 set the same preferences as `--profile` / `--wrong-way-penalty`; they
 are stored with the endpoints, so the Solve button and a bare
 `solve_route.py` both use them.
+Solve waits for pending settings saves and refuses to run if a save failed.
+The output log reports the actual profile and counterflow factor used.
+
+**Compare presets** is a separate action: it uses each preset's own profile
+and counterflow factor, not your custom preferences. It writes to
+`result/comparison/` (or `<out>/comparison/`), leaving the current
+`route.csv`, `route_map.html` and saved settings untouched. The comparison
+lists each preset's effective factor; its maps open through a separate link.
+Both actions use the saved route endpoints. A normal solve never displays
+old comparison results. The CLI's `--variants` output layout is unchanged.
 
 **show islands** colours each connected component of your service
 streets separately (with per-island zoom buttons); stray extra islands may be
@@ -177,8 +187,9 @@ python solve_route.py --data data --out result \
 
 # Closed tour: same, plus the shortest ride from the end back to the
 # start (depot -> round -> handover office -> depot). The office visit
-# is last-before-home, so the return leg is a constant and joint
-# optimality is preserved.
+# is last-before-home. The return leg is appended separately;
+# this does not establish global optimality, including turn costs
+# at the handover between the service route and the return leg.
 python solve_route.py --data data --out result \
     --start=-37.8406,144.9541 --end=-37.8380,144.9520 --return-to-start
 
@@ -236,8 +247,10 @@ listed for you to re-mark — never silently dropped.
 
 ## What "shortest" means — speed profiles
 
-The solver minimises **riding time**, so it needs to know how fast each
-edge is ridden. On a footpath that is a property of the surface and the
+The solver seeks lower **modelled route cost**, using riding-time estimates
+and configured turn/direction preferences. It does not guarantee the fastest
+route, and artificial preference penalties are not reported as riding time.
+It needs to know how fast each edge is ridden. On a footpath that is a property of the surface and the
 vehicle — no footway anywhere carries a posted limit. On a road it is
 the posted limit, which the extraction stores in `maxspeed_kmh`.
 
@@ -304,6 +317,23 @@ display label (`inner`/`outer` on rings), not the authoritative identity.
 The viewer shows both delivery and travel sides. Regenerate old routes before
 using `sort_plan.py`; it now assigns addresses by local polyline side and
 orders them by travel direction, keeping opposite sides in separate runs.
+The printable sort sheet shows every available house number in delivery
+order, with a numeric range only as a secondary summary. In `sort_plan.csv`,
+the existing `houses` column remains that range summary; the appended
+`house_sequence` column is a JSON array of strings in delivery order
+(for example `["20", "18A", "2/16"]`). It preserves gaps, suffixes, unit
+numbers and repeated entries; `count` is the array length. An empty run
+has `[]` and displays a dash. No missing numbers are inferred from a range.
+Range-summary counts include repeated entries, just like `count`.
+For spreadsheet filtering, `sort_addresses.csv` has one row per available
+address: `delivery_seq` (global 1-based order), `run_seq` (the `sort_plan.csv`
+segment), `street`, `housenumber`, `delivery_side`, `side` and `direction`.
+Duplicates remain separate rows; empty segments produce no address rows.
+Sort by `delivery_seq` to restore route order after filtering/sorting. Import
+`housenumber` as text in a spreadsheet to preserve leading zeros and unit labels.
+This sequence reflects available address locations, not verified building
+entrances or the order of units sharing one location. Regenerate the sort
+plan to add the sequence to older exports.
 
 Direction diagnostics remain visible at x1, including `--vehicle footpath`:
 turning off the preference does not change the reference traffic direction.
@@ -328,7 +358,7 @@ python solve_route.py --data data --out result --history \
     --note "after fixing the sliver gaps"
 
 python round_history.py list          # every version, newest last
-python round_history.py diff          # what changed between the last two
+python round_history.py diff          # latest two timeline entries, including reuse
 python round_history.py diff 2026 -1  # by id prefix or negative index
 python round_history.py show -1       # one version in full
 ```
@@ -347,14 +377,63 @@ Only confirming or changing a physical side counts as a side edit; merely
 adding the column does not. Missing counterflow statistics in old versions
 are shown as `-` (unknown), not zero.
 A new or changed counterflow measurement is recorded even at the same route
-distance; repeating the same measurement does not create another version.
+distance. Deduplication now compares the complete experiment, not just distance
+or the annotation hash:
+
+- SHA-256 of the input `nodes.csv` and `edges.csv`, including connectors,
+  exclusions, geometry, speed limits and intersection controls.
+- Resolved settings: endpoints, algorithm, traffic side, penalties, search
+  options and the contents of the speed profiles. Comparisons retain every
+  candidate's effective configuration and the common scoring profile.
+- The ordered `route.csv` rows and reported metrics, including counterflow.
+
+The configuration also identifies solver source hashes and Python/NetworkX
+versions. Input paths and timestamps are not part of the fingerprint; input
+CSV byte changes conservatively create a version, even for formatting-only
+edits. Route CSV BOM/newline differences do not. `diff` reports which fingerprint
+categories changed; `show` includes the saved configuration and input hashes.
+The annotation and hashes come from the same input snapshot used for solving,
+not a later reread of files edited while the solver was running.
 
 Versions live in `round.local/history/<id>/` (gitignored), each with
 `service.csv`, `summary.json`, `route.csv` and a copy of
-`route_map.html` you can still open months later. Re-solving an
-unchanged round does not create a duplicate. The editor's **Solve
-route** button records versions automatically and lists the recent
-ones under the button.
+`route_map.html` you can still open months later. Repeating an identical
+experiment without a note or forced bump does not create a duplicate.
+Matching searches the entire history, not only its last entry: alternating
+Solve and Compare reuses their existing versions. The console reports the
+matching version number; records are not reordered, and old duplicates are
+not automatically deleted.
+Version archives and activity are separate: `events.csv` records each observed
+transition with a timestamp and a reference to the version. `A -> B -> A`
+keeps two archives but three events; consecutive repeats of A add neither.
+Use `python round_history.py timeline` to see this sequence (including
+`created` and `reused`). With no arguments, `diff` compares the latest two
+timeline entries, so after returning to A it reports B -> A. Before event
+recording existed, the archived creation entries provide that timeline.
+`list`, `show` and explicit `diff` references remain archive-based. In particular,
+`diff -2 -1` compares the newest two archives, not the latest two events;
+`diff OLD` compares OLD to the newest archive. `-1` remains the newest *archive*,
+not the last reuse.
+Earlier archives appear as `archived`; reuse before event recording was added
+cannot be reconstructed and is not invented. Reading history never migrates
+or rewrites those archives.
+A nonempty `--note` (including an editor version label) or `--bump` always
+creates a version; clear the editor label to resume automatic deduplication.
+Old records without fingerprints remain untouched. The first new solve
+creates a baseline, and subsequent identical solves deduplicate normally.
+Missing configuration or route data never counts as proof of an identical run.
+These fingerprints do not replace backups of the full input network.
+The editor's **Solve
+route** and **Compare presets** buttons both request history recording
+and list recent activity under the buttons; comparison records its selected
+route together with the configuration of the complete comparison experiment.
+This activity tracks solved/compared experiments, not a change to the saved
+normal-route output; Compare still leaves that output and its settings alone.
+Both the CLI list and editor history identify **Solve** (single result) or
+**Compare** (minimum comparison time), the selected variant and its profile.
+The index stores `selection`, `variant`, `variant_label` and `algorithm`.
+For older indexes, display metadata is read from the existing archived summary
+without rewriting it; insufficient evidence is shown as **Unknown**.
 
 ## Reading the result
 
@@ -379,11 +458,18 @@ change when connectors have different paths in each direction
 sets traffic handedness, not the physical delivery side).
 
 The mandatory distance is the job itself: one traversal per required side.
-Matching gives an exact augmentation only for connected undirected graphs
-with symmetric additive costs. The current directional preferences, turn
+Matching gives an exact augmentation for connected required work in an
+undirected graph with symmetric additive costs. The current directional preferences, turn
 costs and tour search do **not** guarantee a globally shortest or quickest
 route, even with one service island. Disconnected islands add heuristic
-bridging as well. Coverage and walk continuity are checked independently of
+bridging as well. Bridge kilometres measure added riding, not an upper bound
+on how far the whole route is from optimal. The same caveat applies to pinned
+endpoints and `--return-to-start`.
+Preset identifiers `shortest`, `fastest`, `gentle` and `with_traffic` are kept
+for CLI compatibility; their display labels describe priorities, not guarantees.
+The comparison's lowest estimated time is only among the generated candidates,
+under the common scoring profile, not among all possible routes.
+Coverage and walk continuity are checked independently of
 optimisation quality; see `docs/DEVELOPMENT.md` (E3/E17).
 
 `route.csv` doubles as the basis for a new **sort sequence**: mail is

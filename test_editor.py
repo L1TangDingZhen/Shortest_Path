@@ -19,13 +19,15 @@ asserts on the JSON payload embedded in the HTML:
     saves (threads or processes) have one winner, and conflicts keep backups
   * --serve endpoints + solve: POST /endpoints stores the picked
     start/end (rejecting nonsense), the payload carries them back, and
-    POST /solve runs the solver on them and serves /route_map.html
+    POST /solve honours the stored preferences and serves /route_map.html;
+    POST /compare uses isolated preset outputs without changing those settings
 
 Run:  python test_editor.py
 """
 
 import csv
 import hashlib
+import http.server
 import io
 import json
 import re
@@ -37,7 +39,8 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Barrier
+from queue import Queue
+from threading import Barrier, Event, Thread
 from unittest.mock import patch
 
 import make_editor
@@ -166,6 +169,7 @@ def main():
     test_serve()
     test_snapshot_revision()
     test_process_lock()
+    test_busy_solver()
 
     print("\nALL TESTS PASSED")
 
@@ -264,6 +268,62 @@ except SaveConflict:
             if proc.poll() is None:
                 proc.kill()
             proc.wait(timeout=10)
+
+
+def test_busy_solver():
+    print("== one server refuses overlapping solve/compare requests ==")
+    data = TMP / "busy_solver"
+    write_case(data)
+    servers = Queue()
+    started, release = Event(), Event()
+    original_server = http.server.ThreadingHTTPServer
+
+    def server_factory(*args, **kwargs):
+        server = original_server(*args, **kwargs)
+        servers.put(server)
+        return server
+
+    def blocked_solver(*args, **kwargs):
+        started.set()
+        assert release.wait(10), "test did not release the solver"
+        return False, "Synthetic solver failure"
+
+    def request(base, action):
+        req = urllib.request.Request(base + action, data=b"", method="POST")
+        try:
+            response = urllib.request.urlopen(req, timeout=10)
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
+            return response.code, json.loads(response.read())
+
+    with patch.object(http.server, "ThreadingHTTPServer", side_effect=server_factory), \
+            patch.object(make_editor, "run_solver", side_effect=blocked_solver) as solver:
+        thread = Thread(target=make_editor.serve,
+                        args=(data, 0, TMP / "busy_out", TMP / "busy_history"), daemon=True)
+        thread.start()
+        server = servers.get(timeout=10)
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                first = pool.submit(request, base, "/solve")
+                try:
+                    assert started.wait(10)
+                    status, reply = request(base, "/compare")
+                    assert status == 409 and not reply["ok"] and reply["routes"] == [], reply
+                    assert solver.call_count == 1
+                finally:
+                    release.set()
+                assert first.result(timeout=10)[0] == 400
+            # Failure must release the gate for another request.
+            assert request(base, "/compare")[0] == 400
+            assert solver.call_count == 2
+        finally:
+            release.set()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=10)
+            assert not thread.is_alive()
 
 
 def test_serve():
@@ -371,22 +431,27 @@ def test_serve():
             assert e.code == 404, e.code
 
         eps = {"start": [-37.845, 144.950], "end": [-37.8471, 144.9529],
-               "return_to_start": True, "profile": "edv",
-               "wrong_way_penalty": 2}
+               "return_to_start": True, "profile": "limits",
+               "wrong_way_penalty": 7}
         req = urllib.request.Request(
             f"{base}/endpoints", data=json.dumps(eps).encode("utf-8"),
             method="POST", headers={"Content-Type": "application/json"})
         saved = json.loads(urllib.request.urlopen(req, timeout=10).read())
         assert saved["start"] == eps["start"] and saved["end"] == eps["end"]
         assert saved["return_to_start"] is True
-        assert saved["profile"] == "edv"
-        assert saved["wrong_way_penalty"] == 2
+        assert saved["profile"] == "limits"
+        assert saved["wrong_way_penalty"] == 7
         assert json.loads((data / "endpoints.json").read_text(
             encoding="utf-8"))["start"] == eps["start"]
 
-        # nonsense values are rejected
+        # Zero, sub-unit and non-finite values must fail before touching disk.
+        settings_before = (data / "endpoints.json").read_bytes()
         for bad in ({"start": ["north", 3]},
                     {"wrong_way_penalty": 0.5},
+                    *({"wrong_way_penalty": value} for value in
+                      (0, 0.0, -0.0, "0", False,
+                       float("nan"), float("inf"), float("-inf"),
+                       "NaN", "Infinity", "-Infinity", "1e9999")),
                     {"profile": "; rm -rf /"}):
             req = urllib.request.Request(
                 f"{base}/endpoints", data=json.dumps(bad).encode("utf-8"),
@@ -397,6 +462,20 @@ def test_serve():
                 raise AssertionError(f"{bad} must be rejected")
             except urllib.error.HTTPError as e:
                 assert e.code == 400, e.code
+                if "wrong_way_penalty" in bad:
+                    assert "must be finite and >= 1" in e.read().decode()
+            assert (data / "endpoints.json").read_bytes() == settings_before
+
+        # Missing/null/empty still default to 1; explicit valid factors survive.
+        for settings, expected in (({}, 1), ({"wrong_way_penalty": None}, 1),
+                                   ({"wrong_way_penalty": ""}, 1),
+                                   ({"wrong_way_penalty": 1}, 1),
+                                   ({"wrong_way_penalty": 1.25}, 1.25), (eps, 7)):
+            req = urllib.request.Request(
+                f"{base}/endpoints", data=json.dumps(settings).encode("utf-8"),
+                method="POST", headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                assert json.loads(response.read())["wrong_way_penalty"] == expected
 
         # the served page carries the stored endpoints back
         html3 = urllib.request.urlopen(f"{base}/", timeout=10).read()
@@ -413,14 +492,57 @@ def test_serve():
         out = reply["output"]
         assert reply["ok"] and "RESULT" in out, out
         assert "return to start" in out, out
-        # Solve runs every preference and hands them back for the panel
+        assert "speed profile: limits" in out and "wrong-way penalty x7" in out, out
+        assert "--variants" not in out
+        assert reply["routes"] == [], reply
+        result_dir = TMP / "serve_out"
+        assert not (result_dir / "alternatives.json").exists()
+        current_csv = (result_dir / "route.csv").read_bytes()
+        current_map = (result_dir / "route_map.html").read_bytes()
+        settings = (data / "endpoints.json").read_bytes()
+        summaries = list((TMP / "serve_hist").glob("*/summary.json"))
+        assert len(summaries) == 1
+        summary = json.loads(summaries[0].read_text())
+        assert summary["profile"] == "limits" and summary["wrong_way_penalty"] == 7
+        assert summary["wrong_way_source"] == "endpoints.json"
+
+        print("== compare: explicit presets leave current route/settings intact ==")
+        req = urllib.request.Request(f"{base}/compare", data=b"preset comparison",
+                                     method="POST")
+        reply = json.loads(urllib.request.urlopen(req, timeout=300).read())
+        assert reply["ok"] and "--variants" in reply["output"], reply
         assert len(reply["routes"]) >= 2, reply["routes"]
         assert {"variant", "label", "time_min", "total_km"} <= \
             set(reply["routes"][0]), reply["routes"][0]
+        assert {r["wrong_way_penalty"] for r in reply["routes"]} == {1, 3, 12}
+        assert (data / "endpoints.json").read_bytes() == settings
+        assert (result_dir / "route.csv").read_bytes() == current_csv
+        assert (result_dir / "route_map.html").read_bytes() == current_map
+        with urllib.request.urlopen(f"{base}/history", timeout=10) as response:
+            history_entries = json.loads(response.read())
+        assert {r["selection"] for r in history_entries} == {"single", "minimum_comparison_time"}
+        assert history_entries[0]["run_description"].startswith("Solve:")
+        assert history_entries[-1]["run_description"].startswith("Compare:")
+        assert all(r["variant"] and r["algorithm"] for r in history_entries)
         page = urllib.request.urlopen(
-            f"{base}/alternatives.html", timeout=10).read()
+            f"{base}/comparison/alternatives.html", timeout=10).read()
         assert b"alt-data" in page, "comparison map not served"
-        assert (TMP / "serve_out" / "route.csv").exists()
+        variant = reply["routes"][0]["variant"]
+        page = urllib.request.urlopen(
+            f"{base}/comparison/{variant}/route_map.html", timeout=10).read()
+        assert b"route-data" in page
+
+        # An old comparison must never be returned for a later normal solve.
+        (result_dir / "alternatives.json").write_text(json.dumps({"routes": [{"stale": True}]}))
+        eps.update(profile="edv", wrong_way_penalty=11)
+        req = urllib.request.Request(f"{base}/endpoints", data=json.dumps(eps).encode(),
+                                     method="POST", headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10).close()
+        req = urllib.request.Request(f"{base}/solve", data=b"", method="POST")
+        reply = json.loads(urllib.request.urlopen(req, timeout=300).read())
+        assert reply["ok"] and reply["routes"] == [], reply
+        assert "speed profile: edv" in reply["output"]
+        assert "wrong-way penalty x11" in reply["output"]
         page = urllib.request.urlopen(f"{base}/route_map.html",
                                       timeout=10).read()
         assert b"route-data" in page, "route map not served"
